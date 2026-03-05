@@ -1294,51 +1294,83 @@ const MAXCOLS=6;
 const LEGEND_W=252;
 
 function buildLegendCells(lx, ly) {
-  const LW=LEGEND_W, LHDR=28, LR=24, TR=20, SH=18;
+  // All cells use parent="1" with ABSOLUTE coordinates (lx+rx, ly+ry).
+  // This is required for Lucidchart compatibility — Lucidchart does not support
+  // edges or cells whose parent is a non-root container (nested parent != "1").
+  const LW=LEGEND_W, LR=24, TR=20, SH=18;
   const cells=[];
   let lid=9000;
   const nid=()=>`lg_${++lid}`;
-  const FID="legend_frame";
+  let ry=0; // relative y; absolute = ly+ry
 
+  // ── Background rectangle (replaces swimlane — Lucidchart-safe) ───────────
+  const TOTAL_H = 530;
   cells.push(
-    `<mxCell id="${FID}" value="Legend" style="swimlane;startSize=${LHDR};fillColor=#1A237E;swimlaneFillColor=#0D1117;strokeColor=#283593;strokeWidth=2;fontColor=#90CAF9;fontSize=12;fontStyle=1;align=center;rounded=1;arcSize=3;html=1;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="516" as="geometry"/></mxCell>`
+    // Dark background fill
+    `<mxCell id="legend_bg" value="" style="rounded=1;arcSize=3;fillColor=#0D1117;strokeColor=#283593;strokeWidth=2;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="${TOTAL_H}" as="geometry"/></mxCell>`,
+    // Header bar
+    `<mxCell id="legend_hdr_bar" value="" style="rounded=0;fillColor=#1A237E;strokeColor=none;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="28" as="geometry"/></mxCell>`,
+    // Header text
+    `<mxCell id="legend_hdr_txt" value="Legend" style="text;html=1;align=center;fontStyle=1;fontSize=12;fontColor=#90CAF9;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="28" as="geometry"/></mxCell>`
   );
-  let y=LHDR+8;
+  ry = 36;
 
+  // Helper: section heading
   const hdr=(t)=>{
-    cells.push(`<mxCell id="${nid()}" value="${xe(t)}" style="text;html=1;align=left;fontStyle=1;fontSize=9;fontColor=#64B5F6;strokeColor=none;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="10" y="${y}" width="${LW-20}" height="16" as="geometry"/></mxCell>`);
-    y+=SH;
+    cells.push(`<mxCell id="${nid()}" value="${xe(t)}" style="text;html=1;align=left;fontStyle=1;fontSize=9;fontColor=#64B5F6;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry}" width="${LW-20}" height="16" as="geometry"/></mxCell>`);
+    ry+=SH;
   };
+
+  // Helper: horizontal divider (plain rect, no 'line' style which Lucidchart ignores)
   const div=()=>{
-    cells.push(`<mxCell id="${nid()}" value="" style="line;strokeColor=#283593;strokeWidth=1;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="8" y="${y}" width="${LW-16}" height="8" as="geometry"/></mxCell>`);
-    y+=12;
+    cells.push(`<mxCell id="${nid()}" value="" style="rounded=0;fillColor=#283593;strokeColor=none;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+8}" y="${ly+ry+2}" width="${LW-16}" height="1" as="geometry"/></mxCell>`);
+    ry+=10;
   };
+
+  // Helper: node-type row (colored swatch + label, all parent="1")
   const nodeRow=(lbl,fill,stroke,extra="")=>{
     cells.push(
-      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=6;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;${extra}resizable=0;" vertex="1" parent="${FID}"><mxGeometry x="10" y="${y+3}" width="28" height="17" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="46" y="${y+3}" width="${LW-56}" height="17" as="geometry"/></mxCell>`
+      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=6;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;${extra}resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry+3}" width="28" height="17" as="geometry"/></mxCell>`,
+      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+46}" y="${ly+ry+3}" width="${LW-56}" height="17" as="geometry"/></mxCell>`
     );
-    y+=LR;
-  };
-  const edgeRow=(lbl,eStyle,dotCol)=>{
-    const sid=nid(), tid=nid();
-    cells.push(
-      `<mxCell id="${sid}" value="" style="ellipse;fillColor=${dotCol};strokeColor=${dotCol};" vertex="1" parent="${FID}"><mxGeometry x="10" y="${y+8}" width="7" height="7" as="geometry"/></mxCell>`,
-      `<mxCell id="${tid}" value="" style="ellipse;fillColor=none;strokeColor=none;" vertex="1" parent="${FID}"><mxGeometry x="82" y="${y+8}" width="7" height="7" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="" style="${eStyle}exitX=1;exitY=0.5;exitPerimeter=0;entryX=0;entryY=0.5;entryPerimeter=0;" edge="1" source="${sid}" target="${tid}" parent="${FID}"><mxGeometry relative="1" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="97" y="${y+4}" width="${LW-107}" height="16" as="geometry"/></mxCell>`
-    );
-    y+=LR;
-  };
-  const tierRow=(lbl,fill,stroke)=>{
-    cells.push(
-      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=3;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;resizable=0;" vertex="1" parent="${FID}"><mxGeometry x="10" y="${y+3}" width="28" height="13" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="46" y="${y+2}" width="${LW-56}" height="15" as="geometry"/></mxCell>`
-    );
-    y+=TR;
+    ry+=LR;
   };
 
-  // ── Section 1: Node Types ─────────────────────────────────────────
+  // Helper: edge-type row — replaces actual mxCell edges (which break in Lucidchart when parent!="1")
+  // Uses a solid colored line rectangle + arrow-tip triangle for visual representation
+  const edgeRow=(lbl,color,dashed=false)=>{
+    const lineW=60, lineH=2, arrowW=6, arrowH=8;
+    const ex=lx+10, ey=ly+ry+11;
+    // Line body
+    const lineStyle=dashed
+      ? `rounded=0;fillColor=${color};strokeColor=none;resizable=0;html=1;opacity=80;`
+      : `rounded=0;fillColor=${color};strokeColor=none;resizable=0;html=1;`;
+    if(dashed){
+      // Draw as 4 short dashes
+      for(let d=0;d<4;d++){
+        cells.push(`<mxCell id="${nid()}" value="" style="${lineStyle}" vertex="1" parent="1"><mxGeometry x="${ex+d*15}" y="${ey}" width="10" height="${lineH}" as="geometry"/></mxCell>`);
+      }
+    } else {
+      cells.push(`<mxCell id="${nid()}" value="" style="${lineStyle}" vertex="1" parent="1"><mxGeometry x="${ex}" y="${ey}" width="${lineW}" height="${lineH}" as="geometry"/></mxCell>`);
+    }
+    // Arrowhead (right-pointing triangle)
+    cells.push(
+      `<mxCell id="${nid()}" value="" style="triangle;direction=east;fillColor=${color};strokeColor=${color};resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${ex+lineW}" y="${ey-3}" width="${arrowW}" height="${arrowH}" as="geometry"/></mxCell>`,
+      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+86}" y="${ly+ry+4}" width="${LW-96}" height="16" as="geometry"/></mxCell>`
+    );
+    ry+=LR;
+  };
+
+  // Helper: tier row
+  const tierRow=(lbl,fill,stroke)=>{
+    cells.push(
+      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=3;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry+3}" width="28" height="13" as="geometry"/></mxCell>`,
+      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+46}" y="${ly+ry+2}" width="${LW-56}" height="15" as="geometry"/></mxCell>`
+    );
+    ry+=TR;
+  };
+
+  // ── Section 1: Node Types ─────────────────────────────────────────────────
   hdr("NODE TYPES");
   nodeRow("AWS Resource (managed)",  "#FFFFFF","#546E7A");
   nodeRow("Data Source (read-only)", "#F5F5F5","#0277BD","dashed=1;dashPattern=4 3;");
@@ -1347,16 +1379,16 @@ function buildLegendCells(lx, ly) {
   nodeRow("Remote State Reference",  "#E3F2FD","#1565C0","dashed=1;dashPattern=6 4;");
   div();
 
-  // ── Section 2: Connection Types ───────────────────────────────────
+  // ── Section 2: Connection Types ───────────────────────────────────────────
   hdr("CONNECTION TYPES");
-  edgeRow("Implicit reference",    "html=1;edgeStyle=none;strokeColor=#78909C;strokeWidth=1.5;endArrow=block;endFill=1;startArrow=none;",                                   "#78909C");
-  edgeRow("Explicit depends_on",   "html=1;edgeStyle=none;strokeColor=#E53935;strokeWidth=2;dashed=1;dashPattern=5 3;endArrow=block;endFill=1;startArrow=none;",           "#E53935");
-  edgeRow("Module input / output", "html=1;edgeStyle=none;strokeColor=#2E7D32;strokeWidth=2;endArrow=open;endFill=0;startArrow=none;",                                     "#2E7D32");
-  edgeRow("Remote state read",     "html=1;edgeStyle=none;strokeColor=#6A1B9A;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=open;endFill=0;startArrow=oval;startFill=1;","#6A1B9A");
-  edgeRow("Data source read",      "html=1;edgeStyle=none;strokeColor=#0277BD;strokeWidth=1.5;dashed=1;dashPattern=4 4;endArrow=open;endFill=0;startArrow=none;",          "#0277BD");
+  edgeRow("Implicit reference",    "#78909C", false);
+  edgeRow("Explicit depends_on",   "#E53935", true);
+  edgeRow("Module input / output", "#2E7D32", false);
+  edgeRow("Remote state read",     "#6A1B9A", true);
+  edgeRow("Data source read",      "#0277BD", true);
   div();
 
-  // ── Section 3: Tier Boundaries ────────────────────────────────────
+  // ── Section 3: Tier Boundaries ────────────────────────────────────────────
   hdr("TIER BOUNDARIES");
   tierRow("xSphere Private Cloud",  "#E8EAF6","#3949AB");
   tierRow("Org / Account",          "#F3E5F5","#6A1B9A");
@@ -1366,7 +1398,8 @@ function buildLegendCells(lx, ly) {
   tierRow("Compute · API · Events", "#E3F2FD","#1565C0");
   tierRow("Storage · Database",     "#FFF8E1","#F57F17");
 
-  cells.push(`<mxCell id="${nid()}" value="threataform · enterprise terraform dfd" style="text;html=1;align=center;fontSize=7;fontColor=#37474F;strokeColor=none;fillColor=none;" vertex="1" parent="${FID}"><mxGeometry x="0" y="${y+4}" width="${LW}" height="12" as="geometry"/></mxCell>`);
+  // Footer
+  cells.push(`<mxCell id="${nid()}" value="threataform · enterprise terraform dfd" style="text;html=1;align=center;fontSize=7;fontColor=#37474F;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly+ry+6}" width="${LW}" height="12" as="geometry"/></mxCell>`);
   return cells;
 }
 
