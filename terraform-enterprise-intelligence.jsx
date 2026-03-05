@@ -1691,26 +1691,125 @@ function KBPanel({domain}) {
 // USER DOCUMENTS PANEL
 // ─────────────────────────────────────────────────────────────────────────────
 const DOC_TYPE_META = {
-  json: { label:"JSON", color:"#F9A825" },
-  md:   { label:"MD",   color:"#42A5F5" },
-  tf:   { label:"TF",   color:"#7C4DFF" },
-  pdf:  { label:"PDF",  color:"#EF5350" },
-  txt:  { label:"TXT",  color:"#78909C" },
+  // Terraform / IaC
+  tf:       { label:"TF",      color:"#7C4DFF" },
+  hcl:      { label:"HCL",     color:"#9C27B0" },
+  tfvars:   { label:"TFVARS",  color:"#AB47BC" },
+  sentinel: { label:"SENTINEL",color:"#CE93D8" },
+  // Config / data
+  json:     { label:"JSON",    color:"#F9A825" },
+  yaml:     { label:"YAML",    color:"#FFA726" },
+  yml:      { label:"YAML",    color:"#FFA726" },
+  toml:     { label:"TOML",    color:"#FF8F00" },
+  xml:      { label:"XML",     color:"#FB8C00" },
+  csv:      { label:"CSV",     color:"#66BB6A" },
+  // Docs
+  md:       { label:"MD",      color:"#42A5F5" },
+  txt:      { label:"TXT",     color:"#78909C" },
+  pdf:      { label:"PDF",     color:"#EF5350" },
+  // Code
+  py:       { label:"PY",      color:"#26A69A" },
+  sh:       { label:"SH",      color:"#4CAF50" },
+  bash:     { label:"SH",      color:"#4CAF50" },
+  ts:       { label:"TS",      color:"#29B6F6" },
+  js:       { label:"JS",      color:"#FFEE58" },
+  go:       { label:"GO",      color:"#00BCD4" },
+  rb:       { label:"RB",      color:"#EF5350" },
+  // CI/CD & infra
+  groovy:   { label:"GROOVY",  color:"#BF360C" },
+  jenkinsfile:{label:"JENKINS",color:"#D84315" },
+  dockerfile:{label:"DOCKER",  color:"#0288D1" },
+  env:      { label:"ENV",     color:"#78909C" },
+  // Catch-all
+  log:      { label:"LOG",     color:"#607D8B" },
 };
 
-function UserDocsPanel({docs, onAdd, onDelete}) {
-  const [openDoc, setOpenDoc] = useState(null);
+function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
+  const [openDoc, setOpenDoc]       = useState(null);
   const [docDragging, setDocDragging] = useState(false);
+  const [folderOpen, setFolderOpen] = useState({});
+
   const handleDrop = e => {
     e.preventDefault(); setDocDragging(false);
     if (e.dataTransfer.files?.length) onAdd(e.dataTransfer.files);
+  };
+
+  // Group docs by top-level folder (from webkitRelativePath)
+  const grouped = useMemo(() => {
+    const g = {}; // { folderLabel: [{doc, idx}] }
+    docs.forEach((doc, idx) => {
+      const parts = (doc.path || doc.name).split(/[/\\]/);
+      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : "__root__";
+      if (!g[folder]) g[folder] = [];
+      g[folder].push({ doc, idx });
+    });
+    return g;
+  }, [docs]);
+
+  const totalKB = docs.reduce((s, d) => s + (d.content?.length || 0), 0) / 1024;
+  const folderCount = Object.keys(grouped).filter(k => k !== "__root__").length;
+
+  const renderDocRow = ({ doc, idx }) => {
+    const ext = (doc.name || "").split(".").pop().toLowerCase();
+    const typeMeta = DOC_TYPE_META[ext] || { label: ext.toUpperCase().slice(0,8) || "FILE", color:"#78909C" };
+    const isOpen = openDoc === idx;
+    return (
+      <div key={idx} style={{borderTop:`1px solid ${C.border}`}}>
+        <div
+          style={{
+            display:"flex", alignItems:"center", justifyContent:"space-between",
+            padding:"10px 18px",
+            background: isOpen ? `${C.blue}08` : "transparent",
+            cursor:"pointer", transition:"background .15s",
+          }}
+          onClick={()=>setOpenDoc(isOpen ? null : idx)}
+        >
+          <div style={{display:"flex", alignItems:"center", gap:10, minWidth:0}}>
+            <span style={{
+              fontSize:9, fontWeight:700, color:typeMeta.color,
+              background:`${typeMeta.color}15`, border:`1px solid ${typeMeta.color}33`,
+              borderRadius:4, padding:"2px 6px", flexShrink:0, textAlign:"center"
+            }}>{typeMeta.label}</span>
+            <div style={{minWidth:0}}>
+              <div style={{...SANS, fontSize:12, fontWeight:600, color:C.text,
+                overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:320}}>
+                {doc.name}
+              </div>
+              <div style={{fontSize:10, color:C.textMuted, marginTop:1}}>
+                {doc.binary ? "binary / not shown" : `${(doc.content.length/1024).toFixed(1)} KB`}
+              </div>
+            </div>
+          </div>
+          <div style={{display:"flex", alignItems:"center", gap:8, flexShrink:0}}>
+            <span style={{fontSize:11, color:C.textMuted, transform:isOpen?"rotate(180deg)":"none", transition:"transform .2s"}}>▼</span>
+            <button onClick={e=>{e.stopPropagation();onDelete(idx);}}
+              style={{ background:"transparent", border:`1px solid ${C.red}44`,
+                borderRadius:5, padding:"3px 10px", color:C.red, fontSize:11, cursor:"pointer", ...SANS }}>
+              ✕
+            </button>
+          </div>
+        </div>
+        {isOpen && !doc.binary && (
+          <div style={{padding:"0 18px 14px", background:C.bg}}>
+            <pre style={{
+              ...MONO, fontSize:11, background:"#0D1117", color:"#C9D1D9",
+              padding:"14px 16px", borderRadius:8, lineHeight:1.75,
+              whiteSpace:"pre-wrap", overflowX:"auto",
+              maxHeight:380, overflowY:"auto", margin:0, border:`1px solid ${C.border}`
+            }}>
+              {doc.content.slice(0, 40000)}{doc.content.length > 40000 ? "\n\n… (truncated for display — full content used in analysis)" : ""}
+            </pre>
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
     <div style={{display:"flex", flexDirection:"column", gap:0}}>
       {/* Header */}
       <div style={{
-        padding:"24px 28px 20px",
+        padding:"22px 26px 18px",
         background:`linear-gradient(135deg, #78909C18, ${C.surface})`,
         borderBottom:`2px solid #78909C44`,
         borderRadius:"10px 10px 0 0",
@@ -1721,111 +1820,113 @@ function UserDocsPanel({docs, onAdd, onDelete}) {
             background:"#78909C22", border:"1px solid #78909C44",
             display:"flex", alignItems:"center", justifyContent:"center",
             fontSize:20, flexShrink:0
-          }}>📄</div>
-          <div>
-            <div style={{...SANS, fontSize:18, fontWeight:700, color:C.text}}>My Documents</div>
+          }}>📂</div>
+          <div style={{flex:1}}>
+            <div style={{...SANS, fontSize:17, fontWeight:700, color:C.text}}>My Documents & Folders</div>
             <div style={{fontSize:11, color:"#78909C", marginTop:2}}>
-              {docs.length} document{docs.length !== 1 ? "s" : ""} stored in browser
+              {docs.length} file{docs.length !== 1 ? "s" : ""}
+              {folderCount > 0 && ` across ${folderCount} folder${folderCount !== 1?"s":""}`}
+              {" · "}{totalKB.toFixed(1)} KB stored
             </div>
           </div>
+          {docs.length > 0 && (
+            <button onClick={onClear}
+              style={{background:"transparent", border:`1px solid ${C.red}55`, borderRadius:6,
+                padding:"6px 14px", color:C.red, fontSize:11, cursor:"pointer", ...SANS}}>
+              Clear All
+            </button>
+          )}
         </div>
-        <div style={{...SANS, fontSize:13, color:C.textSub, lineHeight:1.7, maxWidth:600}}>
-          Upload .txt, .md, .json, .tf, or .pdf files as reference material alongside your architecture analysis. Files persist across sessions in your browser.
+        <div style={{...SANS, fontSize:12, color:C.textSub, lineHeight:1.7}}>
+          Upload entire Terraform repo folders or individual files of any type. All text-readable files are ingested for analysis — .tf, .hcl, .tfvars, .json, .yaml, .md, .sh, .py, Dockerfiles, Jenkinsfiles, and more.
         </div>
       </div>
 
       <div style={{background:C.surface, border:"1px solid #78909C22", borderTop:"none", borderRadius:"0 0 10px 10px", overflow:"hidden"}}>
-        {/* Drop zone */}
-        <div style={{padding:"16px"}}>
+        {/* Drop zone + buttons */}
+        <div style={{padding:"14px 16px"}}>
           <div
             onDrop={handleDrop}
             onDragOver={e=>{e.preventDefault();setDocDragging(true);}}
             onDragLeave={()=>setDocDragging(false)}
             style={{
               border:`2px dashed ${docDragging ? C.blue : C.border2}`,
-              borderRadius:10, padding:"28px 20px", textAlign:"center",
+              borderRadius:10, padding:"22px 20px", textAlign:"center",
               background: docDragging ? `${C.blue}10` : C.bg,
               transition:"all .2s",
             }}
           >
-            <div style={{fontSize:28, marginBottom:8, opacity:docDragging?1:0.5}}>📁</div>
-            <div style={{...SANS, color:C.textMuted, fontSize:13, marginBottom:14}}>
-              Drop .txt .md .json .tf .pdf files here
+            <div style={{fontSize:26, marginBottom:6, opacity:docDragging?1:0.5}}>📂</div>
+            <div style={{...SANS, color:C.textMuted, fontSize:12, marginBottom:14}}>
+              Drop any files or folders here — all file types accepted
             </div>
-            <label style={{
-              background:C.surface, border:`1px solid ${C.border2}`,
-              borderRadius:6, padding:"8px 18px",
-              color:C.textSub, fontSize:12, cursor:"pointer", ...SANS,
-              display:"inline-block"
-            }}>
-              Browse Files
-              <input type="file" accept=".txt,.md,.json,.tf,.pdf" multiple
-                onChange={e=>{if(e.target.files?.length)onAdd(e.target.files);e.target.value="";}}
-                style={{display:"none"}}/>
-            </label>
+            <div style={{display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap"}}>
+              {/* Browse folder */}
+              <label style={{
+                background:`${C.accent}18`, border:`1px solid ${C.accent}55`,
+                borderRadius:6, padding:"8px 18px",
+                color:C.accent, fontSize:12, cursor:"pointer", ...SANS,
+                display:"inline-flex", alignItems:"center", gap:6,
+              }}>
+                📂 Select Folder
+                <input type="file" webkitdirectory="" multiple
+                  onChange={e=>{if(e.target.files?.length)onAdd(e.target.files);e.target.value="";}}
+                  style={{display:"none"}}/>
+              </label>
+              {/* Browse files */}
+              <label style={{
+                background:C.surface, border:`1px solid ${C.border2}`,
+                borderRadius:6, padding:"8px 18px",
+                color:C.textSub, fontSize:12, cursor:"pointer", ...SANS,
+                display:"inline-flex", alignItems:"center", gap:6,
+              }}>
+                📄 Browse Files
+                <input type="file" multiple
+                  onChange={e=>{if(e.target.files?.length)onAdd(e.target.files);e.target.value="";}}
+                  style={{display:"none"}}/>
+              </label>
+            </div>
+          </div>
+          <div style={{fontSize:10, color:C.textMuted, textAlign:"center", marginTop:8, ...SANS}}>
+            All files read client-side — nothing leaves your browser
           </div>
         </div>
 
         {docs.length === 0 && (
-          <div style={{padding:"24px 20px", textAlign:"center", color:C.textMuted, fontSize:13, ...SANS, borderTop:`1px solid ${C.border}`}}>
-            No documents uploaded yet. Add files above to reference them in your analysis.
+          <div style={{padding:"20px", textAlign:"center", color:C.textMuted, fontSize:12, ...SANS, borderTop:`1px solid ${C.border}`}}>
+            No files uploaded yet. Select a Terraform folder from Bitbucket or upload individual files to enrich your analysis.
           </div>
         )}
 
-        {docs.map((doc, i) => {
-          const typeMeta = DOC_TYPE_META[doc.type] || DOC_TYPE_META.txt;
-          const isOpen = openDoc === i;
+        {/* Grouped file list */}
+        {Object.entries(grouped).map(([folder, items]) => {
+          if (folder === "__root__") {
+            return items.map(renderDocRow);
+          }
+          const isFolderOpen = folderOpen[folder] !== false; // default open
           return (
-            <div key={i} style={{borderTop:`1px solid ${C.border}`}}>
+            <div key={folder} style={{borderTop:`1px solid ${C.border}`}}>
+              {/* Folder header */}
               <div
+                onClick={()=>setFolderOpen(s=>({...s,[folder]:!isFolderOpen}))}
                 style={{
-                  display:"flex", alignItems:"center", justifyContent:"space-between",
-                  padding:"12px 18px",
-                  background: isOpen ? `${C.blue}08` : "transparent",
-                  cursor:"pointer",
-                  transition:"background .15s",
+                  display:"flex", alignItems:"center", gap:10,
+                  padding:"9px 18px", cursor:"pointer",
+                  background:`${C.surface2}`, borderBottom:isFolderOpen?`1px solid ${C.border}`:"none",
                 }}
-                onClick={()=>setOpenDoc(isOpen ? null : i)}
               >
-                <div style={{display:"flex", alignItems:"center", gap:12}}>
-                  <span style={{
-                    fontSize:10, fontWeight:700, color:typeMeta.color,
-                    background:`${typeMeta.color}15`, border:`1px solid ${typeMeta.color}33`,
-                    borderRadius:4, padding:"2px 7px", minWidth:32, textAlign:"center"
-                  }}>{typeMeta.label}</span>
-                  <div>
-                    <div style={{...SANS, fontSize:13, fontWeight:600, color:C.text}}>{doc.name}</div>
-                    <div style={{fontSize:11, color:C.textMuted, marginTop:1}}>
-                      {(doc.content.length / 1024).toFixed(1)} KB
-                    </div>
-                  </div>
-                </div>
-                <div style={{display:"flex", alignItems:"center", gap:10}}>
-                  <span style={{fontSize:11, color:C.textMuted, transform:isOpen?"rotate(180deg)":"none", transition:"transform .2s"}}>▼</span>
-                  <button
-                    onClick={e=>{e.stopPropagation();onDelete(i);}}
-                    style={{
-                      background:"transparent", border:`1px solid ${C.red}44`,
-                      borderRadius:5, padding:"4px 12px",
-                      color:C.red, fontSize:11, cursor:"pointer", ...SANS,
-                      transition:"background .15s",
-                    }}
-                  >Remove</button>
-                </div>
+                <span style={{fontSize:13}}>{isFolderOpen ? "📂" : "📁"}</span>
+                <span style={{...SANS, fontSize:12, fontWeight:700, color:C.textSub,
+                  overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1}}>
+                  {folder}
+                </span>
+                <span style={{fontSize:10, color:C.textMuted, background:C.bg,
+                  border:`1px solid ${C.border}`, borderRadius:10, padding:"1px 8px", flexShrink:0}}>
+                  {items.length} file{items.length !== 1 ? "s" : ""}
+                </span>
+                <span style={{fontSize:10, color:C.textMuted}}>{isFolderOpen?"▲":"▼"}</span>
               </div>
-              {isOpen && (
-                <div style={{padding:"0 18px 16px", background:C.bg}}>
-                  <pre style={{
-                    ...MONO, fontSize:12, background:"#0D1117",
-                    color:"#C9D1D9", padding:"16px 18px", borderRadius:8,
-                    lineHeight:1.8, whiteSpace:"pre-wrap", overflowX:"auto",
-                    maxHeight:420, overflowY:"auto", margin:0,
-                    border:`1px solid ${C.border}`
-                  }}>
-                    {doc.content}
-                  </pre>
-                </div>
-              )}
+              {isFolderOpen && items.map(renderDocRow)}
             </div>
           );
         })}
@@ -3146,17 +3247,33 @@ function AnalysisPanel({ parseResult, files, userDocs, scopeFiles, onScopeChange
       {/* Supporting Documents */}
       {A.userDocs.length > 0 && (
         <Section id="docs" title="Supporting Documents" color="#78909C" count={A.userDocs.length}>
-          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-            {A.userDocs.map((d,i) => (
-              <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:"10px 14px" }}>
-                <div style={{ fontSize:13, color:"#90A4AE", fontWeight:600, marginBottom:6 }}>
-                  {d.name} <span style={{ color:C.textMuted, fontWeight:400, fontSize:11 }}>· {d.type}</span>
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            {A.userDocs.map((d,i) => {
+              const ext = (d.name||"").split(".").pop().toLowerCase();
+              const typeMeta = DOC_TYPE_META[ext] || { label: ext.toUpperCase().slice(0,6)||"FILE", color:"#78909C" };
+              return (
+                <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:"9px 13px", display:"flex", gap:10, alignItems:"flex-start" }}>
+                  <span style={{
+                    fontSize:9, fontWeight:700, color:typeMeta.color,
+                    background:`${typeMeta.color}15`, border:`1px solid ${typeMeta.color}33`,
+                    borderRadius:4, padding:"2px 6px", flexShrink:0, marginTop:1
+                  }}>{typeMeta.label}</span>
+                  <div style={{minWidth:0}}>
+                    <div style={{ fontSize:12, color:"#90A4AE", fontWeight:600, marginBottom:3,
+                      overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                      {d.path || d.name}
+                    </div>
+                    {!d.binary && (
+                      <div style={{ fontSize:10, color:C.textMuted, ...MONO, whiteSpace:"pre-wrap",
+                        maxHeight:60, overflow:"hidden", lineHeight:1.5 }}>
+                        {(d.content||"").substring(0,300)}{(d.content||"").length>300?"…":""}
+                      </div>
+                    )}
+                    {d.binary && <div style={{fontSize:10, color:C.textMuted, fontStyle:"italic"}}>binary file</div>}
+                  </div>
                 </div>
-                <div style={{ fontSize:11, color:C.textMuted, ...MONO, whiteSpace:"pre-wrap", maxHeight:80, overflow:"hidden", lineHeight:1.5 }}>
-                  {(d.content||"").substring(0,400)}{d.content?.length>400?"…":""}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Section>
       )}
@@ -3263,16 +3380,37 @@ export default function App() {
     try { localStorage.setItem("tf-intel-user-docs", JSON.stringify(docs)); } catch {}
   }, []);
   const addUserDocs = useCallback((fileList) => {
-    const allowed = Array.from(fileList).filter(f => /\.(txt|md|json|tf|pdf)$/.test(f.name));
-    if (!allowed.length) return;
-    Promise.all(allowed.map(f => new Promise((res) => {
+    // Skip: images, compiled binaries, archives, lock files with no text value
+    const SKIP_EXT = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
+    // Files that are text-readable (attempt readAsText on everything else)
+    const candidates = Array.from(fileList)
+      .filter(f => !SKIP_EXT.test(f.name) && f.size < 5 * 1024 * 1024); // skip >5MB
+    if (!candidates.length) return;
+    Promise.all(candidates.map(f => new Promise((res) => {
+      const path = f.webkitRelativePath || f.name;
+      const name = f.name;
+      const ext  = name.includes(".") ? name.split(".").pop().toLowerCase() : "txt";
       const r = new FileReader();
-      r.onload = ev => res({name:f.name, content:ev.target.result, type:f.name.split(".").pop()});
+      r.onload = ev => {
+        const content = ev.target.result;
+        // Heuristic: if first 512 bytes contain many non-printable chars it's binary
+        const sample = content.slice(0, 512);
+        const nonPrint = (sample.match(/[\x00-\x08\x0E-\x1F\x7F]/g) || []).length;
+        if (nonPrint > 20) {
+          res({ path, name, ext, content:"[binary file — not displayed]", binary:true, size:f.size });
+        } else {
+          res({ path, name, ext, content, binary:false, size:f.size });
+        }
+      };
       r.onerror = () => res(null);
       r.readAsText(f);
     }))).then(loaded => {
       const valid = loaded.filter(Boolean);
-      if (valid.length) saveUserDocs([...userDocs, ...valid]);
+      if (!valid.length) return;
+      // Deduplicate by path against existing docs
+      const existingPaths = new Set(userDocs.map(d => d.path || d.name));
+      const newDocs = valid.filter(d => !existingPaths.has(d.path || d.name));
+      if (newDocs.length) saveUserDocs([...userDocs, ...newDocs]);
     });
   }, [userDocs, saveUserDocs]);
 
@@ -3508,7 +3646,9 @@ export default function App() {
           {/* Content */}
           <div style={{overflowY:"auto", padding:"24px 28px", background:C.bg}}>
             {kbDomain === "userdocs"
-              ? <UserDocsPanel docs={userDocs} onAdd={addUserDocs} onDelete={(i) => saveUserDocs(userDocs.filter((_,idx)=>idx!==i))} />
+              ? <UserDocsPanel docs={userDocs} onAdd={addUserDocs}
+                  onDelete={(i) => saveUserDocs(userDocs.filter((_,idx)=>idx!==i))}
+                  onClear={() => saveUserDocs([])} />
               : <KBPanel domain={kbDomain} />
             }
           </div>
