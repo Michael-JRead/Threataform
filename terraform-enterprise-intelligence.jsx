@@ -1,4 +1,16 @@
-import { useState, useCallback, useRef, useMemo, Component } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect, Component } from "react";
+import {
+  BookOpen, Upload, Brain, Microscope, Map as MapIcon, Building2, Search, ShieldCheck,
+  ListChecks, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers,
+  Image as ImageIcon, BarChart2, Code2, BookMarked, LayoutList, ChevronLeft,
+  ArrowRight, Trash2, FolderOpen, Loader2, AppWindow, Sparkles, Shield, Cloud,
+  ClipboardList, Lock, SquareStack, DoorOpen, ArrowLeftRight, Globe, RefreshCw,
+  KeyRound, Link as LinkIcon, Database, FileText, ChevronDown, ChevronRight,
+  CheckCircle2, AlertCircle, Plus, X, Home, Settings, Info, Eye, EyeOff,
+  BarChart, TrendingUp, Target, Activity, ArrowUpRight, CheckSquare, Square,
+  PenLine, RotateCcw, Cpu, Server, Network, HardDrive, Users, Plug,
+  Download, XCircle, CheckCircle, Package,
+} from "lucide-react";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENTERPRISE TERRAFORM ARCHITECTURE INTELLIGENCE PLATFORM  v1.0
@@ -10,6 +22,13 @@ import { useState, useCallback, useRef, useMemo, Component } from "react";
 //  4. Jenkins / Jules → Terraform → xSphere/AWS Bootstrap Pipelines
 //  5. Enterprise Multi-Repo TF DFD — Upload files → parse → draw.io XML
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Icon mapping for KB domains — used in KBPanel and sidebar (avoids modifying large KB data)
+const KB_DOMAIN_ICONS = {
+  xsphere: Cloud, spinnaker: Settings, iam: KeyRound, jenkins: Server,
+  dfd: MapIcon, wiz: ShieldAlert, attack: Zap, cwe: TriangleAlert,
+  stride: Target, tfePave: Layers, userdocs: FileText,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KNOWLEDGE BASE
@@ -1192,6 +1211,111 @@ function detectPaveLayer(filePath) {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE EXTRACTION UTILITIES — PDF.js + Tesseract.js (CDN lazy-loaded)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function _loadScript(src) {
+  return new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+    const s = document.createElement("script");
+    s.src = src; s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
+
+async function _loadPdfJs() {
+  if (window.pdfjsLib) return;
+  await _loadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+async function _loadTesseract() {
+  if (window.Tesseract) return;
+  await _loadScript("https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js");
+}
+
+async function _ocrImageSource(imageSource) {
+  await _loadTesseract();
+  const worker = await window.Tesseract.createWorker("eng");
+  try {
+    const { data: { text } } = await worker.recognize(imageSource);
+    return text.trim();
+  } finally {
+    await worker.terminate();
+  }
+}
+
+async function _extractPdfPage(page) {
+  const tc = await page.getTextContent();
+  const text = tc.items.map(it => it.str).join(" ").trim();
+  if (text.length > 40) return text; // text-based page
+
+  // Image-based / scanned page — render to canvas then OCR
+  const viewport = page.getViewport({ scale: 1.5 });
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  const ocr = await _ocrImageSource(canvas);
+  return ocr || "";
+}
+
+/**
+ * extractTextFromFile(file) → Promise<string>
+ * Extracts rich text context from any uploaded file:
+ *  - PDF  → PDF.js text layer; image pages → Tesseract.js OCR
+ *  - Image files → Tesseract.js OCR with structural wrapper
+ *  - Everything else → FileReader.readAsText()
+ */
+async function extractTextFromFile(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+
+  if (ext === "pdf") {
+    try {
+      await _loadPdfJs();
+      const arrayBuf = await file.arrayBuffer();
+      const doc = await window.pdfjsLib.getDocument({ data: arrayBuf }).promise;
+      const pages = await Promise.all(
+        Array.from({ length: doc.numPages }, (_, i) =>
+          doc.getPage(i + 1).then(_extractPdfPage)
+        )
+      );
+      return pages.filter(Boolean).join("\n\n");
+    } catch (err) {
+      console.warn("[extractTextFromFile] PDF extraction failed:", err);
+      return `[PDF: ${file.name} — extraction failed]`;
+    }
+  }
+
+  if (/^image\//i.test(file.type) || /\.(png|jpg|jpeg|webp|bmp|tiff?)$/i.test(file.name)) {
+    try {
+      const dataUrl = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = e => res(e.target.result);
+        r.onerror = () => rej(new Error("FileReader error"));
+        r.readAsDataURL(file);
+      });
+      const ocr = await _ocrImageSource(dataUrl);
+      return `[Image: ${file.name}]\n${ocr || "[No extractable text — visual/diagram content]"}`;
+    } catch (err) {
+      console.warn("[extractTextFromFile] Image OCR failed:", err);
+      return `[Image: ${file.name} — OCR failed]`;
+    }
+  }
+
+  // All other text-readable files (tf, hcl, txt, md, json, yaml, csv, xml, sentinel…)
+  return new Promise(res => {
+    const r = new FileReader();
+    r.onload = e => res(e.target.result || "");
+    r.onerror = () => res("");
+    r.readAsText(file);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function parseTFMultiFile(files) {
   const resources=[], modules=[], connections=[], outputs=[], variables=[], remoteStates=[];
   // Build an output index keyed by "output_name" → value for cross-file resolution
@@ -1333,6 +1457,1143 @@ function parseTFMultiFile(files) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// THREAT MODEL INTELLIGENCE ENGINE
+// Pure client-side — NO external APIs, ZERO hallucination.
+// Retrieves verbatim passages from indexed documents using BM25-lite scoring.
+// Entity extraction covers STRIDE, MITRE ATT&CK, compliance, AWS services,
+// security controls, and architecture scope declarations.
+// ─────────────────────────────────────────────────────────────────────────────
+const _STOP = new Set([
+  "the","a","an","is","are","was","were","be","been","being","have","has","had",
+  "do","does","did","will","would","could","should","may","might","must","shall",
+  "and","or","but","if","in","on","at","to","for","of","with","by","from","as",
+  "this","that","these","those","it","its","we","they","he","she","you","i",
+  "not","no","so","then","than","when","where","how","what","which","who","all",
+  "also","can","use","used","using","each","other","more","such","well","via",
+  "get","set","any","its","our","your","their","been","has","had","one","two",
+]);
+
+const _ENTITY_PATTERNS = {
+  stride: {
+    spoofing:     /\b(spoof|impersonat|fake.identity|fake.cred|bypass.auth|phishing|cred.theft|identity.theft)\b/gi,
+    tampering:    /\b(tamper|corrupt|modif|inject|alter|manipulat|integrity|supply.chain|sql.inject|code.inject)\b/gi,
+    repudiation:  /\b(repudiat|audit.trail|non.repudiation|forensic|evidence|audit.log|immutable.log)\b/gi,
+    infoDisclose: /\b(information.disclosure|data.leak|exfiltrat|sensitive.data|secret|credential.expos|pii|phi)\b/gi,
+    dos:          /\b(denial.of.service|\bdos\b|\bddos\b|rate.limit|throttl|flood|resource.exhaust|availability)\b/gi,
+    elevPriv:     /\b(privilege.escalat|elevation.of.priv|lateral.movement|sudo|root.access|breakout|iam.escalat)\b/gi,
+  },
+  attack: {
+    initialAccess:   /\b(initial.access|phishing|valid.accounts|exploit.public|supply.chain.compromise)\b/gi,
+    execution:       /\b(execution|scripting|lambda.exec|user.execution|command.script|powershell)\b/gi,
+    persistence:     /\b(persistence|backdoor|scheduled.task|startup|boot.persist|account.manipulation)\b/gi,
+    privEsc:         /\b(privilege.escalat|access.token|abuse.elevation|exploitation.for.privesc)\b/gi,
+    defenseEvasion:  /\b(defense.evasion|obfuscat|disable.security|log.tamper|rootkit|masquerade)\b/gi,
+    credAccess:      /\b(credential.access|brute.force|keylogg|pass.the.hash|cred.dump|credential.stuffing)\b/gi,
+    discovery:       /\b(discovery|network.scan|account.discovery|cloud.infrastructure|enumerate|recon)\b/gi,
+    lateralMovement: /\b(lateral.movement|remote.service|pass.the.ticket|ssh.hijack|internal.spear)\b/gi,
+    exfiltration:    /\b(exfiltrat|data.theft|c2.exfil|dns.exfil|transfer.data)\b/gi,
+    impact:          /\b(ransomware|wiper|defacement|data.destruction|service.stop|inhibit.recovery)\b/gi,
+  },
+  compliance: {
+    hipaa:    /\b(hipaa|protected.health|ehr|electronic.health|\bbaa\b|hitrust)\b/gi,
+    fedramp:  /\b(fedramp|nist.800|fisma|federal.risk|govcloud|government.cloud)\b/gi,
+    soc2:     /\b(soc.?2|soc\s2|type.ii|aicpa|trust.service.criteria)\b/gi,
+    pci:      /\b(pci.?dss|payment.card|cardholder|card.data|\bpan\b|\bcvv\b)\b/gi,
+    gdpr:     /\b(gdpr|data.protection.regulation|right.to.erasure|data.subject|personal.data)\b/gi,
+    cmmc:     /\b(cmmc|cybersecurity.maturity|defense.industrial|\bdib\b|\bcui\b|controlled.unclassified)\b/gi,
+    iso27001: /\b(iso.?27001|isms|information.security.management)\b/gi,
+  },
+  aws: {
+    s3:         /\b(aws_s3|\bs3\b|simple.storage|object.storage|bucket)\b/gi,
+    ec2:        /\b(aws_ec2|\bec2\b|elastic.compute|ec2.instance|auto.?scaling.group)\b/gi,
+    iam:        /\b(aws_iam|\biam\b|identity.access|assume.?role|\bscp\b|service.control)\b/gi,
+    lambda:     /\b(aws_lambda|\blambda\b|serverless.function|event.?driven.compute)\b/gi,
+    rds:        /\b(aws_rds|\brds\b|aurora|db.instance|relational.database)\b/gi,
+    vpc:        /\b(aws_vpc|\bvpc\b|virtual.private.cloud|security.group|subnet|nacl)\b/gi,
+    kms:        /\b(aws_kms|\bkms\b|key.management|customer.managed.key|\bcmk\b)\b/gi,
+    cloudtrail: /\b(cloudtrail|api.audit|aws.audit.log|trail)\b/gi,
+    guardduty:  /\b(guardduty|threat.detection|malicious.activity|findings)\b/gi,
+    waf:        /\b(aws_waf|\bwaf\b|web.application.firewall|owasp.rule)\b/gi,
+    secrets:    /\b(secrets.?manager|parameter.store|secret.rotation)\b/gi,
+  },
+  security: {
+    encryption:  /\b(encrypt|at.?rest|in.?transit|\btls\b|\bssl\b|\baes\b|\brsa\b|cipher)\b/gi,
+    mfa:         /\b(\bmfa\b|multi.?factor|two.?factor|\btotp\b|hardware.token|yubikey)\b/gi,
+    zeroTrust:   /\b(zero.?trust|never.trust|least.privilege|microsegment|always.verify)\b/gi,
+    secrets:     /\b(api.?key|hardcoded.secret|secret.leak|exposed.credential|private.?key)\b/gi,
+    monitoring:  /\b(siem|security.monitor|alert|alarm|observ|audit.log|trace)\b/gi,
+    network:     /\b(\bdmz\b|perimeter|network.segment|bastion|jump.?host|\bvpn\b|private.?link)\b/gi,
+  },
+  scope: {
+    inScope:    /\b(in.?scope|within.?scope|assessment.scope|included.in.scope|in\s+scope)\b/gi,
+    outOfScope: /\b(out.?of.?scope|excluded|not.in.scope|beyond.scope|outside.scope)\b/gi,
+    boundary:   /\b(trust.boundary|security.boundary|data.flow.boundary|scope.boundary|system.boundary)\b/gi,
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUILT-IN THREAT INTELLIGENCE KNOWLEDGE GRAPH v2
+// MITRE ATT&CK Cloud, CWE, Terraform → Threat Mappings, Misconfig Checks
+// ─────────────────────────────────────────────────────────────────────────────
+const ATTACK_TECHNIQUES = {
+  'T1078.004':{ name:'Valid Cloud Accounts',           tactic:'Initial Access/Persistence',  severity:'Critical', desc:'Adversaries obtain and abuse credentials of existing cloud accounts to gain access.' },
+  'T1530':    { name:'Data from Cloud Storage',        tactic:'Collection',                  severity:'High',     desc:'Adversaries access data from improperly secured cloud storage objects.' },
+  'T1537':    { name:'Transfer Data to Cloud Account', tactic:'Exfiltration',                severity:'High',     desc:'Adversaries exfiltrate data to a different cloud account they control.' },
+  'T1098.001':{ name:'Additional Cloud Credentials',   tactic:'Persistence',                 severity:'High',     desc:'Adversaries add adversary-controlled credentials to maintain persistent access.' },
+  'T1098.003':{ name:'Additional Cloud Roles',         tactic:'Persistence',                 severity:'High',     desc:'Adversaries attach IAM roles with elevated permissions to cloud services.' },
+  'T1580':    { name:'Cloud Infrastructure Discovery', tactic:'Discovery',                   severity:'Medium',   desc:'Adversaries enumerate cloud infrastructure, services, and configurations.' },
+  'T1562.008':{ name:'Disable Cloud Logs',             tactic:'Defense Evasion',             severity:'High',     desc:'Adversaries disable CloudTrail or other logging to evade detection.' },
+  'T1552.005':{ name:'Cloud Instance Metadata API',   tactic:'Credential Access',           severity:'High',     desc:'Adversaries query the Instance Metadata Service (IMDS) for credentials.' },
+  'T1648':    { name:'Serverless Execution',           tactic:'Execution',                   severity:'Medium',   desc:'Adversaries abuse serverless functions to execute malicious code or commands.' },
+  'T1059.009':{ name:'Cloud API',                      tactic:'Execution',                   severity:'Medium',   desc:'Adversaries abuse cloud management APIs to execute commands or access resources.' },
+  'T1190':    { name:'Exploit Public-Facing App',      tactic:'Initial Access',              severity:'Critical', desc:'Adversaries exploit vulnerabilities in internet-facing applications or services.' },
+  'T1485':    { name:'Data Destruction',               tactic:'Impact',                      severity:'Critical', desc:'Adversaries destroy data and files to interrupt availability of systems.' },
+  'T1490':    { name:'Inhibit System Recovery',        tactic:'Impact',                      severity:'High',     desc:'Adversaries delete backups and snapshots to prevent recovery operations.' },
+  'T1496':    { name:'Resource Hijacking',             tactic:'Impact',                      severity:'Medium',   desc:'Adversaries leverage compromised systems for cryptomining or other compute abuse.' },
+  'T1548':    { name:'Abuse Elevation Control',        tactic:'Privilege Escalation',        severity:'High',     desc:'Adversaries abuse elevated control mechanisms such as IAM policies to gain higher privileges.' },
+  'T1555.006':{ name:'Cloud Secrets Management',       tactic:'Credential Access',           severity:'High',     desc:'Adversaries query cloud secrets stores (Secrets Manager, SSM) for credentials.' },
+  'T1600':    { name:'Weaken Encryption',              tactic:'Defense Evasion',             severity:'High',     desc:'Adversaries compromise or disable KMS keys to weaken cryptographic protections.' },
+  'T1613':    { name:'Container and Resource Discovery',tactic:'Discovery',                  severity:'Medium',   desc:'Adversaries enumerate containers, pods, and cluster resources for lateral movement.' },
+  'T1046':    { name:'Network Service Discovery',      tactic:'Discovery',                   severity:'Low',      desc:'Adversaries scan network services to identify attack surface.' },
+  'T1133':    { name:'External Remote Services',       tactic:'Initial Access/Persistence',  severity:'High',     desc:'Adversaries leverage VPNs, RDP, or other external remote services for persistent access.' },
+};
+
+// Terraform resource type → ATT&CK technique IDs
+const TF_ATTACK_MAP = {
+  'aws_s3_bucket':                     ['T1530','T1537','T1485'],
+  'aws_s3_bucket_acl':                 ['T1530'],
+  'aws_s3_bucket_policy':              ['T1530','T1078.004'],
+  'aws_s3_bucket_public_access_block': ['T1530'],
+  'aws_iam_role':                      ['T1078.004','T1098.003','T1548'],
+  'aws_iam_user':                      ['T1078.004','T1098.001'],
+  'aws_iam_policy':                    ['T1078.004','T1548'],
+  'aws_iam_role_policy_attachment':    ['T1098.003','T1548'],
+  'aws_iam_user_policy':               ['T1078.004'],
+  'aws_iam_instance_profile':          ['T1552.005','T1548'],
+  'aws_lambda_function':               ['T1648','T1059.009','T1552.005'],
+  'aws_lambda_permission':             ['T1648'],
+  'aws_instance':                      ['T1552.005','T1190','T1580'],
+  'aws_launch_template':               ['T1552.005'],
+  'aws_autoscaling_group':             ['T1496','T1190'],
+  'aws_cloudtrail':                    ['T1562.008'],
+  'aws_kms_key':                       ['T1600'],
+  'aws_kms_alias':                     ['T1600'],
+  'aws_secretsmanager_secret':         ['T1555.006'],
+  'aws_ssm_parameter':                 ['T1555.006'],
+  'aws_rds_instance':                  ['T1530','T1190','T1485'],
+  'aws_rds_cluster':                   ['T1530','T1485'],
+  'aws_db_instance':                   ['T1530','T1190','T1485'],
+  'aws_elasticache_cluster':           ['T1530','T1190'],
+  'aws_security_group':                ['T1190','T1046'],
+  'aws_security_group_rule':           ['T1190','T1046'],
+  'aws_vpc':                           ['T1580'],
+  'aws_subnet':                        ['T1580'],
+  'aws_internet_gateway':              ['T1133','T1190'],
+  'aws_nat_gateway':                   ['T1537'],
+  'aws_lb':                            ['T1190','T1133'],
+  'aws_alb':                           ['T1190','T1133'],
+  'aws_lb_listener':                   ['T1190'],
+  'aws_cloudfront_distribution':       ['T1190','T1530'],
+  'aws_wafv2_web_acl':                 ['T1190'],
+  'aws_guardduty_detector':            ['T1562.008'],
+  'aws_config_rule':                   ['T1562.008'],
+  'aws_config_configuration_recorder': ['T1562.008'],
+  'aws_sns_topic':                     ['T1537','T1059.009'],
+  'aws_sqs_queue':                     ['T1537','T1485'],
+  'aws_dynamodb_table':                ['T1530','T1485'],
+  'aws_elasticsearch_domain':          ['T1530','T1190'],
+  'aws_opensearch_domain':             ['T1530','T1190'],
+  'aws_eks_cluster':                   ['T1613','T1190','T1548'],
+  'aws_ecs_cluster':                   ['T1613','T1648'],
+  'aws_ecs_task_definition':           ['T1552.005','T1648'],
+  'aws_ecr_repository':                ['T1613'],
+  'aws_apigatewayv2_api':              ['T1190','T1059.009'],
+  'aws_api_gateway_rest_api':          ['T1190','T1059.009'],
+  'aws_route53_record':                ['T1580'],
+  'aws_route53_zone':                  ['T1580'],
+  'aws_organizations_policy':          ['T1078.004','T1548'],
+  'xsphere_virtual_machine':           ['T1190','T1552.005','T1580'],
+  'xsphere_cluster':                   ['T1580','T1613'],
+};
+
+// CWE weakness definitions
+const CWE_DETAILS = {
+  'CWE-284':{ name:'Improper Access Control',                    desc:'The software does not restrict or incorrectly restricts access to a resource from an unauthorized actor.' },
+  'CWE-285':{ name:'Improper Authorization',                     desc:'Failure to verify that an actor is authorized to access a resource or perform an action.' },
+  'CWE-311':{ name:'Missing Encryption of Sensitive Data',       desc:'The software does not encrypt sensitive data, exposing it to unauthorized actors.' },
+  'CWE-312':{ name:'Cleartext Storage of Sensitive Information', desc:'Sensitive information is stored in plaintext accessible to unauthorized parties.' },
+  'CWE-326':{ name:'Inadequate Encryption Strength',             desc:'The software stores or transmits data using encryption that is considered too weak.' },
+  'CWE-732':{ name:'Incorrect Permission Assignment',            desc:'Permissions allow unauthorized actors to access critical resources.' },
+  'CWE-778':{ name:'Insufficient Logging',                       desc:'The software does not log security-relevant events, impeding detection of attacks.' },
+  'CWE-256':{ name:'Plaintext Storage of Password',              desc:'Storing passwords in plaintext may result in system compromise if storage is breached.' },
+  'CWE-250':{ name:'Execution with Unnecessary Privileges',      desc:'The software performs operations using excessively high-privilege accounts or credentials.' },
+  'CWE-319':{ name:'Cleartext Transmission',                     desc:'Sensitive information is transmitted in plaintext over an unencrypted network channel.' },
+  'CWE-306':{ name:'Missing Authentication for Critical Function',desc:'The software does not perform any authentication for functionality that requires identity.' },
+  'CWE-798':{ name:'Use of Hard-coded Credentials',              desc:'Hard-coded credentials used for authentication to external systems or as inbound auth.' },
+  'CWE-400':{ name:'Uncontrolled Resource Consumption',          desc:'Improper resource control allows an attacker to cause denial of service.' },
+  'CWE-269':{ name:'Improper Privilege Management',              desc:'The software does not properly assign, modify, track, or check privileges.' },
+  'CWE-1104':{ name:'Use of Unmaintained Third-Party Component', desc:'The product relies on a third-party component that is no longer actively maintained.' },
+};
+
+// STRIDE applicability by DFD element type
+const STRIDE_PER_ELEMENT = {
+  external_entity: ['spoofing','repudiation'],
+  process:         ['spoofing','tampering','repudiation','infoDisclose','dos','elevPriv'],
+  data_store:      ['tampering','repudiation','infoDisclose','dos'],
+  data_flow:       ['spoofing','tampering','infoDisclose','dos'],
+};
+
+// Resource type → DFD element type for STRIDE-per-element
+function _getElementType(resourceType) {
+  const rt = resourceType || '';
+  if (/s3|rds|dynamodb|elasticache|opensearch|elasticsearch|ebs|efs|ssm_parameter|secrets/.test(rt)) return 'data_store';
+  if (/security_group|nacl|waf|shield|firewall|acl|route53|nat_gateway|internet_gateway/.test(rt)) return 'data_flow';
+  if (/iam_role|iam_user|iam_policy|organizations|cognito/.test(rt)) return 'external_entity';
+  return 'process';
+}
+
+// Terraform misconfiguration checks (checkov-style, pure attribute inspection)
+const TF_MISCONFIG_CHECKS = {
+  'aws_s3_bucket': [
+    { id:'S3-001', title:'S3 Bucket Public Access Not Blocked',   severity:'Critical', cwe:['CWE-284','CWE-732'], attack:['T1530'], check:(a)=>!a.block_public_acls&&!a.block_public_policy,              remediation:'Enable aws_s3_bucket_public_access_block with all four settings = true.' },
+    { id:'S3-002', title:'S3 Bucket Versioning Disabled',         severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'], check:(a)=>!a.versioning,                                              remediation:'Enable versioning { enabled = true } for data protection and DR.' },
+    { id:'S3-003', title:'S3 Bucket Access Logging Disabled',     severity:'Medium',   cwe:['CWE-778'],           attack:['T1562.008'], check:(a)=>!a.logging,                                            remediation:'Enable server access logging via logging { target_bucket = ... }' },
+    { id:'S3-004', title:'S3 Bucket Encryption Not Configured',   severity:'High',     cwe:['CWE-311'],           attack:['T1530'], check:(a)=>!a.server_side_encryption_configuration,                   remediation:'Configure server_side_encryption_configuration with AES256 or aws:kms.' },
+  ],
+  'aws_security_group': [
+    { id:'SG-001', title:'Unrestricted SSH Access (0.0.0.0/0:22)',   severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=22&&r.to_port>=22&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),   remediation:'Restrict SSH to known IP ranges. Use bastion host or SSM Session Manager.' },
+    { id:'SG-002', title:'Unrestricted RDP Access (0.0.0.0/0:3389)', severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=3389&&r.to_port>=3389&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),remediation:'Restrict RDP to specific IP ranges. Use VPN or Direct Connect.' },
+    { id:'SG-003', title:'All Inbound Traffic Allowed (0.0.0.0/0)', severity:'Critical', cwe:['CWE-732'],           attack:['T1190'],         check:(a)=>(a.ingress||[]).some(r=>r.from_port===0&&r.to_port===0&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),        remediation:'Apply least privilege. Only allow necessary ports from known CIDRs.' },
+  ],
+  'aws_rds_instance': [
+    { id:'RDS-001', title:'RDS Not Encrypted at Rest',          severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],        check:(a)=>!a.storage_encrypted,                   remediation:'Set storage_encrypted = true and specify a kms_key_id.' },
+    { id:'RDS-002', title:'RDS Instance Publicly Accessible',   severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],        check:(a)=>a.publicly_accessible===true,            remediation:'Set publicly_accessible = false. Place RDS in private subnets only.' },
+    { id:'RDS-003', title:'RDS Deletion Protection Disabled',   severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.deletion_protection,                 remediation:'Set deletion_protection = true in all production environments.' },
+    { id:'RDS-004', title:'RDS Automated Backups Disabled',     severity:'High',     cwe:['CWE-400'],           attack:['T1485','T1490'], check:(a)=>a.backup_retention_period===0,           remediation:'Set backup_retention_period >= 7 days for production databases.' },
+    { id:'RDS-005', title:'RDS Multi-AZ Not Enabled',           severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.multi_az,                            remediation:'Set multi_az = true for high availability in production.' },
+  ],
+  'aws_db_instance': [
+    { id:'RDS-001', title:'DB Not Encrypted at Rest',           severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],  check:(a)=>!a.storage_encrypted,     remediation:'Set storage_encrypted = true and specify kms_key_id.' },
+    { id:'RDS-002', title:'DB Instance Publicly Accessible',    severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],  check:(a)=>a.publicly_accessible===true, remediation:'Set publicly_accessible = false.' },
+  ],
+  'aws_instance': [
+    { id:'EC2-001', title:'IMDSv1 Enabled (Metadata API Vulnerable)', severity:'High',   cwe:['CWE-284'],    attack:['T1552.005'], check:(a)=>{ const m=a.metadata_options; return !m||m.http_tokens!=='required'; }, remediation:'Set metadata_options { http_tokens = "required" } to enforce IMDSv2.' },
+    { id:'EC2-002', title:'No IAM Instance Profile Assigned',         severity:'Low',    cwe:['CWE-250'],    attack:['T1552.005'], check:(a)=>!a.iam_instance_profile,                                              remediation:'Assign a least-privilege IAM instance profile; avoid embedded credentials.' },
+    { id:'EC2-003', title:'Root EBS Volume Not Encrypted',            severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const r=a.root_block_device; return !r||!r.encrypted; },            remediation:'Set root_block_device { encrypted = true, kms_key_id = ... }' },
+    { id:'EC2-004', title:'EBS Volumes Not Encrypted',                severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const b=a.ebs_block_device||[]; return b.some&&b.some(v=>!v.encrypted); }, remediation:'Set encrypted = true on all ebs_block_device blocks.' },
+  ],
+  'aws_cloudtrail': [
+    { id:'CT-001', title:'CloudTrail Log File Validation Disabled', severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.enable_log_file_validation, remediation:'Set enable_log_file_validation = true to detect log tampering.' },
+    { id:'CT-002', title:'CloudTrail Logs Not Encrypted with KMS',  severity:'Medium', cwe:['CWE-311'], attack:['T1530'],     check:(a)=>!a.kms_key_id,                remediation:'Set kms_key_id to a KMS CMK ARN to encrypt CloudTrail logs at rest.' },
+    { id:'CT-003', title:'CloudTrail Not Multi-Region',             severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.is_multi_region_trail,      remediation:'Set is_multi_region_trail = true to capture all regional API activity.' },
+  ],
+  'aws_kms_key': [
+    { id:'KMS-001', title:'KMS Key Rotation Disabled', severity:'Medium', cwe:['CWE-326'], attack:['T1600'], check:(a)=>!a.enable_key_rotation, remediation:'Set enable_key_rotation = true for automatic annual key rotation.' },
+  ],
+  'aws_lambda_function': [
+    { id:'LMB-001', title:'Lambda Not Inside VPC',                    severity:'Medium', cwe:['CWE-284'],           attack:['T1648'],     check:(a)=>!a.vpc_config,                                                           remediation:'Configure vpc_config with subnet_ids and security_group_ids.' },
+    { id:'LMB-002', title:'Lambda Uses Deprecated/EOL Runtime',       severity:'High',   cwe:['CWE-1104'],          attack:['T1190'],     check:(a)=>['nodejs12.x','nodejs10.x','python2.7','python3.6','ruby2.5'].includes(a.runtime||''), remediation:'Upgrade to a current supported runtime (nodejs20.x, python3.12, etc.).' },
+    { id:'LMB-003', title:'Lambda Env Vars May Contain Secrets',      severity:'High',   cwe:['CWE-256','CWE-798'], attack:['T1555.006'], check:(a)=>{ const e=JSON.stringify(a.environment||'').toLowerCase(); return /password|secret|key|token|credential/.test(e); }, remediation:'Use AWS Secrets Manager or SSM SecureString instead of env var secrets.' },
+  ],
+  'aws_ssm_parameter': [
+    { id:'SSM-001', title:'SSM Parameter Not SecureString Type', severity:'High', cwe:['CWE-256','CWE-312'], attack:['T1555.006'], check:(a)=>a.type!=='SecureString', remediation:'Use type = "SecureString" with a KMS key for sensitive parameter values.' },
+  ],
+  'aws_eks_cluster': [
+    { id:'EKS-001', title:'EKS API Endpoint Publicly Accessible',  severity:'High',   cwe:['CWE-284'], attack:['T1190','T1613'], check:(a)=>{ const v=a.vpc_config; return !v||v.endpoint_public_access!==false; },  remediation:'Set endpoint_public_access = false; access cluster via private endpoint + VPN.' },
+    { id:'EKS-002', title:'EKS Control Plane Logging Incomplete',   severity:'Medium', cwe:['CWE-778'], attack:['T1562.008'],     check:(a)=>{ const l=a.enabled_cluster_log_types||[]; return !['api','audit','authenticator'].every(x=>l.includes(x)); }, remediation:'Enable all log types: api, audit, authenticator, controllerManager, scheduler.' },
+  ],
+  'aws_iam_role': [
+    { id:'IAM-001', title:'IAM Role Allows Wildcard Actions (*)', severity:'Critical', cwe:['CWE-284','CWE-269'], attack:['T1078.004','T1548'], check:(a)=>{ const p=JSON.stringify(a.assume_role_policy||a.inline_policy||''); return p.includes('"Action":"*"')||p.includes('"Action": "*"'); }, remediation:'Apply least-privilege IAM. Enumerate only required actions — never use "*".' },
+  ],
+  'aws_iam_user': [
+    { id:'IAM-002', title:'IAM User Detected — Prefer IAM Roles', severity:'Low', cwe:['CWE-285'], attack:['T1078.004'], check:()=>true, remediation:'Prefer IAM roles for service access and AWS SSO/Identity Center for human access.' },
+  ],
+  // ── DynamoDB ──────────────────────────────────────────────────────────────
+  'aws_dynamodb_table': [
+    { id:'DDB-001', title:'DynamoDB Table No Explicit KMS Encryption',  severity:'Medium', cwe:['CWE-311'],       attack:['T1530'],     check:(a)=>!a.server_side_encryption, remediation:'Add server_side_encryption { enabled = true } with a CMK kms_key_arn for compliance.' },
+    { id:'DDB-002', title:'DynamoDB PITR (Point-in-Time Recovery) Off',  severity:'High',   cwe:['CWE-400'],       attack:['T1485','T1490'], check:(a)=>!a.point_in_time_recovery, remediation:'Enable point_in_time_recovery { enabled = true } for ransomware / deletion recovery.' },
+    { id:'DDB-003', title:'DynamoDB Table Has No Deletion Protection',   severity:'Medium', cwe:['CWE-400'],       attack:['T1485'],     check:(a)=>!a.deletion_protection_enabled, remediation:'Set deletion_protection_enabled = true to prevent accidental or malicious deletion.' },
+  ],
+  // ── ElastiCache ───────────────────────────────────────────────────────────
+  'aws_elasticache_cluster': [
+    { id:'ECACHE-001', title:'ElastiCache Cluster Not Encrypted at Rest',    severity:'High',   cwe:['CWE-311','CWE-326'], attack:['T1530'],     check:(a)=>!a.at_rest_encryption_enabled, remediation:'Set at_rest_encryption_enabled = true with kms_key_id for CMK encryption.' },
+    { id:'ECACHE-002', title:'ElastiCache Cluster Not Encrypted in Transit', severity:'High',   cwe:['CWE-319'],           attack:['T1040'],     check:(a)=>!a.transit_encryption_enabled,  remediation:'Set transit_encryption_enabled = true (requires Redis engine >= 3.2.6).' },
+    { id:'ECACHE-003', title:'ElastiCache No Auth Token (Redis AUTH off)',   severity:'Medium', cwe:['CWE-306'],           attack:['T1078'],     check:(a)=>!a.auth_token,                  remediation:'Set auth_token for Redis clusters with transit_encryption_enabled = true.' },
+    { id:'ECACHE-004', title:'ElastiCache No Snapshot Retention',           severity:'Medium', cwe:['CWE-400'],           attack:['T1485'],     check:(a)=>!a.snapshot_retention_limit||a.snapshot_retention_limit===0, remediation:'Set snapshot_retention_limit >= 7 days for backup and recovery capability.' },
+  ],
+  'aws_elasticache_replication_group': [
+    { id:'ECACHE-001', title:'ElastiCache Replication Group Not Encrypted at Rest',    severity:'High',   cwe:['CWE-311'], attack:['T1530'], check:(a)=>!a.at_rest_encryption_enabled, remediation:'Set at_rest_encryption_enabled = true.' },
+    { id:'ECACHE-002', title:'ElastiCache Replication Group Not Encrypted in Transit', severity:'High',   cwe:['CWE-319'], attack:['T1040'], check:(a)=>!a.transit_encryption_enabled,  remediation:'Set transit_encryption_enabled = true.' },
+    { id:'ECACHE-003', title:'ElastiCache Replication Group No Auth Token',            severity:'Medium', cwe:['CWE-306'], attack:['T1078'], check:(a)=>!a.auth_token,                  remediation:'Set auth_token for Redis AUTH enforcement.' },
+  ],
+  // ── API Gateway ───────────────────────────────────────────────────────────
+  'aws_api_gateway_rest_api': [
+    { id:'APIGW-001', title:'API Gateway Execute-API Endpoint Not Disabled',severity:'Medium', cwe:['CWE-284'],     attack:['T1190'], check:(a)=>!a.disable_execute_api_endpoint, remediation:'Set disable_execute_api_endpoint = true; access via custom domain with WAF.' },
+    { id:'APIGW-002', title:'API Gateway No WAF ACL Associated',            severity:'High',   cwe:['CWE-693'],     attack:['T1190','T1499'], check:(a)=>!a.body?.includes('aws_wafv2_web_acl_association'), remediation:'Associate an aws_wafv2_web_acl_association resource with the API stage.' },
+  ],
+  'aws_apigatewayv2_api': [
+    { id:'APIGW2-001', title:'API GW v2 No CORS Configuration',             severity:'Low',    cwe:['CWE-346'],     attack:['T1059.009'], check:(a)=>!a.cors_configuration, remediation:'Configure cors_configuration with explicit allow_origins — avoid wildcard.' },
+    { id:'APIGW2-002', title:'API GW v2 No Authorizer Configured',          severity:'High',   cwe:['CWE-306'],     attack:['T1190'],     check:(a)=>!a.authorizer_id&&!a.authorization_type&&a.authorization_type!=='JWT'&&a.authorization_type!=='AWS_IAM', remediation:'Attach a JWT or IAM authorizer; never expose unauthenticated routes in production.' },
+  ],
+  // ── SNS ───────────────────────────────────────────────────────────────────
+  'aws_sns_topic': [
+    { id:'SNS-001', title:'SNS Topic Not Encrypted with KMS',         severity:'High',   cwe:['CWE-311','CWE-326'], attack:['T1530'],     check:(a)=>!a.kms_master_key_id, remediation:'Set kms_master_key_id to a CMK ARN — never use unencrypted topics for sensitive payloads.' },
+    { id:'SNS-002', title:'SNS Topic Policy Allows Public Publish',   severity:'Critical',cwe:['CWE-284'],           attack:['T1059.009'], check:(a)=>{ const p=JSON.stringify(a.policy||''); return p.includes('"Principal":"*"')||p.includes('"Principal":{"AWS":"*"}'); }, remediation:'Restrict sns:Publish to specific IAM principals; never use Principal = "*".' },
+  ],
+  // ── SQS ───────────────────────────────────────────────────────────────────
+  'aws_sqs_queue': [
+    { id:'SQS-001', title:'SQS Queue Not Encrypted',                   severity:'High',   cwe:['CWE-311','CWE-326'], attack:['T1530'], check:(a)=>!a.kms_master_key_id&&!a.sqs_managed_sse_enabled, remediation:'Set sqs_managed_sse_enabled = true or specify kms_master_key_id for SSE-KMS.' },
+    { id:'SQS-002', title:'SQS Queue Policy Allows Public Access',     severity:'Critical',cwe:['CWE-284'],           attack:['T1530'], check:(a)=>{ const p=JSON.stringify(a.policy||''); return p.includes('"Principal":"*"')||p.includes('"Principal":{"AWS":"*"}'); }, remediation:'Restrict sqs:SendMessage to specific IAM principals or VPC endpoint conditions.' },
+    { id:'SQS-003', title:'SQS Queue Visibility Timeout Too Low',      severity:'Low',    cwe:['CWE-400'],           attack:['T1499'], check:(a)=>a.visibility_timeout_seconds<30, remediation:'Set visibility_timeout_seconds >= Lambda timeout (min 30s) to prevent duplicate processing.' },
+  ],
+  // ── CloudFront ────────────────────────────────────────────────────────────
+  'aws_cloudfront_distribution': [
+    { id:'CF-001', title:'CloudFront Allows HTTP (Not HTTPS-Only)',    severity:'High',   cwe:['CWE-319'],     attack:['T1040'],     check:(a)=>!a.viewer_protocol_policy||a.viewer_protocol_policy==='allow-all', remediation:'Set viewer_protocol_policy = "redirect-to-https" or "https-only" in all cache behaviors.' },
+    { id:'CF-002', title:'CloudFront No WAF Web ACL Associated',       severity:'High',   cwe:['CWE-693'],     attack:['T1190','T1499'], check:(a)=>!a.web_acl_id, remediation:'Set web_acl_id to an aws_wafv2_web_acl ARN (must be in us-east-1 for CloudFront).' },
+    { id:'CF-003', title:'CloudFront Logging Disabled',                severity:'Medium', cwe:['CWE-778'],     attack:['T1562.008'], check:(a)=>!a.logging_config, remediation:'Configure logging_config { bucket = ... } to capture all edge access logs.' },
+    { id:'CF-004', title:'CloudFront Geo Restriction Not Configured',  severity:'Low',    cwe:['CWE-284'],     attack:['T1190'],     check:(a)=>!a.restrictions&&!a.geo_restriction, remediation:'Configure geo_restriction if the application should be limited to specific countries.' },
+  ],
+  // ── Load Balancer ─────────────────────────────────────────────────────────
+  'aws_lb_listener': [
+    { id:'LB-001', title:'Load Balancer Listener Using HTTP Not HTTPS', severity:'High',   cwe:['CWE-319'],     attack:['T1040'], check:(a)=>a.protocol==='HTTP'&&!a.redirect, remediation:'Redirect HTTP → HTTPS or use HTTPS listener with a valid ACM certificate.' },
+    { id:'LB-002', title:'Load Balancer HTTPS Using Insecure TLS Policy',severity:'Medium',cwe:['CWE-326'],     attack:['T1040'], check:(a)=>a.protocol==='HTTPS'&&a.ssl_policy&&['ELBSecurityPolicy-2015-05','ELBSecurityPolicy-TLS-1-0-2015-04'].includes(a.ssl_policy), remediation:'Use ELBSecurityPolicy-TLS13-1-2-2021-06 or newer. Avoid legacy TLS 1.0/1.1 policies.' },
+  ],
+  // ── Secrets Manager ───────────────────────────────────────────────────────
+  'aws_secretsmanager_secret': [
+    { id:'SM-001', title:'Secrets Manager Secret No Automatic Rotation', severity:'High',   cwe:['CWE-324'],     attack:['T1555.006'], check:(a)=>!a.rotation_lambda_arn&&!a.rotation_rules, remediation:'Configure rotation_rules { automatically_after_days = 90 } and a rotation Lambda.' },
+    { id:'SM-002', title:'Secrets Manager ForceDelete (No Recovery Window)', severity:'High',cwe:['CWE-400'],    attack:['T1485'],     check:(a)=>a.recovery_window_in_days===0||a.force_overwrite_replica_secret===true, remediation:'Set recovery_window_in_days = 30 (default). Avoid force delete in production.' },
+  ],
+  // ── RDS Cluster ───────────────────────────────────────────────────────────
+  'aws_rds_cluster': [
+    { id:'RDSC-001', title:'RDS Cluster Not Encrypted at Rest',        severity:'High',   cwe:['CWE-311','CWE-326'], attack:['T1530'],     check:(a)=>!a.storage_encrypted, remediation:'Set storage_encrypted = true and specify kms_key_id for the cluster.' },
+    { id:'RDSC-002', title:'RDS Cluster Deletion Protection Disabled', severity:'Medium', cwe:['CWE-400'],           attack:['T1485'],     check:(a)=>!a.deletion_protection, remediation:'Set deletion_protection = true to prevent accidental cluster deletion.' },
+    { id:'RDSC-003', title:'RDS Cluster Backup Retention Too Short',   severity:'High',   cwe:['CWE-400'],           attack:['T1485','T1490'], check:(a)=>!a.backup_retention_period||a.backup_retention_period<7, remediation:'Set backup_retention_period >= 7 days. Minimum 35 days for PCI/HIPAA.' },
+    { id:'RDSC-004', title:'RDS Cluster Not Multi-AZ',                 severity:'Medium', cwe:['CWE-400'],           attack:['T1485'],     check:(a)=>!a.availability_zones||!a.multi_az, remediation:'Configure multi-AZ by specifying multiple availability_zones or setting multi_az = true.' },
+  ],
+  // ── ECS Task Definition ───────────────────────────────────────────────────
+  'aws_ecs_task_definition': [
+    { id:'ECS-001', title:'ECS Task Definition Privileged Container',  severity:'Critical', cwe:['CWE-250','CWE-269'], attack:['T1611'], check:(a)=>{ const body=JSON.stringify(a); return body.includes('"privileged":true')||body.includes('"privileged": true'); }, remediation:'Never run privileged = true in production. Use specific Linux capabilities instead.' },
+    { id:'ECS-002', title:'ECS Task No Read-Only Root Filesystem',     severity:'Medium',   cwe:['CWE-732'],           attack:['T1036'],  check:(a)=>!a.readonlyRootFilesystem&&!a.readonly_root_filesystem, remediation:'Set readonlyRootFilesystem = true in container definitions to prevent container escape.' },
+    { id:'ECS-003', title:'ECS Task Not Using awslogs Log Driver',     severity:'Medium',   cwe:['CWE-778'],           attack:['T1562.008'], check:(a)=>!a.logConfiguration&&!a.log_configuration, remediation:'Configure logConfiguration with logDriver = "awslogs" for CloudWatch integration.' },
+  ],
+  // ── ECR ───────────────────────────────────────────────────────────────────
+  'aws_ecr_repository': [
+    { id:'ECR-001', title:'ECR Repository Scan on Push Disabled',     severity:'Medium', cwe:['CWE-1104'],     attack:['T1195.002'], check:(a)=>!a.image_scanning_configuration||!a.scan_on_push, remediation:'Set image_scanning_configuration { scan_on_push = true } for automatic vulnerability scanning.' },
+    { id:'ECR-002', title:'ECR Repository Image Tags Are Mutable',    severity:'Medium', cwe:['CWE-494'],      attack:['T1195.002'], check:(a)=>!a.image_tag_mutability||a.image_tag_mutability!=='IMMUTABLE', remediation:'Set image_tag_mutability = "IMMUTABLE" to prevent tag overwriting / supply chain attacks.' },
+    { id:'ECR-003', title:'ECR Repository Not Encrypted with CMK',    severity:'Medium', cwe:['CWE-311'],      attack:['T1530'],     check:(a)=>!a.encryption_configuration||!a.kms_key, remediation:'Set encryption_configuration { encryption_type = "KMS", kms_key = var.kms_arn }.' },
+  ],
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTERPRISE SECURITY KNOWLEDGE GRAPH v2
+// Control Detection · Defense-in-Depth Layers · Zero-Trust Pillars
+// NIST CSF 2.0 · Cross-Doc Correlation · Blast Radius · Posture Scoring
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Control detection map: TF resource presence → named security control
+const CONTROL_DETECTION_MAP = [
+  // ── Perimeter
+  { id:'CTRL-WAF',    layer:'perimeter',   ztPillar:'network',     name:'Web Application Firewall (WAF)',       detect:(rs)=>rs.some(r=>['aws_wafv2_web_acl','aws_waf_web_acl'].includes(r.type)) },
+  { id:'CTRL-SHIELD', layer:'perimeter',   ztPillar:'network',     name:'DDoS Protection (Shield Advanced)',    detect:(rs)=>rs.some(r=>r.type==='aws_shield_protection') },
+  { id:'CTRL-CF',     layer:'perimeter',   ztPillar:'network',     name:'CloudFront CDN / Edge Security',       detect:(rs)=>rs.some(r=>r.type==='aws_cloudfront_distribution') },
+  // ── Network
+  { id:'CTRL-VPC',    layer:'network',     ztPillar:'network',     name:'VPC Network Isolation',                detect:(rs)=>rs.some(r=>r.type==='aws_vpc') },
+  { id:'CTRL-NACL',   layer:'network',     ztPillar:'network',     name:'Network ACLs (Layer 4 filter)',        detect:(rs)=>rs.some(r=>r.type==='aws_network_acl') },
+  { id:'CTRL-VPCE',   layer:'network',     ztPillar:'network',     name:'VPC Endpoints (PrivateLink)',          detect:(rs)=>rs.some(r=>r.type==='aws_vpc_endpoint') },
+  { id:'CTRL-FLOGS',  layer:'network',     ztPillar:'monitoring',  name:'VPC Flow Logs',                        detect:(rs)=>rs.some(r=>r.type==='aws_flow_log') },
+  { id:'CTRL-TGW',    layer:'network',     ztPillar:'network',     name:'Transit Gateway (Microsegmentation)',  detect:(rs)=>rs.some(r=>r.type==='aws_ec2_transit_gateway') },
+  { id:'CTRL-DX',     layer:'network',     ztPillar:'network',     name:'Direct Connect / VPN',                 detect:(rs)=>rs.some(r=>['aws_dx_connection','aws_vpn_connection','aws_customer_gateway'].includes(r.type)) },
+  // ── Identity
+  { id:'CTRL-SCP',    layer:'identity',    ztPillar:'identity',    name:'Service Control Policies (SCPs)',      detect:(rs)=>rs.some(r=>r.type==='aws_organizations_policy') },
+  { id:'CTRL-SSO',    layer:'identity',    ztPillar:'identity',    name:'AWS SSO / Identity Center',            detect:(rs)=>rs.some(r=>r.type.startsWith('aws_ssoadmin')||r.type.startsWith('aws_identitystore')) },
+  { id:'CTRL-OIDC',   layer:'identity',    ztPillar:'identity',    name:'OIDC Federation (GitHub/TFE)',         detect:(rs)=>rs.some(r=>r.type==='aws_iam_openid_connect_provider') },
+  { id:'CTRL-PB',     layer:'identity',    ztPillar:'identity',    name:'IAM Permission Boundaries',           detect:(rs)=>rs.some(r=>r.type==='aws_iam_role'&&r.body&&r.body.includes('permissions_boundary')) },
+  { id:'CTRL-SAML',   layer:'identity',    ztPillar:'identity',    name:'SAML Federation',                      detect:(rs)=>rs.some(r=>r.type==='aws_iam_saml_provider') },
+  { id:'CTRL-AA',     layer:'identity',    ztPillar:'identity',    name:'IAM Access Analyzer',                  detect:(rs)=>rs.some(r=>r.type==='aws_accessanalyzer_analyzer') },
+  // ── Compute
+  { id:'CTRL-IMDSv2', layer:'compute',     ztPillar:'application', name:'EC2 IMDSv2 Enforced',                  detect:(rs)=>rs.filter(r=>r.type==='aws_instance').length>0&&rs.filter(r=>r.type==='aws_instance').every(r=>r.body&&r.body.includes('http_tokens')&&r.body.includes('required')) },
+  { id:'CTRL-SSMSM',  layer:'compute',     ztPillar:'application', name:'SSM Session Manager',                  detect:(rs)=>rs.some(r=>r.type==='aws_ssm_document'||r.type==='aws_ssm_association') },
+  { id:'CTRL-EKSP',   layer:'compute',     ztPillar:'application', name:'EKS Private API Endpoint',             detect:(rs)=>rs.some(r=>r.type==='aws_eks_cluster'&&r.body&&r.body.includes('endpoint_public_access')&&r.body.includes('false')) },
+  // ── Application
+  { id:'CTRL-APIGW',  layer:'application', ztPillar:'application', name:'API Gateway Auth / Throttling',        detect:(rs)=>rs.some(r=>r.type.startsWith('aws_api_gateway')||r.type.startsWith('aws_apigatewayv2')) },
+  { id:'CTRL-COGNITO',layer:'application', ztPillar:'application', name:'Cognito User Authentication',          detect:(rs)=>rs.some(r=>r.type.startsWith('aws_cognito')) },
+  { id:'CTRL-WAFASSOC',layer:'application',ztPillar:'application', name:'WAF Associated to ALB/API GW',         detect:(rs)=>rs.some(r=>r.type==='aws_wafv2_web_acl_association') },
+  // ── Data
+  { id:'CTRL-KMS',    layer:'data',        ztPillar:'data',        name:'KMS Customer-Managed Keys',            detect:(rs)=>rs.some(r=>r.type==='aws_kms_key') },
+  { id:'CTRL-SM',     layer:'data',        ztPillar:'data',        name:'Secrets Manager',                      detect:(rs)=>rs.some(r=>r.type==='aws_secretsmanager_secret') },
+  { id:'CTRL-SSMPS',  layer:'data',        ztPillar:'data',        name:'SSM Parameter Store (SecureString)',   detect:(rs)=>rs.some(r=>r.type==='aws_ssm_parameter'&&r.body&&r.body.includes('SecureString')) },
+  { id:'CTRL-MACIE',  layer:'data',        ztPillar:'data',        name:'Macie (Sensitive Data Discovery)',     detect:(rs)=>rs.some(r=>r.type.startsWith('aws_macie')) },
+  { id:'CTRL-BACKUP', layer:'data',        ztPillar:'data',        name:'AWS Backup (Recovery Plans)',          detect:(rs)=>rs.some(r=>r.type.startsWith('aws_backup')) },
+  { id:'CTRL-S3VER',  layer:'data',        ztPillar:'data',        name:'S3 Versioning (Data Protection)',      detect:(rs)=>rs.some(r=>r.type==='aws_s3_bucket'&&r.body&&/versioning[\s\S]{0,80}enabled\s*=\s*true/.test(r.body)) },
+  // ── Monitoring
+  { id:'CTRL-CT',     layer:'monitoring',  ztPillar:'monitoring',  name:'CloudTrail API Audit Logging',         detect:(rs)=>rs.some(r=>r.type==='aws_cloudtrail') },
+  { id:'CTRL-CTMR',   layer:'monitoring',  ztPillar:'monitoring',  name:'CloudTrail Multi-Region',              detect:(rs)=>rs.some(r=>r.type==='aws_cloudtrail'&&r.body&&r.body.includes('is_multi_region_trail')&&r.body.includes('true')) },
+  { id:'CTRL-GD',     layer:'monitoring',  ztPillar:'monitoring',  name:'GuardDuty Threat Detection',           detect:(rs)=>rs.some(r=>r.type==='aws_guardduty_detector') },
+  { id:'CTRL-CONFIG', layer:'monitoring',  ztPillar:'monitoring',  name:'AWS Config (Compliance Rules)',        detect:(rs)=>rs.some(r=>r.type==='aws_config_configuration_recorder'||r.type==='aws_config_rule') },
+  { id:'CTRL-SH',     layer:'monitoring',  ztPillar:'monitoring',  name:'Security Hub (Findings Aggregation)', detect:(rs)=>rs.some(r=>r.type.startsWith('aws_securityhub')) },
+  { id:'CTRL-CW',     layer:'monitoring',  ztPillar:'monitoring',  name:'CloudWatch Metric Alarms',             detect:(rs)=>rs.some(r=>r.type==='aws_cloudwatch_metric_alarm') },
+];
+
+// Defense-in-Depth layer metadata
+const DID_LAYERS = {
+  perimeter:   { name:'Perimeter Defense',    order:1, color:'#B71C1C', Icon:Shield,       desc:'WAF, DDoS protection, CDN edge rules, DNS security' },
+  network:     { name:'Network Segmentation', order:2, color:'#E53935', Icon:Network,      desc:'VPC isolation, SGs, NACLs, PrivateLink, flow logs' },
+  identity:    { name:'Identity & Access',    order:3, color:'#F57C00', Icon:KeyRound,     desc:'SCPs, permission boundaries, SSO, OIDC, Access Analyzer' },
+  compute:     { name:'Compute Security',     order:4, color:'#FBC02D', Icon:Cpu,          desc:'IMDSv2, SSM Session Manager, EKS private endpoints' },
+  application: { name:'Application Security', order:5, color:'#388E3C', Icon:AppWindow,    desc:'API Gateway auth, Cognito, WAF associations, rate limiting' },
+  data:        { name:'Data Protection',      order:6, color:'#0288D1', Icon:Database,     desc:'KMS CMK, Secrets Manager, Macie DLP, S3 versioning, backup' },
+  monitoring:  { name:'Detection & Response', order:7, color:'#7B1FA2', Icon:Activity,     desc:'CloudTrail, GuardDuty, Config rules, Security Hub, CloudWatch' },
+};
+
+// Zero-Trust pillar metadata
+const ZT_PILLARS = {
+  identity:    { name:'Identity',     color:'#7B1FA2', Icon:Users,        desc:'Verify every user/service identity; never trust implicit context' },
+  network:     { name:'Network',      color:'#1565C0', Icon:Globe,        desc:'Micro-segment; deny by default; verify every network flow' },
+  data:        { name:'Data',         color:'#00695C', Icon:HardDrive,    desc:'Classify, protect, and monitor all data regardless of location' },
+  application: { name:'Application',  color:'#E65100', Icon:Zap,          desc:'Authorize each transaction with least-privilege; verify workloads' },
+  monitoring:  { name:'Monitoring',   color:'#4A148C', Icon:Search,       desc:'Log, detect, and respond to all activity continuously' },
+};
+
+// NIST CSF 2.0 control checks (resource-presence + attribute based)
+const NIST_CSF_CHECKS = [
+  // Govern
+  { id:'GV.OC-01', fn:'Govern',   cat:'Org Context',      critical:false, desc:'Org account structure (AWS Organizations)',     check:(rs)=>rs.some(r=>r.type.startsWith('aws_organizations')) },
+  { id:'GV.RR-01', fn:'Govern',   cat:'Roles & Resp',     critical:true,  desc:'Permission boundaries on IAM roles',            check:(rs)=>rs.some(r=>r.type==='aws_iam_role'&&r.body&&r.body.includes('permissions_boundary')) },
+  // Identify
+  { id:'ID.AM-01', fn:'Identify', cat:'Asset Mgmt',       critical:true,  desc:'AWS Config for asset inventory',                check:(rs)=>rs.some(r=>r.type==='aws_config_configuration_recorder') },
+  { id:'ID.RA-01', fn:'Identify', cat:'Risk Assessment',  critical:true,  desc:'GuardDuty for continuous risk detection',       check:(rs)=>rs.some(r=>r.type==='aws_guardduty_detector') },
+  { id:'ID.RA-02', fn:'Identify', cat:'Risk Assessment',  critical:false, desc:'IAM Access Analyzer for external access',       check:(rs)=>rs.some(r=>r.type==='aws_accessanalyzer_analyzer') },
+  // Protect
+  { id:'PR.AC-01', fn:'Protect',  cat:'Identity Mgmt',    critical:true,  desc:'Federated identity (OIDC/SAML/SSO)',            check:(rs)=>rs.some(r=>['aws_iam_openid_connect_provider','aws_iam_saml_provider'].includes(r.type)||r.type.startsWith('aws_ssoadmin')) },
+  { id:'PR.AC-02', fn:'Protect',  cat:'Identity Mgmt',    critical:true,  desc:'No static IAM users (role-based only)',         check:(rs)=>!rs.some(r=>r.type==='aws_iam_user') },
+  { id:'PR.AC-03', fn:'Protect',  cat:'Remote Access',    critical:true,  desc:'EC2 IMDSv2 enforced (prevents SSRF→cred theft)',check:(rs)=>!rs.some(r=>r.type==='aws_instance')||rs.filter(r=>r.type==='aws_instance').every(r=>r.body&&r.body.includes('http_tokens')&&r.body.includes('required')) },
+  { id:'PR.AC-04', fn:'Protect',  cat:'Access Perms',     critical:false, desc:'SCPs at org level guardrails',                  check:(rs)=>rs.some(r=>r.type==='aws_organizations_policy') },
+  { id:'PR.DS-01', fn:'Protect',  cat:'Data at Rest',     critical:true,  desc:'KMS CMK for data encryption',                   check:(rs)=>rs.some(r=>r.type==='aws_kms_key') },
+  { id:'PR.DS-02', fn:'Protect',  cat:'Data in Transit',  critical:true,  desc:'HTTPS/TLS enforced on public endpoints',        check:(rs)=>rs.some(r=>r.type==='aws_lb_listener'&&r.body&&r.body.includes('HTTPS'))||rs.some(r=>r.type==='aws_cloudfront_distribution') },
+  { id:'PR.DS-05', fn:'Protect',  cat:'Data Protection',  critical:false, desc:'Secrets Manager for credential storage',        check:(rs)=>rs.some(r=>r.type==='aws_secretsmanager_secret') },
+  { id:'PR.IP-01', fn:'Protect',  cat:'Baseline Config',  critical:false, desc:'AWS Config rules enforcing secure baseline',    check:(rs)=>rs.some(r=>r.type==='aws_config_rule') },
+  { id:'PR.PT-01', fn:'Protect',  cat:'Protective Tech',  critical:true,  desc:'WAF protecting internet-facing applications',   check:(rs)=>rs.some(r=>['aws_wafv2_web_acl','aws_waf_web_acl'].includes(r.type)) },
+  { id:'PR.PT-03', fn:'Protect',  cat:'Network Integrity', critical:false, desc:'VPC Endpoints for private AWS service access',  check:(rs)=>rs.some(r=>r.type==='aws_vpc_endpoint') },
+  // Detect
+  { id:'DE.AE-01', fn:'Detect',   cat:'Anomaly Detection',critical:false, desc:'CloudWatch alarms for security events',         check:(rs)=>rs.some(r=>r.type==='aws_cloudwatch_metric_alarm') },
+  { id:'DE.CM-01', fn:'Detect',   cat:'Monitoring',       critical:true,  desc:'CloudTrail API activity logging',               check:(rs)=>rs.some(r=>r.type==='aws_cloudtrail') },
+  { id:'DE.CM-03', fn:'Detect',   cat:'Monitoring',       critical:true,  desc:'CloudTrail multi-region coverage',              check:(rs)=>rs.some(r=>r.type==='aws_cloudtrail'&&r.body&&r.body.includes('is_multi_region_trail')&&r.body.includes('true')) },
+  { id:'DE.CM-06', fn:'Detect',   cat:'Threat Detection', critical:true,  desc:'GuardDuty ML-based anomaly detection',          check:(rs)=>rs.some(r=>r.type==='aws_guardduty_detector') },
+  { id:'DE.CM-07', fn:'Detect',   cat:'Threat Detection', critical:false, desc:'Security Hub centralizing findings',            check:(rs)=>rs.some(r=>r.type.startsWith('aws_securityhub')) },
+  // Respond
+  { id:'RS.AN-01', fn:'Respond',  cat:'Incident Analysis',critical:false, desc:'SNS for security alert notification',           check:(rs)=>rs.some(r=>r.type==='aws_sns_topic') },
+  { id:'RS.RP-01', fn:'Respond',  cat:'Response Planning',critical:false, desc:'Lambda-based automated response playbooks',     check:(rs)=>rs.some(r=>r.type==='aws_lambda_function'&&r.body&&/guardduty|security|incident|remediat/i.test(r.body)) },
+  // Recover
+  { id:'RC.RP-01', fn:'Recover',  cat:'Recovery Planning',critical:false, desc:'AWS Backup plan configured',                    check:(rs)=>rs.some(r=>r.type.startsWith('aws_backup')) },
+  { id:'RC.RP-02', fn:'Recover',  cat:'Recovery Planning',critical:true,  desc:'RDS automated backup retention configured',     check:(rs)=>!rs.some(r=>(r.type==='aws_rds_instance'||r.type==='aws_rds_cluster')&&r.body&&/backup_retention_period\s*=\s*0/.test(r.body)) },
+  { id:'RC.IM-01', fn:'Recover',  cat:'Improvements',     critical:false, desc:'S3 versioning for object-level recovery',       check:(rs)=>rs.some(r=>r.type==='aws_s3_bucket'&&r.body&&/versioning[\s\S]{0,80}enabled\s*=\s*true/.test(r.body)) },
+];
+
+// Architecture hierarchy inference from Terraform resources
+function inferArchitectureHierarchy(resources, modules, files) {
+  const h = { org:null, accounts:[], vpcs:[], subnets:[], paveLayers:{} };
+  // Org
+  if (resources.some(r=>r.type.startsWith('aws_organizations')))
+    h.org = { detected:true, scpCount:resources.filter(r=>r.type==='aws_organizations_policy').length, accountCount:resources.filter(r=>r.type==='aws_organizations_account').length };
+  // Accounts from provider blocks + naming
+  const providerPattern = /provider\s+"aws"\s*\{([^}]+)\}/g;
+  (files||[]).forEach(f => { let m; while((m=providerPattern.exec(f.content||''))!==null) {
+    const alias=(m[1].match(/alias\s*=\s*"([^"]+)"/))||[];
+    const region=(m[1].match(/region\s*=\s*"([^"]+)"/))||[];
+    if(alias[1]) h.accounts.push({ alias:alias[1], region:region[1]||'unknown' });
+  }});
+  if(!h.accounts.length) h.accounts=[{alias:'default',region:'detected from resources'}];
+  // VPCs
+  resources.filter(r=>r.type==='aws_vpc').forEach(r=>{
+    const cidr=(r.body.match(/cidr_block\s*=\s*"([^"]+)"/))||[];
+    const hasIGW=resources.some(x=>x.type==='aws_internet_gateway'&&x.body&&x.body.includes(r.name));
+    h.vpcs.push({id:r.id,name:r.name,cidr:cidr[1]||'?',hasInternetGateway:hasIGW,
+      subnets:resources.filter(s=>s.type==='aws_subnet'&&s.body&&s.body.includes(r.name)).map(s=>s.id)});
+  });
+  // Subnets
+  resources.filter(r=>r.type==='aws_subnet').forEach(r=>{
+    const cidr=(r.body.match(/cidr_block\s*=\s*"([^"]+)"/))||[];
+    const isPublic=/map_public_ip_on_launch\s*=\s*true/.test(r.body);
+    const az=(r.body.match(/availability_zone\s*=\s*"([^"]+)"/))||[];
+    h.subnets.push({id:r.id,name:r.name,cidr:cidr[1]||'?',isPublic,az:az[1]||'?'});
+  });
+  // Pave layers
+  resources.forEach(r=>{ if(r.paveLayer){h.paveLayers[r.paveLayer]=(h.paveLayers[r.paveLayer]||0)+1; }});
+  return h;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THREAT MODEL INTELLIGENCE ENGINE v2
+// BM25 (Robertson IDF, k1=1.5 b=0.75) + TF-IDF Cosine + RRF Fusion
+// Query expansion · Recursive chunking · Contextual compression · Confidence
+// Built-in ATT&CK/CWE knowledge · STRIDE-per-element · Misconfig detection
+// ─────────────────────────────────────────────────────────────────────────────
+class ThreatModelIntelligence {
+  constructor() {
+    this.chunks   = [];   // [{id, source, text, entities, category, docId, chunkIdx}]
+    this._tf      = [];   // per-chunk Map<term,count>
+    this._tfidf   = [];   // per-chunk Map<term,tfidf>
+    this._docLens = [];   // token counts per chunk
+    this._idf     = {};   // Robertson IDF per term
+    this._vocab   = new Set();
+    this._avgDocLen = 0;
+    this._built   = false;
+    this._k1 = 1.5;       // BM25 term-frequency saturation
+    this._b  = 0.75;      // BM25 document-length normalization
+  }
+
+  // ── Tokenizer ────────────────────────────────────────────────────────────────
+  _tokenize(text) {
+    return text.toLowerCase()
+      .replace(/[^a-z0-9\s._/-]/g, " ")
+      .split(/\s+/)
+      .filter(t => t.length > 2 && !_STOP.has(t));
+  }
+
+  // ── Security-domain query expansion ─────────────────────────────────────────
+  _expandQuery(q) {
+    const EXP = {
+      iam:['identity access management','permissions','policy','role','privilege'],
+      mfa:['multi-factor','two-factor','2fa','authentication','second factor'],
+      ssm:['systems manager','parameter store','session manager'],
+      vpc:['virtual private cloud','network','subnet','routing'],
+      kms:['key management','encryption key','customer managed'],
+      s3:['object storage','bucket','simple storage service'],
+      rds:['relational database','database','sql','aurora'],
+      ec2:['virtual machine','instance','compute','server'],
+      eks:['kubernetes','k8s','container orchestration','cluster'],
+      ecs:['container','fargate','task definition'],
+      lambda:['serverless','function','faas','event-driven'],
+      imds:['instance metadata','imdsv1','imdsv2','metadata api','169.254.169.254'],
+      phi:['protected health information','patient data','hipaa','ePHI'],
+      pii:['personally identifiable','personal data','gdpr','data subject'],
+      dos:['denial of service','availability','ddos','flooding'],
+      cve:['vulnerability','exploit','exposure','patch'],
+      cwe:['weakness','vulnerability class','defect'],
+      xss:['cross-site scripting','script injection'],
+      sqli:['sql injection','injection attack','database injection'],
+    };
+    const lower = q.toLowerCase();
+    const extra = [];
+    lower.split(/\s+/).forEach(w => { if (EXP[w]) extra.push(...EXP[w]); });
+    return extra.length ? q + ' ' + extra.join(' ') : q;
+  }
+
+  // ── Recursive character splitter (800-char target, 80-char overlap) ──────────
+  _splitText(text, maxChars=800, overlapChars=80) {
+    const seps = ['\n\n','\n','. ','! ','? ','; ',', ',' '];
+    const out = [];
+    const split = (txt, si) => {
+      if (txt.length <= maxChars) { if (txt.trim().length > 20) out.push(txt.trim()); return; }
+      if (si >= seps.length) {
+        for (let i=0; i<txt.length; i+=maxChars-overlapChars) out.push(txt.slice(i,i+maxChars).trim());
+        return;
+      }
+      const parts = txt.split(seps[si]);
+      let cur = '';
+      for (const p of parts) {
+        const cand = cur ? cur+seps[si]+p : p;
+        if (cand.length <= maxChars) { cur = cand; }
+        else {
+          if (cur.trim().length > 20) cur.length > maxChars ? split(cur,si+1) : out.push(cur.trim());
+          cur = p;
+        }
+      }
+      if (cur.trim().length > 20) cur.length > maxChars ? split(cur,si+1) : out.push(cur.trim());
+    };
+    split(text, 0);
+    // Apply sliding overlap between consecutive chunks
+    const result = [];
+    for (let i=0; i<out.length; i++) {
+      if (i===0) { result.push(out[i]); continue; }
+      const prev = out[i-1];
+      result.push(prev.slice(Math.max(0,prev.length-overlapChars)) + ' ' + out[i]);
+    }
+    return result;
+  }
+
+  // ── Entity extraction (reuses _ENTITY_PATTERNS) ──────────────────────────────
+  _extractEntities(text) {
+    const found = {};
+    for (const [cat, pats] of Object.entries(_ENTITY_PATTERNS)) {
+      found[cat] = {};
+      for (const [sub, rx] of Object.entries(pats)) {
+        const m = [...text.matchAll(new RegExp(rx.source, rx.flags))].map(x => x[0].toLowerCase());
+        const u = [...new Set(m)];
+        if (u.length) found[cat][sub] = u;
+      }
+    }
+    return found;
+  }
+
+  // ── Document categorization ──────────────────────────────────────────────────
+  _categorizeDoc(doc) {
+    const s = ((doc.name||'') + ' ' + (doc.content||'').slice(0,500)).toLowerCase();
+    if (/threat|stride|mitre|attack|risk|dread|pasta|threat.model/.test(s)) return 'threat-model';
+    if (/architect|design|diagram|infra|topology|data.flow|dfd/.test(s)) return 'architecture';
+    if (/policy|compliance|hipaa|fedramp|soc2|pci|gdpr|cmmc|iso.?27001/.test(s)) return 'compliance';
+    if (/runbook|playbook|incident|procedure|response|sop/.test(s)) return 'runbook';
+    if (/\.tf$|terraform|provider|resource|module/.test(s)) return 'terraform';
+    return 'general';
+  }
+
+  // ── Add a single chunk to the corpus ────────────────────────────────────────
+  _addChunk(source, text, category='general', docId=null, chunkIdx=0) {
+    if (!text || text.trim().length < 20) return;
+    const id = this.chunks.length;
+    const trimmed = text.trim();
+    const entities = this._extractEntities(trimmed);
+    const tokens = this._tokenize(trimmed);
+    const tfMap = {};
+    tokens.forEach(t => { tfMap[t] = (tfMap[t]||0)+1; this._vocab.add(t); });
+    this.chunks.push({ id, source, text: trimmed, entities, category, docId: docId||source, chunkIdx });
+    this._tf.push(tfMap);
+    this._docLens.push(tokens.length);
+  }
+
+  // ── Build BM25 IDF + TF-IDF vectors (call after all chunks added) ────────────
+  _buildIndex() {
+    const N = this.chunks.length;
+    if (N === 0) return;
+    this._avgDocLen = this._docLens.reduce((a,b)=>a+b,0) / N;
+    // Robertson IDF: log((N − df + 0.5)/(df + 0.5) + 1)
+    const df = {};
+    this._tf.forEach(m => Object.keys(m).forEach(t => { df[t]=(df[t]||0)+1; }));
+    this._idf = {};
+    Object.entries(df).forEach(([t,dft]) => {
+      this._idf[t] = Math.log((N - dft + 0.5)/(dft + 0.5) + 1);
+    });
+    // TF-IDF vectors for cosine similarity
+    this._tfidf = this._tf.map((m, i) => {
+      const vec = {};
+      const len = this._docLens[i] || 1;
+      Object.entries(m).forEach(([t,c]) => {
+        vec[t] = (c/len) * (this._idf[t]||0);
+      });
+      return vec;
+    });
+  }
+
+  // ── BM25 scores for all chunks given query terms ─────────────────────────────
+  _bm25(terms) {
+    const N = this.chunks.length;
+    const scores = new Float64Array(N);
+    const k1=this._k1, b=this._b, avgL=this._avgDocLen||1;
+    terms.forEach(term => {
+      const idf = this._idf[term];
+      if (!idf) return;
+      this._tf.forEach((m,i) => {
+        const c = m[term]||0;
+        if (!c) return;
+        const num = c*(k1+1);
+        const den = c + k1*(1-b+b*(this._docLens[i]/avgL));
+        scores[i] += idf*(num/den);
+      });
+    });
+    return scores;
+  }
+
+  // ── TF-IDF cosine similarity (complementary to BM25) ─────────────────────────
+  _cosine(terms) {
+    const N = this.chunks.length;
+    const scores = new Float64Array(N);
+    const qVec = {};
+    terms.forEach(t => { qVec[t]=(qVec[t]||0)+(this._idf[t]||0.5); });
+    const qNorm = Math.sqrt(Object.values(qVec).reduce((s,v)=>s+v*v,0)) || 1;
+    this._tfidf.forEach((dv, i) => {
+      let dot=0, dNorm=0;
+      Object.entries(dv).forEach(([t,v]) => { if(qVec[t]) dot+=v*qVec[t]; dNorm+=v*v; });
+      scores[i] = dot / (Math.sqrt(dNorm)*qNorm||1);
+    });
+    return scores;
+  }
+
+  // ── Reciprocal Rank Fusion (k=60) ────────────────────────────────────────────
+  _rrf(rankedLists, k=60) {
+    const sc = {};
+    rankedLists.forEach(list => {
+      list.forEach((idx,rank) => { sc[idx]=(sc[idx]||0)+1/(k+rank+1); });
+    });
+    return Object.entries(sc).sort((a,b)=>b[1]-a[1]).map(([i,s])=>({idx:+i,rrfScore:s}));
+  }
+
+  // ── Contextual compression: pull top-N most relevant sentences ───────────────
+  _compress(text, qTerms, maxSentences=3) {
+    const qSet = new Set(qTerms);
+    const sents = text.replace(/([.!?])\s+/g,'$1|||').split('|||').map(s=>s.trim()).filter(s=>s.length>10);
+    if (sents.length <= maxSentences) return text;
+    const scored = sents.map(s => {
+      const toks = this._tokenize(s);
+      return { s, score: toks.filter(t=>qSet.has(t)).length / Math.max(1,toks.length) };
+    }).sort((a,b)=>b.score-a.score);
+    return scored.slice(0,maxSentences).map(x=>x.s).join(' … ');
+  }
+
+  // ── Primary query: BM25 + Cosine → RRF, with entity boost ────────────────────
+  query(queryText, topK=8) {
+    if (!queryText || !this.chunks.length) return [];
+    const expanded = this._expandQuery(queryText);
+    const terms = this._tokenize(expanded);
+    if (!terms.length) return [];
+    const N = this.chunks.length;
+    const bm25s  = this._bm25(terms);
+    const cosines = this._cosine(terms);
+    const bm25R   = Array.from({length:N},(_,i)=>i).filter(i=>bm25s[i]>0).sort((a,b)=>bm25s[b]-bm25s[a]);
+    const cosR    = Array.from({length:N},(_,i)=>i).filter(i=>cosines[i]>0).sort((a,b)=>cosines[b]-cosines[a]);
+    // Entity overlap boost
+    const qEnt  = this._extractEntities(queryText);
+    const entBoost = [];
+    if (Object.values(qEnt).some(s=>Object.keys(s).length>0)) {
+      this.chunks.forEach((c,i) => {
+        let boost=0;
+        Object.entries(qEnt).forEach(([cat,subs]) => {
+          Object.keys(subs).forEach(sub => { if(c.entities[cat]?.[sub]?.length) boost++; });
+        });
+        if (boost>0) entBoost.push(i);
+      });
+    }
+    const lists = [bm25R.slice(0,60), cosR.slice(0,60)];
+    if (entBoost.length) lists.push(entBoost);
+    const fused = this._rrf(lists);
+    const maxS = fused[0]?.rrfScore||1;
+    return fused.slice(0,topK).map(({idx,rrfScore}) => {
+      const c = this.chunks[idx];
+      const confidence = Math.round((rrfScore/maxS)*100);
+      return { ...c, score:Math.round(bm25s[idx]*10)/10, rrfScore:Math.round(rrfScore*1000)/1000, confidence, compressed:this._compress(c.text,terms) };
+    });
+  }
+
+  // ── Structured threat profile for a resource ─────────────────────────────────
+  getThreats(resource) {
+    const type = resource?.type||'';
+    const elementType = _getElementType(type);
+    const stride = STRIDE_PER_ELEMENT[elementType]||STRIDE_PER_ELEMENT.process;
+    const techniques = (TF_ATTACK_MAP[type]||[]).map(tid => {
+      const t = ATTACK_TECHNIQUES[tid];
+      return t ? { techniqueId:tid, techniqueName:t.name, tactic:t.tactic, severity:t.severity, desc:t.desc, url:`https://attack.mitre.org/techniques/${tid.replace('.','/').replace('.','/')}` } : null;
+    }).filter(Boolean);
+    return { stride, elementType, attackTechniques:techniques };
+  }
+
+  // ── Misconfiguration checks for a resource ───────────────────────────────────
+  getMisconfigurations(resource) {
+    const type = resource?.type||'';
+    // Use _parseAttrMap to parse HCL body into attribute dict — resource.attributes is always {}
+    const attrs = this._parseAttrMap(resource?.body||'');
+    return (TF_MISCONFIG_CHECKS[type]||[]).reduce((out,chk) => {
+      let triggered=false;
+      try { triggered=chk.check(attrs); } catch(_){}
+      if (triggered) out.push({ id:chk.id, title:chk.title, severity:chk.severity, cwe:chk.cwe, attack:chk.attack, remediation:chk.remediation });
+      return out;
+    },[]);
+  }
+
+  // ── Parse HCL body into attribute map (fixes getMisconfigurations attrs bug) ────
+  _parseAttrMap(body) {
+    const attrs = {};
+    if (!body) return attrs;
+    [...body.matchAll(/\b(\w+)\s*=\s*"([^"\n]*)"/g)].forEach(([,k,v])=>{attrs[k]=v;});
+    [...body.matchAll(/\b(\w+)\s*=\s*(true|false)\b/g)].forEach(([,k,v])=>{attrs[k]=(v==='true');});
+    [...body.matchAll(/\b(\w+)\s*=\s*(\d+)\b/g)].forEach(([,k,v])=>{if(attrs[k]===undefined)attrs[k]=parseInt(v,10);});
+    [...body.matchAll(/\b(\w+)\s*\{/g)].forEach(([,k])=>{if(attrs[k]===undefined)attrs[k]=true;});
+    const ingress=[...body.matchAll(/ingress\s*\{([\s\S]*?)(?=\n\s*(?:ingress|egress|tags|\}))/g)].map(m=>{
+      const fp=(m[1].match(/from_port\s*=\s*(\d+)/)||[])[1];
+      const tp=(m[1].match(/to_port\s*=\s*(\d+)/)||[])[1];
+      const cidrs=[...m[1].matchAll(/"([\d.:\/]+)"/g)].map(x=>x[1]);
+      return {from_port:fp?+fp:0,to_port:tp?+tp:0,cidr_blocks:cidrs};
+    });
+    if(ingress.length) attrs.ingress=ingress;
+    return attrs;
+  }
+
+  // ── Control inventory: detect which security controls are present ─────────────
+  getControlInventory(resources) {
+    const present=[], absent=[];
+    CONTROL_DETECTION_MAP.forEach(ctrl => {
+      try { (ctrl.detect(resources) ? present : absent).push({...ctrl}); } catch(e) { absent.push({...ctrl}); }
+    });
+    return { present, absent };
+  }
+
+  // ── Defense-in-Depth layer assessment ────────────────────────────────────────
+  getDefenseInDepthAssessment(resources) {
+    const {present, absent} = this.getControlInventory(resources);
+    const layers={};
+    Object.entries(DID_LAYERS).forEach(([lid,ldef])=>{
+      const p=present.filter(c=>c.layer===lid), a=absent.filter(c=>c.layer===lid);
+      const total=p.length+a.length;
+      layers[lid]={...ldef, present:p, absent:a, score:total>0?Math.round((p.length/total)*100):0, total};
+    });
+    const overallPresent=present.length, overallTotal=present.length+absent.length;
+    return { layers, overallScore:overallTotal>0?Math.round((overallPresent/overallTotal)*100):0, presentCount:overallPresent, absentCount:absent.length };
+  }
+
+  // ── Zero-Trust pillar assessment ─────────────────────────────────────────────
+  getZeroTrustAssessment(resources) {
+    const {present,absent}=this.getControlInventory(resources);
+    const pillars={};
+    Object.entries(ZT_PILLARS).forEach(([pid,pdef])=>{
+      const p=present.filter(c=>c.ztPillar===pid), a=absent.filter(c=>c.ztPillar===pid);
+      const total=p.length+a.length;
+      pillars[pid]={...pdef, present:p, absent:a, score:total>0?Math.round((p.length/total)*100):0, total};
+    });
+    const scores=Object.values(pillars).map(p=>p.score);
+    return { pillars, overallScore:scores.length?Math.round(scores.reduce((a,b)=>a+b,0)/scores.length):0 };
+  }
+
+  // ── NIST CSF 2.0 compliance assessment ──────────────────────────────────────
+  getNISTCSFAssessment(resources) {
+    const results=NIST_CSF_CHECKS.map(chk=>{let pass=false;try{pass=chk.check(resources);}catch(e){}return{...chk,pass};});
+    const byFn={};
+    results.forEach(r=>{
+      if(!byFn[r.fn]) byFn[r.fn]={pass:0,fail:0,criticalFail:0,checks:[]};
+      byFn[r.fn].checks.push(r);
+      r.pass?byFn[r.fn].pass++:(byFn[r.fn].fail++,r.critical&&byFn[r.fn].criticalFail++);
+    });
+    const pass=results.filter(r=>r.pass).length, total=results.length;
+    return {byFn, pass, fail:total-pass, total, score:Math.round((pass/total)*100)};
+  }
+
+  // ── Security posture: weighted score + grade ─────────────────────────────────
+  getSecurityPosture(resources) {
+    if(!resources?.length) return null;
+    const did=this.getDefenseInDepthAssessment(resources);
+    const zt=this.getZeroTrustAssessment(resources);
+    const nist=this.getNISTCSFAssessment(resources);
+    const score=Math.round(nist.score*0.40+did.overallScore*0.35+zt.overallScore*0.25);
+    const grade=score>=80?'A':score>=65?'B':score>=50?'C':score>=35?'D':'F';
+    const gradeColor=grade==='A'?'#2E7D32':grade==='B'?'#558B2F':grade==='C'?'#F9A825':grade==='D'?'#E65100':'#B71C1C';
+    const maturity=score>=80?'Zero Trust Optimal':score>=60?'Advanced':score>=40?'Initial':'Traditional / Ad-Hoc';
+    return {score,grade,gradeColor,maturity,did,zt,nist};
+  }
+
+  // ── Cross-doc correlation: link doc mentions to TF resource attributes ────────
+  getCrossDocCorrelation(resources) {
+    if(!this.chunks.length||!resources?.length) return [];
+    const corrs=[];
+    resources.slice(0,60).forEach(r=>{
+      const hits=this.analyzeResource(r.type,r.name);
+      if(!hits.length) return;
+      const attrs=this._parseAttrMap(r.body||'');
+      const contradictions=[];
+      hits.forEach(chunk=>{
+        const t=chunk.text.toLowerCase();
+        if(t.includes('encrypt')&&(attrs.encrypted===false||attrs.storage_encrypted===false))
+          contradictions.push({type:'CONTRADICTION',title:'Docs require encryption but resource has it disabled',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
+        if(t.includes('private')&&attrs.publicly_accessible===true)
+          contradictions.push({type:'CONTRADICTION',title:'Docs describe private access but resource is publicly accessible',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
+        if(t.includes('mfa')&&r.type==='aws_iam_user')
+          contradictions.push({type:'GAP',title:'Docs mention MFA but IAM user detected (prefer roles + SSO)',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
+        const outOfScope=(chunk.entities?.scope?.outOfScope||[]);
+        if(outOfScope.some(s=>s.includes(r.type.replace('aws_',''))||s.includes(r.name)))
+          contradictions.push({type:'SCOPE-VIOLATION',title:'Resource declared out-of-scope in architecture doc',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
+      });
+      corrs.push({resource:r,docHits:hits,contradictions});
+    });
+    return corrs.filter(c=>c.contradictions.length>0||c.docHits.length>0);
+  }
+
+  // ── Blast radius: what can be reached if resource is compromised ──────────────
+  getBlastRadius(targetId, resources, connections) {
+    if(!connections?.length) return {reachable:[],dataAssets:[],riskScore:0,paths:[]};
+    const adj={};
+    connections.forEach(c=>{if(!adj[c.from])adj[c.from]=[];adj[c.from].push(c.to);});
+    const visited=new Set([targetId]), queue=[targetId], paths=[];
+    while(queue.length){const curr=queue.shift();(adj[curr]||[]).forEach(next=>{if(!visited.has(next)){visited.add(next);queue.push(next);paths.push({from:curr,to:next});}});}
+    visited.delete(targetId);
+    const reachable=resources.filter(r=>visited.has(r.id));
+    const dataRx=/s3|rds|dynamo|elastic|secret|ssm_param|kms|neptune|document/;
+    const dataAssets=reachable.filter(r=>dataRx.test(r.type));
+    const iamRx=/iam_role|iam_policy/;
+    const iamAssets=reachable.filter(r=>iamRx.test(r.type));
+    const riskScore=Math.min(100,reachable.length*4+dataAssets.length*12+iamAssets.length*8);
+    return {reachable,dataAssets,iamAssets,riskScore,paths,totalReachable:reachable.length};
+  }
+
+  // ── Relevant doc passages for a resource (for Resource Intelligence tab) ──────
+  analyzeResource(resourceType, resourceName) {
+    const q = `${resourceType} ${(resourceName||'').replace(/_/g,' ')} security threat access`;
+    return this.query(q, 5).filter(c=>c.category!=='terraform');
+  }
+
+  // ── Architecture-wide intelligence summary ───────────────────────────────────
+  getArchitectureSummary(resources, userDocs) {
+    const agg = {};
+    this.chunks.forEach(c => {
+      Object.entries(c.entities).forEach(([cat,subs]) => {
+        Object.entries(subs).forEach(([sub,terms]) => {
+          if (!agg[cat]) agg[cat]={};
+          if (!agg[cat][sub]) agg[cat][sub]=new Set();
+          terms.forEach(t=>agg[cat][sub].add(t));
+        });
+      });
+    });
+    const entitySummary={};
+    Object.entries(agg).forEach(([cat,subs]) => {
+      entitySummary[cat]={};
+      Object.entries(subs).forEach(([sub,set]) => { if(set.size) entitySummary[cat][sub]=[...set].slice(0,8); });
+    });
+    const rtCounts={};
+    (resources||[]).forEach(r=>{ rtCounts[r.type]=(rtCounts[r.type]||0)+1; });
+    const scopeChunks=this.chunks.filter(c=>c.entities.scope?.inScope?.length||c.entities.scope?.outOfScope?.length).map(c=>({
+      source:c.source, inScope:c.entities.scope?.inScope||[], outOfScope:c.entities.scope?.outOfScope||[], excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
+    }));
+    const threatChunks=this.chunks.filter(c=>Object.keys(c.entities.stride||{}).length>0).map(c=>({
+      source:c.source, category:c.category, threats:Object.keys(c.entities.stride||{}), excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
+    }));
+    // ATT&CK coverage across terraform resources
+    const allTechniques=new Set();
+    (resources||[]).forEach(r=>(TF_ATTACK_MAP[r.type]||[]).forEach(t=>allTechniques.add(t)));
+    // Misconfig findings across all resources
+    const allMisconfigs=[];
+    (resources||[]).forEach(r=>{
+      const findings=this.getMisconfigurations(r);
+      if(findings.length) allMisconfigs.push({resource:r,findings});
+    });
+    const SEV=['Critical','High','Medium','Low'];
+    const topMisconfigs=allMisconfigs.flatMap(m=>m.findings.map(f=>({...f,resourceType:m.resource.type,resourceName:m.resource.name||m.resource.id})))
+      .sort((a,b)=>SEV.indexOf(a.severity)-SEV.indexOf(b.severity)).slice(0,30);
+    // ── New: posture, hierarchy, controls, cross-doc ─────────────────────────
+    let posture=null, hierarchy=null, controlInventory=null, crossDocCorrelations=null;
+    try { posture = this.getSecurityPosture(resources||[]); } catch(_){}
+    try { hierarchy = inferArchitectureHierarchy(resources||[], [], []); } catch(_){}
+    try { controlInventory = this.getControlInventory(resources||[]); } catch(_){}
+    try { crossDocCorrelations = this.getCrossDocCorrelation(resources||[]); } catch(_){}
+    return {
+      entitySummary, rtCounts, scopeChunks, threatChunks,
+      docCount:[...new Set(this.chunks.map(c=>c.source).filter(s=>s!=='terraform'))].length,
+      chunkCount:this.chunks.length,
+      attackTechniqueCount:allTechniques.size,
+      misconfigCount:allMisconfigs.reduce((s,m)=>s+m.findings.length,0),
+      misconfigsByResource:allMisconfigs,
+      topMisconfigs,
+      posture,
+      hierarchy,
+      controlInventory,
+      crossDocCorrelations,
+    };
+  }
+
+  // ── Architecture Analysis — derives structured fields from TF resources + docs ─
+  analyzeArchitecture(resources, userDocs, modelDetails) {
+    const res = resources || [];
+    const _hasType = (...patterns) => res.some(r => patterns.some(p => r.type?.includes(p)));
+    const _countType = (pattern) => res.filter(r => r.type?.includes(pattern)).length;
+    const _names = (...patterns) => [...new Set(res.filter(r => patterns.some(p => r.type?.includes(p))).map(r => r.name || r.type))];
+
+    // ── Application type inference ──
+    const appTypes = [];
+    if (_hasType('aws_lambda_function', 'aws_apigatewayv2', 'aws_api_gateway_rest_api') && !_hasType('aws_ecs', 'aws_eks', 'aws_instance')) appTypes.push('Serverless');
+    if (_hasType('aws_ecs_cluster', 'aws_ecs_service', 'aws_eks_cluster')) appTypes.push('Container-Based (ECS/EKS)');
+    if (_hasType('aws_instance', 'aws_autoscaling_group', 'aws_launch_template') && !_hasType('aws_ecs', 'aws_eks')) appTypes.push('VM-Based');
+    if (_hasType('aws_s3_bucket') && _hasType('aws_cloudfront_distribution') && !_hasType('aws_lambda', 'aws_ecs', 'aws_instance')) appTypes.push('Static Web Application');
+    if (_hasType('aws_kinesis', 'aws_msk', 'aws_sqs', 'aws_sns') && _hasType('aws_lambda', 'aws_glue', 'aws_firehose')) appTypes.push('Data Pipeline / Streaming');
+    if (_hasType('aws_api_gateway', 'aws_apigatewayv2')) appTypes.push('REST API');
+    if (!appTypes.length) appTypes.push('Cloud Application');
+
+    // ── Entry point detection ──
+    const entryPointTypes = [];
+    if (_hasType('aws_api_gateway_rest_api', 'aws_apigatewayv2_api')) entryPointTypes.push('REST API');
+    if (_hasType('aws_lb', 'aws_alb')) entryPointTypes.push('HTTPS / ALB');
+    if (_hasType('aws_cloudfront_distribution')) entryPointTypes.push('CDN (CloudFront)');
+    if (_hasType('aws_cognito_user_pool_client')) entryPointTypes.push('Web UI (Cognito-federated)');
+    if (_hasType('aws_sqs_queue', 'aws_sns_topic')) entryPointTypes.push('Event / Message Queue');
+    if (_hasType('aws_kinesis_stream')) entryPointTypes.push('Event Stream (Kinesis)');
+    if (!entryPointTypes.length) entryPointTypes.push('HTTPS');
+
+    // ── Exposure ──
+    const exposure = [];
+    if (_hasType('aws_cloudfront_distribution', 'aws_lb', 'aws_api_gateway', 'aws_route53')) exposure.push('Public Internet');
+    if (_hasType('aws_vpc_endpoint')) exposure.push('VPC Endpoint (Internal)');
+    if (!exposure.length) exposure.push('Intranet Only');
+
+    // ── Compute type ──
+    const computeType = [];
+    if (_hasType('aws_lambda_function')) computeType.push('Serverless (Lambda)');
+    if (_hasType('aws_ecs_cluster', 'aws_ecs_service')) computeType.push('Container (ECS)');
+    if (_hasType('aws_eks_cluster')) computeType.push('Container (EKS)');
+    if (_hasType('aws_instance', 'aws_autoscaling_group')) computeType.push('VM (EC2)');
+    if (_hasType('aws_apprunner_service')) computeType.push('Cloud Managed Service (App Runner)');
+    if (!computeType.length) computeType.push('Cloud Managed Service');
+
+    // ── Auth methods (TF-based) ──
+    const authMethods = [];
+    if (_hasType('aws_cognito_user_pool')) authMethods.push('OAuth 2.0 / Cognito');
+    if (_hasType('aws_iam_openid_connect_provider')) authMethods.push('OIDC / SSO');
+    if (_hasType('aws_iam_role', 'aws_iam_policy')) authMethods.push('AWS IAM');
+    if (!authMethods.length) authMethods.push('AWS IAM');
+
+    // ── Integrations ──
+    const integrations = [];
+    if (_hasType('aws_sqs_queue')) integrations.push('Message Queue (SQS)');
+    if (_hasType('aws_sns_topic')) integrations.push('Event Notification (SNS)');
+    if (_hasType('aws_kinesis_stream')) integrations.push('Event Stream (Kinesis)');
+    if (_hasType('aws_api_gateway')) integrations.push('REST API');
+    if (_hasType('aws_msk')) integrations.push('Event Stream (Kafka/MSK)');
+
+    // ── Storage ──
+    const storageTypes = [];
+    if (_hasType('aws_s3_bucket')) storageTypes.push(`S3 (${_countType('aws_s3_bucket')} bucket${_countType('aws_s3_bucket')!==1?'s':''})`);
+    if (_hasType('aws_dynamodb_table')) storageTypes.push(`DynamoDB (${_countType('aws_dynamodb_table')} table${_countType('aws_dynamodb_table')!==1?'s':''})`);
+    if (_hasType('aws_rds_cluster', 'aws_db_instance')) storageTypes.push('RDS (relational)');
+    if (_hasType('aws_elasticache')) storageTypes.push('ElastiCache (in-memory cache)');
+    if (_hasType('aws_efs_file_system')) storageTypes.push('EFS (shared file system)');
+
+    // ── Doc-based narrative queries ──
+    const _q = (terms, k=3) => {
+      const results = this.query(terms, k);
+      return results.map(r => r.text.substring(0, 300).replace(/\s+/g,' ').trim()).join(' ');
+    };
+
+    const docEntryPoints   = _q("entry point ingress endpoint API gateway load balancer");
+    const docDataFlow      = _q("data flow pipeline stream ingestion process transform");
+    const docSecBounds     = _q("trust boundary security zone VPC network segment DMZ");
+    const docAuth          = _q("authentication authorization IAM role policy SSO OAuth MFA");
+    const docExtDeps       = _q("third party vendor external integration dependency service");
+    const docStorage       = _q("storage database encryption data at rest S3 DynamoDB RDS");
+    const docFaultTol      = _q("fault tolerance high availability resilience redundancy failover");
+    const docPubPriv       = _q("public private internet exposure VPC subnet internal external");
+    const docControls      = _q("security control WAF GuardDuty Security Hub encryption KMS IAM");
+
+    // ── Narrative construction ──
+    const tfEntryPts = entryPointTypes.join(', ');
+    const tfCompute  = computeType.join(', ');
+    const tfStorage  = storageTypes.length ? storageTypes.join(', ') : 'Not detected in Terraform';
+    const tfAuth     = authMethods.join(', ');
+    const tfExposure = exposure.join(', ');
+
+    const narrative = {
+      entryPoints: [
+        `Application exposes the following entry points: ${tfEntryPts}.`,
+        docEntryPoints || null,
+      ].filter(Boolean).join(' '),
+
+      dataFlow: [
+        integrations.length ? `Integration services: ${integrations.join(', ')}.` : null,
+        docDataFlow || null,
+      ].filter(Boolean).join(' ') || `Data flow derived from Terraform resources: ${tfCompute}.`,
+
+      securityBoundaries: [
+        res.some(r=>r.type==='aws_vpc') ? `Network isolation via AWS VPC with ${_countType('aws_subnet')} subnet(s).` : null,
+        res.some(r=>r.type==='aws_security_group') ? `${_countType('aws_security_group')} security group(s) control intra-VPC traffic.` : null,
+        docSecBounds || null,
+      ].filter(Boolean).join(' ') || 'Security boundaries not detected in Terraform.',
+
+      publicPrivateResources: [
+        `Exposure: ${tfExposure}.`,
+        res.some(r=>r.type==='aws_vpc') ? `Resources deployed within AWS VPC.` : null,
+        docPubPriv || null,
+      ].filter(Boolean).join(' '),
+
+      securityControls: [
+        _hasType('aws_wafv2_web_acl') ? 'WAF v2 protects internet-facing endpoints.' : null,
+        _hasType('aws_guardduty_detector') ? 'GuardDuty threat detection enabled.' : null,
+        _hasType('aws_securityhub_account') ? 'Security Hub aggregates findings.' : null,
+        _hasType('aws_kms_key') ? `${_countType('aws_kms_key')} KMS key(s) for encryption.` : null,
+        _hasType('aws_acm_certificate') ? 'ACM certificates enforce TLS.' : null,
+        docControls || null,
+      ].filter(Boolean).join(' ') || 'Security controls not detected in Terraform.',
+
+      faultTolerance: [
+        _hasType('aws_autoscaling_group') ? 'Auto Scaling Groups provide horizontal scaling.' : null,
+        _hasType('aws_rds_cluster') ? 'RDS Cluster provides multi-node resilience.' : null,
+        _hasType('aws_elasticache_replication_group') ? 'ElastiCache replication group for cache HA.' : null,
+        _hasType('aws_backup_vault') ? 'AWS Backup vault configured.' : null,
+        docFaultTol || null,
+      ].filter(Boolean).join(' ') || 'Fault tolerance configuration not detected in Terraform.',
+
+      authAndAuthz: [
+        `Authentication: ${tfAuth}.`,
+        _hasType('aws_iam_role') ? `${_countType('aws_iam_role')} IAM role(s) manage service permissions.` : null,
+        docAuth || null,
+      ].filter(Boolean).join(' '),
+
+      externalDependencies: [
+        docExtDeps || null,
+        integrations.length ? `External message/event integrations: ${integrations.join(', ')}.` : null,
+        _hasType('aws_vpc_endpoint') ? 'AWS VPC Endpoints used for private AWS service access.' : null,
+      ].filter(Boolean).join(' ') || 'No external dependencies identified.',
+
+      storageAndDataSecurity: [
+        tfStorage !== 'Not detected in Terraform' ? `Storage services: ${tfStorage}.` : null,
+        _hasType('aws_s3_bucket_versioning') ? 'S3 versioning enabled.' : null,
+        _hasType('aws_kms_key') ? 'KMS encryption keys provisioned for data-at-rest.' : null,
+        _hasType('aws_secretsmanager_secret') ? `${_countType('aws_secretsmanager_secret')} secret(s) managed via Secrets Manager.` : null,
+        docStorage || null,
+      ].filter(Boolean).join(' ') || 'Storage configuration not detected in Terraform.',
+    };
+
+    const attributes = {
+      applicationType: appTypes,
+      entryPointTypes,
+      developedBy: _hasType('aws_') ? 'Vendor (AWS)' : 'Internal',
+      inboundDataSource: _hasType('aws_cloudfront', 'aws_lb', 'aws_api_gateway') ? ['External Public'] : ['Internal Corporate Network'],
+      inboundDataFlow: _hasType('aws_api_gateway', 'aws_lb') ? ['API Request'] : [],
+      outboundDataFlow: storageTypes.length ? ['DB Write'] : [],
+      outboundDataDestination: ['Internal Corporate Network'],
+      exposure,
+      authMethods,
+      facilityType: ['AWS Cloud'],
+      computeType,
+      users: ['Internal Apps/Services'],
+      integrations,
+    };
+
+    // Confidence: based on resource count + indexed doc chunk count
+    const confidence = Math.min(100, Math.round(
+      Math.min(res.length, 50) * 1.2 +
+      Math.min(this.chunks.filter(c => c.source !== 'terraform').length, 20) * 2
+    ));
+
+    return { narrative, attributes, confidence };
+  }
+
+  // ── Index user-uploaded documents ────────────────────────────────────────────
+  indexDocuments(userDocs) {
+    (userDocs||[]).forEach((doc,di) => {
+      if (doc.binary||!doc.content||doc.content.length<10) return;
+      const cat = this._categorizeDoc(doc);
+      this._splitText(doc.content).forEach((chunk,ci) => {
+        this._addChunk(doc.name||doc.path, chunk, cat, `doc_${di}`, ci);
+      });
+    });
+  }
+
+  // ── Index parsed Terraform resources ────────────────────────────────────────
+  indexResources(resources, modules) {
+    (resources||[]).forEach(r => {
+      const attacks=(TF_ATTACK_MAP[r.type]||[]).map(tid=>{const t=ATTACK_TECHNIQUES[tid]; return t?`${tid} ${t.name} ${t.tactic}`:tid;}).join('. ');
+      const mischecks=(TF_MISCONFIG_CHECKS[r.type]||[]).map(c=>c.title).join('. ');
+      const text=[
+        `Terraform resource ${r.type} named ${r.name||r.id}.`,
+        `Provider: ${(r.type||'').split('_')[0]}.`,
+        attacks?`MITRE ATT&CK: ${attacks}.`:'',
+        mischecks?`Security checks: ${mischecks}.`:'',
+      ].filter(Boolean).join(' ');
+      this._addChunk('terraform', text, 'terraform');
+    });
+    (modules||[]).forEach(m => {
+      this._addChunk('terraform', `Terraform module ${m.name} source ${m.src||'registry'} type ${m.srcType||''}.`, 'terraform');
+    });
+  }
+
+  // ── Full rebuild ─────────────────────────────────────────────────────────────
+  build(userDocs, resources, modules) {
+    this.chunks=[]; this._tf=[]; this._tfidf=[]; this._docLens=[];
+    this._idf={}; this._vocab=new Set(); this._built=false;
+    this.indexDocuments(userDocs);
+    this.indexResources(resources, modules);
+    this._buildIndex();
+    this._built=true;
+    return this;
+  }
+
+  // ── Legacy: keep _addChunk's old index object intact for any callers ─────────
+  // (not needed in v2 but guards against stale refs)
+  get index() { return this._idf; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DFD XML GENERATOR
 // ─────────────────────────────────────────────────────────────────────────────
 const xe = s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
@@ -1471,7 +2732,7 @@ function buildLegendCells(lx, ly) {
   return cells;
 }
 
-function generateDFDXml(resources, modules, connections) {
+function generateDFDXml(resources, modules, connections, intelligenceCtx) {
   const TORD = ["xsphere","org","security","cicd","network","compute","storage"];
   const groups = {};
   TORD.forEach(t=>{groups[t]=[];});
@@ -1494,29 +2755,40 @@ function generateDFDXml(resources, modules, connections) {
   const containers=[], edges=[], vertices=[];
   let cellN=100;
 
-  // VERTICAL LAYOUT: tiers stack top-to-bottom, uniform width = max tier width
-  const maxNodes = activeTiers.reduce((mx,t)=>Math.max(mx,groups[t].length),1);
-  const effectiveCols = Math.min(maxNodes, MAXCOLS);
-  const tierW = TPAD*2 + effectiveCols*(NW+HGAP) - HGAP;
-  let globalY = CPAD;
+  // ── HORIZONTAL LEFT-TO-RIGHT LAYOUT ────────────────────────────────────────
+  // Legend sits at top-left (CPAD, CPAD). Diagram flows right from legend.
+  // Each tier is a vertical column; nodes within a tier flow top-to-bottom.
+  // MAXROWS: max nodes per sub-column within a tier before wrapping to next column.
+  const MAXROWS = 5;
+  const DIAG_X   = CPAD + LEGEND_W + 40; // diagram start X (right of legend)
+  const DIAG_Y   = CPAD;                 // diagram start Y (same top as legend)
+
+  // Uniform tier height: based on tallest single sub-column across all tiers
+  const maxRowsNeeded = activeTiers.reduce((mx,t)=>Math.max(mx,Math.min(groups[t].length,MAXROWS)),1);
+  const tierH = HDRH + TVPAD + maxRowsNeeded*(NH+LH+VGAP) - VGAP + TVPAD;
+
+  let globalX = DIAG_X;
 
   activeTiers.forEach((t,ti)=>{
     const nodes=groups[t];
-    const rows=Math.ceil(nodes.length/MAXCOLS);
-    const tH=HDRH+TVPAD+rows*(NH+LH+VGAP)-VGAP+TVPAD;
+    // How many sub-columns does this tier need?
+    const subCols = Math.ceil(nodes.length / MAXROWS);
+    const tW = TPAD*2 + subCols*(NW+HGAP) - HGAP;
 
     const tm = TIERS[t]||{label:t, bg:"#F5F5F5", border:"#999", hdr:"#555"};
     const tcid=`tier_${t}`;
     // Single plain rectangle per tier — most compatible with Lucidchart's draw.io importer.
     // Label floats at top-left of the tier background box.
     containers.push(
-      `<mxCell id="${tcid}" value="${xeXml(tm.label)}&#xa;(${nodes.length} resources)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=${tm.hdr};fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=5;" vertex="1" parent="1">\n      <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n    </mxCell>`
+      `<mxCell id="${tcid}" value="${xeXml(tm.label)}&#xa;(${nodes.length} resources)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=${tm.hdr};fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=5;" vertex="1" parent="1">\n      <mxGeometry x="${globalX}" y="${DIAG_Y}" width="${tW}" height="${tierH}" as="geometry"/>\n    </mxCell>`
     );
 
     nodes.forEach((n,i)=>{
-      const col=i%MAXCOLS, row=Math.floor(i/MAXCOLS);
-      const nx=CPAD+TPAD+col*(NW+HGAP);
-      const ny=globalY+HDRH+TVPAD+row*(NH+LH+VGAP);
+      // Within a tier: flow top-to-bottom, wrapping into sub-columns
+      const subCol = Math.floor(i / MAXROWS);
+      const row    = i % MAXROWS;
+      const nx = globalX + TPAD + subCol*(NW+HGAP);
+      const ny = DIAG_Y + HDRH + TVPAD + row*(NH+LH+VGAP);
       const cid=`n_${++cellN}`;
       idMap.set(n.id, {cid, tier:t, tierIdx:ti});
       const meta=n._meta;
@@ -1529,7 +2801,18 @@ function generateDFDXml(resources, modules, connections) {
       // xeXml() encodes user content (XML chars + non-ASCII); &#xa; is then appended literally.
       const escapedName = xeXml(rawName);
       const escapedType = shortType ? xeXml(shortType) : "";
-      const rawLbl = escapedType ? `${escapedName}&#xa;${escapedType}` : escapedName;
+      // Intelligence enrichment: if uploaded docs mention STRIDE threats for this resource,
+      // add a third line to the node label (e.g. "⚑ tamper,infoDisclose")
+      // This only adds content to the VALUE field — XML format/structure is untouched.
+      let threatLine = "";
+      if (intelligenceCtx && intelligenceCtx._built) {
+        const hits = intelligenceCtx.analyzeResource(n.type||"", n.name||"");
+        const strideFound = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.stride||{})))].slice(0,2);
+        if (strideFound.length) threatLine = xeXml(`\u26A0 ${strideFound.join(",")}`);
+      }
+      const rawLbl = escapedType
+        ? (threatLine ? `${escapedName}&#xa;${escapedType}&#xa;${threatLine}` : `${escapedName}&#xa;${escapedType}`)
+        : (threatLine ? `${escapedName}&#xa;${threatLine}` : escapedName);
       const bdrDash = n._isModule||n.srcType==="remote_state" ? "dashed=1;" : "";
       const bgColor = n._isModule ? "#FAFFF5" : "#FFFFFF";
       // Matches the working reference XML: html=1 + whiteSpace=wrap are required for Lucidchart.
@@ -1539,14 +2822,14 @@ function generateDFDXml(resources, modules, connections) {
       );
     });
 
-    globalY += tH + TGAP;
+    globalX += tW + TGAP;
   });
 
-  const totalW = tierW + CPAD*2;
-  const totalH = globalY;
+  const totalW = globalX;
+  const totalH = DIAG_Y + tierH + CPAD;
 
-  // Edges with smart exit/entry routing to minimize overlap
-  // Cross-tier: top/bottom routing. Same-tier: left/right routing.
+  // Edges with smart exit/entry routing — orthogonalEdgeStyle for L→R flow.
+  // Cross-tier edges flow left→right. Same-tier: orthogonal routing.
   const seenE=new Set();
   connections.forEach(c=>{
     const sInfo=idMap.get(c.from), tInfo=idMap.get(c.to);
@@ -1564,16 +2847,12 @@ function generateDFDXml(resources, modules, connections) {
     );
   });
 
-  // Legend is included in XML export. It uses only Lucidchart-safe shapes:
-  // - html=1 + whiteSpace=wrap (matching the working reference XML)
-  // - No 'triangle' shape (replaced with small rect end-cap)
-  // - No 'opacity' property
-  // - xeXml() encodes non-ASCII tier label chars (· → &#183;)
-  const legendCells=buildLegendCells(totalW+40, CPAD);
+  // Legend at TOP-LEFT (CPAD, CPAD) — diagram flows right from (DIAG_X, CPAD).
+  // Uses only Lucidchart-safe shapes: html=1 + whiteSpace=wrap, no triangle, no opacity.
+  const legendCells=buildLegendCells(CPAD, CPAD);
   const allCells=[...containers,...edges,...vertices,...legendCells];
-  // Return bare <mxGraphModel> — wrapped in <mxfile compressed="false"> when downloading/copying.
-  // Lucidchart requires the full <mxfile> wrapper with compressed="false"; file upload only (no paste-XML dialog).
-  const pageW = Math.max(5000, totalW+LEGEND_W+200);
+  // Return bare <mxGraphModel> — wrapped in <mxfile> wrapper when downloading/copying.
+  const pageW = Math.max(5000, totalW+200);
   const pageH = Math.max(3500, totalH+200);
   return [
     // Full mxGraphModel attributes matching draw.io export format — required for correct Lucidchart import.
@@ -1847,6 +3126,7 @@ function KBPanel({domain}) {
   const d = KB[domain];
   if (!d) return null;
   const [openSec, setOpenSec] = useState(0);
+  const DomainIcon = KB_DOMAIN_ICONS[domain] || BookOpen;
 
   return (
     <div style={{display:"flex", flexDirection:"column", gap:0}}>
@@ -1865,8 +3145,8 @@ function KBPanel({domain}) {
             background:`linear-gradient(135deg,${d.color}33,${d.color}11)`,
             border:`1px solid ${d.color}44`,
             display:"flex", alignItems:"center", justifyContent:"center",
-            fontSize:20, flexShrink:0
-          }}>{d.icon}</div>
+            flexShrink:0, color:d.color,
+          }}><DomainIcon size={20}/></div>
           <div>
             <div style={{...SANS, fontSize:18, fontWeight:700, color:C.text, letterSpacing:"-.01em"}}>{d.title}</div>
             <div style={{fontSize:11, color:d.color, marginTop:2, fontWeight:500}}>
@@ -2066,8 +3346,9 @@ function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
             <span style={{fontSize:11, color:C.textMuted, transform:isOpen?"rotate(180deg)":"none", transition:"transform .2s"}}>▼</span>
             <button onClick={e=>{e.stopPropagation();onDelete(idx);}}
               style={{ background:"transparent", border:`1px solid ${C.red}44`,
-                borderRadius:5, padding:"3px 10px", color:C.red, fontSize:11, cursor:"pointer", ...SANS }}>
-              ✕
+                borderRadius:5, padding:"3px 8px", color:C.red, fontSize:11, cursor:"pointer", ...SANS,
+                display:"flex", alignItems:"center" }}>
+              <X size={12}/>
             </button>
           </div>
         </div>
@@ -2162,7 +3443,7 @@ function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
                 color:C.textSub, fontSize:12, cursor:"pointer", ...SANS,
                 display:"inline-flex", alignItems:"center", gap:6,
               }}>
-                📄 Browse Files
+                <FileText size={13}/> Browse Files
                 <input type="file" multiple
                   onChange={e=>{if(e.target.files?.length)onAdd(e.target.files);e.target.value="";}}
                   style={{display:"none"}}/>
@@ -2197,7 +3478,7 @@ function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
                   background:`${C.surface2}`, borderBottom:isFolderOpen?`1px solid ${C.border}`:"none",
                 }}
               >
-                <span style={{fontSize:13}}>{isFolderOpen ? "📂" : "📁"}</span>
+                <FolderOpen size={13} style={{opacity: isFolderOpen ? 1 : 0.6}}/>
                 <span style={{...SANS, fontSize:12, fontWeight:700, color:C.textSub,
                   overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1}}>
                   {folder}
@@ -2241,38 +3522,7 @@ class AnalysisErrorBoundary extends Component {
 // THREATAFORM ANALYSIS ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
 
-// MITRE ATT&CK technique reference table (Enterprise v16.1 Cloud/IaaS)
-const ATTACK_TECHNIQUES = {
-  "T1078":     { name:"Valid Accounts",                              tactic:"Initial Access · Persistence · Defense Evasion · Privilege Escalation" },
-  "T1078.004": { name:"Valid Accounts: Cloud Accounts",             tactic:"Initial Access · Persistence" },
-  "T1190":     { name:"Exploit Public-Facing Application",          tactic:"Initial Access" },
-  "T1195":     { name:"Supply Chain Compromise",                    tactic:"Initial Access" },
-  "T1021":     { name:"Remote Services",                            tactic:"Lateral Movement" },
-  "T1021.001": { name:"Remote Services: Remote Desktop Protocol",   tactic:"Lateral Movement" },
-  "T1021.004": { name:"Remote Services: SSH",                       tactic:"Lateral Movement" },
-  "T1530":     { name:"Data from Cloud Storage Object",             tactic:"Collection" },
-  "T1537":     { name:"Transfer Data to Cloud Account",             tactic:"Exfiltration" },
-  "T1552":     { name:"Unsecured Credentials",                      tactic:"Credential Access" },
-  "T1552.005": { name:"Unsecured Credentials: Cloud Instance Metadata API", tactic:"Credential Access" },
-  "T1555.006": { name:"Credentials from Password Stores: Cloud Secrets Management Stores", tactic:"Credential Access" },
-  "T1562.008": { name:"Impair Defenses: Disable Cloud Logs",        tactic:"Defense Evasion" },
-  "T1578":     { name:"Modify Cloud Compute Infrastructure",        tactic:"Defense Evasion" },
-  "T1580":     { name:"Cloud Infrastructure Discovery",             tactic:"Discovery" },
-  "T1619":     { name:"Cloud Storage Object Discovery",             tactic:"Discovery" },
-  "T1485":     { name:"Data Destruction",                           tactic:"Impact" },
-  "T1486":     { name:"Data Encrypted for Impact",                  tactic:"Impact" },
-  "T1490":     { name:"Inhibit System Recovery",                    tactic:"Impact" },
-  "T1496":     { name:"Resource Hijacking",                         tactic:"Impact" },
-  "T1498":     { name:"Network Denial of Service",                  tactic:"Impact" },
-  "T1499":     { name:"Endpoint Denial of Service",                 tactic:"Impact" },
-  "T1602":     { name:"Data from Configuration Repository",         tactic:"Collection" },
-  "T1611":     { name:"Escape to Host",                             tactic:"Privilege Escalation" },
-  "T1098.001": { name:"Account Manipulation: Additional Cloud Credentials", tactic:"Persistence" },
-  "T1098.003": { name:"Account Manipulation: Additional Cloud Roles", tactic:"Persistence" },
-  "T1136.003": { name:"Create Account: Cloud Account",              tactic:"Persistence" },
-  "T1484":     { name:"Domain Policy Modification",                 tactic:"Privilege Escalation · Defense Evasion" },
-  "T1548.005": { name:"Abuse Elevation Control Mechanism: Temporary Elevated Cloud Access", tactic:"Privilege Escalation · Defense Evasion" },
-};
+// ATTACK_TECHNIQUES is defined at top of file (intelligence knowledge graph v2)
 
 // Extract a named attribute value from an HCL resource body
 function tfAttr(body, name) {
@@ -3955,6 +5205,1759 @@ function AnalysisPanel({ parseResult, files, userDocs, scopeFiles, onScopeChange
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DOCUMENTS PAGE — Step 2: categorized supporting document upload
+// ─────────────────────────────────────────────────────────────────────────────
+const DOC_CATEGORIES = [
+  // Group A — Enterprise Context (expanded by default)
+  { id:"enterprise-arch",   group:"A", label:"Enterprise Architecture",      Icon:Building2,      desc:"Platform type, AWS Org/OU/SCP docs, Sentinel policies, ADRs, SDLC processes",   tip:"e.g. AWS Organization policy JSON, Architecture Decision Records, SCPs" },
+  { id:"app-details",       group:"A", label:"Application / Product Details", Icon:AppWindow,      desc:"HLDD, engineer docs, vendor documentation (AWS, Azure, GCP, 3rd party)",        tip:"e.g. High-Level Design Document, vendor integration guide" },
+  // Group B — Security & Compliance (collapsed by default)
+  { id:"security-controls", group:"B", label:"Enterprise Security Controls",  Icon:Shield,         desc:"Security control matrix, control baseline, known risks, security objectives",    tip:"e.g. Security Control Baseline.xlsx, risk register" },
+  { id:"cspm",              group:"B", label:"CSPM / Cloud Configuration",    Icon:Cloud,          desc:"Wiz reports, cloud configuration rules, cloud posture findings",                  tip:"e.g. Wiz export CSV, AWS Config rules JSON" },
+  { id:"compliance-guide",  group:"B", label:"Customer Compliance Guide",     Icon:ClipboardList,  desc:"CSP compliance guides cross-referenced with enterprise control matrix",           tip:"e.g. AWS HIPAA compliance guide PDF" },
+  { id:"trust-cloud",       group:"B", label:"Trust on Cloud Documentation",  Icon:Lock,           desc:"Cloud trust documentation for your enterprise (if available)",                   tip:"e.g. enterprise cloud trust framework PDF" },
+];
+
+const INDUSTRY_FRAMEWORKS = [
+  "NIST 800-53 r5","NIST CSF 2.0","CIS Controls v8","PCI DSS v4","HIPAA",
+  "FedRAMP Moderate","FedRAMP High","GDPR","ISO 27001","CMMC Level 2","SOC 2 Type II","NIST SP 800-207 (Zero Trust)",
+];
+
+const THREAT_FRAMEWORKS = [
+  "STRIDE","PASTA","VAST","LINDDUN","OCTAVE","RTMP",
+  "OWASP Top 10","OWASP Top 10 Cloud","MITRE ATT&CK","DREAD","TRIKE",
+];
+
+function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs, onRemoveDoc, onContinue, onBack }) {
+  const [collapsed, setCollapsed] = useState({ "security-controls":true, "cspm":true, "compliance-guide":true, "trust-cloud":true });
+  const [processing, setProcessing] = useState({});   // { filename: 'processing'|'done'|'error' }
+  const [keyFeaturesText, setKeyFeaturesText] = useState(modelDetails.keyFeatures || "");
+  const kfRef = useRef(null);
+
+  // Auto-resize key features textarea
+  useEffect(() => {
+    if (kfRef.current) {
+      kfRef.current.style.height = "auto";
+      kfRef.current.style.height = kfRef.current.scrollHeight + "px";
+    }
+  }, [keyFeaturesText]);
+
+  const docsByCategory = useMemo(() => {
+    const map = {};
+    DOC_CATEGORIES.forEach(c => { map[c.id] = []; });
+    map["general"] = [];
+    userDocs.forEach(d => { const cat = d.docCategory || "general"; if (!map[cat]) map[cat] = []; map[cat].push(d); });
+    return map;
+  }, [userDocs]);
+
+  const totalDocs = userDocs.length;
+
+  const handleDrop = (e, catId) => {
+    e.preventDefault(); e.stopPropagation();
+    const files = e.dataTransfer.files;
+    if (files?.length) handleFiles(files, catId);
+  };
+
+  const handleFiles = (fileList, catId) => {
+    const files = Array.from(fileList);
+    const initial = {};
+    files.forEach(f => { initial[f.name] = "processing"; });
+    setProcessing(prev => ({ ...prev, ...initial }));
+
+    onAddDocs(fileList, catId, (name, status) => {
+      setProcessing(prev => ({ ...prev, [name]: status }));
+    });
+  };
+
+  const toggleFramework = (fw, isIndustry) => {
+    const key = isIndustry ? "frameworks" : "threatFrameworks";
+    const current = modelDetails[key] || [];
+    const updated = current.includes(fw) ? current.filter(f => f !== fw) : [...current, fw];
+    onSaveDetails({ ...modelDetails, [key]: updated });
+  };
+
+  const saveKeyFeatures = () => {
+    onSaveDetails({ ...modelDetails, keyFeatures: keyFeaturesText });
+  };
+
+  const extColor = ext => ({ pdf:"#E53935", png:"#0288D1", jpg:"#0288D1", jpeg:"#0288D1",
+    docx:"#1565C0", xlsx:"#2E7D32", csv:"#2E7D32", json:"#F57C00", yaml:"#7B1FA2",
+    txt:"#546E7A", md:"#546E7A" })[ext] || C.textMuted;
+
+  const extLabel = name => (name.split(".").pop() || "file").toUpperCase().slice(0,5);
+
+  const fileSize = bytes => bytes < 1024 ? bytes+"B" : bytes < 1048576 ? Math.round(bytes/1024)+"KB" : (bytes/1048576).toFixed(1)+"MB";
+
+  const renderFileList = (catDocs, catId) => (
+    <div style={{ marginTop: catDocs.length ? 10 : 0, display:"flex", flexDirection:"column", gap:4, maxHeight:200, overflowY:"auto" }}>
+      {catDocs.map((doc, i) => {
+        const status = processing[doc.name];
+        return (
+          <div key={i} style={{
+            display:"flex", alignItems:"center", gap:8, padding:"6px 10px",
+            background:C.bg, borderRadius:6, border:`1px solid ${C.border}`,
+          }}>
+            <span style={{
+              fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:3, flexShrink:0, minWidth:32, textAlign:"center",
+              background:`${extColor(doc.ext)}20`, color:extColor(doc.ext), border:`1px solid ${extColor(doc.ext)}44`,
+            }}>{extLabel(doc.name)}</span>
+            <span style={{...SANS, fontSize:12, color:C.textSub, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+              {doc.name}
+            </span>
+            <span style={{fontSize:10, color:C.textMuted, flexShrink:0}}>{fileSize(doc.size||0)}</span>
+            {status === "processing" && (
+              <span style={{fontSize:10, color:C.accent, flexShrink:0, display:"flex", alignItems:"center", gap:3}}>
+                <Loader2 size={11} style={{animation:"spin 1s linear infinite"}}/> extracting
+              </span>
+            )}
+            {status === "done" && <span style={{fontSize:10, color:"#43A047", flexShrink:0}}>extracted</span>}
+            {status === "error" && <span style={{fontSize:10, color:C.red, flexShrink:0}}>error</span>}
+            <button onClick={() => onRemoveDoc(doc.path || doc.name)} style={{
+              background:"transparent", border:"none", color:C.textMuted, cursor:"pointer",
+              padding:"0 2px", borderRadius:3, display:"flex", alignItems:"center", flexShrink:0,
+            }}
+              onMouseEnter={e=>{ e.currentTarget.style.color=C.red; }}
+              onMouseLeave={e=>{ e.currentTarget.style.color=C.textMuted; }}
+            ><X size={12}/></button>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const renderUploadCard = (cat) => {
+    const catDocs = docsByCategory[cat.id] || [];
+    const isCollapsed = collapsed[cat.id];
+    return (
+      <div key={cat.id} style={{
+        background:C.surface, border:`1px solid ${catDocs.length ? C.accent+"66" : C.border}`,
+        borderRadius:12, overflow:"hidden", transition:"border-color .2s",
+      }}>
+        {/* Card header */}
+        <div onClick={() => setCollapsed(s => ({ ...s, [cat.id]: !isCollapsed }))} style={{
+          display:"flex", alignItems:"center", gap:12, padding:"14px 18px",
+          cursor:"pointer", background: catDocs.length ? `${C.accent}08` : "transparent",
+          userSelect:"none",
+        }}>
+          <cat.Icon size={18} style={{ color: catDocs.length ? C.accent : C.textMuted, flexShrink:0 }}/>
+          <div style={{ flex:1 }}>
+            <div style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>{cat.label}</div>
+            <div style={{fontSize:11, color:C.textMuted, marginTop:2}}>{cat.desc}</div>
+          </div>
+          {catDocs.length > 0 && (
+            <span style={{ fontSize:11, fontWeight:700, color:C.accent, background:`${C.accent}18`,
+              border:`1px solid ${C.accent}44`, borderRadius:10, padding:"2px 8px", flexShrink:0 }}>
+              {catDocs.length}
+            </span>
+          )}
+          {isCollapsed ? <ChevronRight size={14} style={{color:C.textMuted, flexShrink:0}}/> : <ChevronDown size={14} style={{color:C.textMuted, flexShrink:0}}/>}
+        </div>
+
+        {/* Card body */}
+        {!isCollapsed && (
+          <div style={{ padding:"0 18px 16px", borderTop:`1px solid ${C.border}` }}>
+            <div style={{fontSize:11, color:C.textMuted, marginBottom:10, marginTop:12, fontStyle:"italic"}}>{cat.tip}</div>
+            {/* Drop zone */}
+            <div
+              onDrop={e => handleDrop(e, cat.id)}
+              onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.accent; }}
+              onDragLeave={e => { e.currentTarget.style.borderColor = C.border2; }}
+              style={{
+                border:`2px dashed ${C.border2}`, borderRadius:8, padding:"20px 16px",
+                textAlign:"center", cursor:"pointer", transition:"border-color .15s",
+              }}
+              onClick={() => {
+                const inp = document.createElement("input");
+                inp.type = "file"; inp.multiple = true;
+                inp.onchange = e => { if (e.target.files?.length) handleFiles(e.target.files, cat.id); };
+                inp.click();
+              }}
+            >
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8, color:C.textMuted }}>
+                <Upload size={16}/>
+                <span style={{...SANS, fontSize:12}}>Drop files here or <span style={{color:C.accent, fontWeight:600}}>click to browse</span></span>
+              </div>
+              <div style={{fontSize:11, color:C.textMuted, marginTop:4}}>PDF · DOCX · XLSX · CSV · JSON · YAML · TXT · Images — max 50MB</div>
+            </div>
+            {renderFileList(catDocs, cat.id)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderChips = (items, selected, onToggle, accentColor = C.accent) => (
+    <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+      {items.map(item => {
+        const active = selected.includes(item);
+        return (
+          <button key={item} onClick={() => onToggle(item)} style={{
+            ...SANS, fontSize:11, fontWeight: active ? 700 : 500,
+            padding:"5px 12px", borderRadius:20, cursor:"pointer",
+            background: active ? `${accentColor}22` : C.surface2,
+            border: `1px solid ${active ? accentColor : C.border2}`,
+            color: active ? accentColor : C.textSub,
+            transition:"all .15s",
+          }}>
+            {item}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column" }}>
+      {/* ── Header ── */}
+      <div style={{
+        background:C.surface, borderBottom:`1px solid ${C.border}`,
+        padding:"0 28px", height:58, display:"flex", alignItems:"center", gap:16, flexShrink:0, position:"sticky", top:0, zIndex:100,
+      }}>
+        <button onClick={onBack} style={{
+          display:"flex", alignItems:"center", gap:5, background:"transparent",
+          border:"none", color:C.textMuted, cursor:"pointer", fontSize:12, ...SANS, padding:"4px 8px", borderRadius:6,
+        }}
+          onMouseEnter={e=>e.currentTarget.style.color=C.text}
+          onMouseLeave={e=>e.currentTarget.style.color=C.textMuted}
+        >
+          <ChevronLeft size={14}/> Models
+        </button>
+
+        {/* Brand */}
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ width:28, height:28, borderRadius:6, background:`linear-gradient(135deg,${C.accent},${C.accent}88)`,
+            display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <Shield size={14} color="#fff"/>
+          </div>
+          <span style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>{model?.name || "Threat Model"}</span>
+        </div>
+
+        {/* Progress steps */}
+        <div style={{ flex:1, display:"flex", justifyContent:"center" }}>
+          {[{n:1,label:"Create Model"},{n:2,label:"Documents"},{n:3,label:"Workspace"}].map((step,i) => (
+            <div key={step.n} style={{ display:"flex", alignItems:"center" }}>
+              {i > 0 && <div style={{ width:40, height:2, background: step.n <= 2 ? C.accent : C.border, margin:"0 4px" }}/>}
+              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <div style={{
+                  width:22, height:22, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center",
+                  background: step.n < 2 ? C.accent : step.n === 2 ? C.accent : C.surface2,
+                  border: `2px solid ${step.n <= 2 ? C.accent : C.border}`,
+                  fontSize:11, fontWeight:700,
+                  color: step.n <= 2 ? "#fff" : C.textMuted,
+                }}>
+                  {step.n < 2 ? <CheckCircle2 size={12}/> : step.n}
+                </div>
+                <span style={{...SANS, fontSize:11, fontWeight: step.n === 2 ? 700 : 400,
+                  color: step.n === 2 ? C.text : step.n < 2 ? C.accent : C.textMuted}}>
+                  {step.label}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Continue */}
+        <button onClick={onContinue} style={{
+          display:"flex", alignItems:"center", gap:7, background:`linear-gradient(135deg,${C.accent},${C.accent}cc)`,
+          border:"none", borderRadius:8, padding:"8px 18px", color:"#fff",
+          fontSize:13, fontWeight:700, cursor:"pointer", ...SANS,
+        }}>
+          Continue <ArrowRight size={14}/>
+          {totalDocs > 0 && (
+            <span style={{ background:"rgba(255,255,255,.2)", borderRadius:10, padding:"1px 7px", fontSize:11 }}>
+              {totalDocs}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* ── Body ── */}
+      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+        {/* ── Left Sidebar ── */}
+        <div style={{
+          width:200, flexShrink:0, background:C.surface, borderRight:`1px solid ${C.border}`,
+          padding:"20px 12px", overflowY:"auto", position:"sticky", top:58, height:"calc(100vh - 58px)",
+        }}>
+          <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase", letterSpacing:".12em", marginBottom:12, paddingLeft:4}}>
+            Sections
+          </div>
+          {[
+            { id:"group-a",   label:"Enterprise Context",   items:["enterprise-arch","app-details"] },
+            { id:"key-feat",  label:"Key Features",         items:[] },
+            { id:"group-b",   label:"Security & Compliance",items:["security-controls","cspm","compliance-guide","trust-cloud"] },
+            { id:"frameworks",label:"Analysis Frameworks",  items:[] },
+          ].map(section => {
+            const count = section.items.reduce((s,id) => s + (docsByCategory[id]?.length||0), 0);
+            const hasExtra = section.id === "frameworks"
+              ? ((modelDetails.frameworks?.length||0) + (modelDetails.threatFrameworks?.length||0)) > 0
+              : false;
+            return (
+              <a key={section.id} href={`#${section.id}`} style={{
+                display:"flex", alignItems:"center", justifyContent:"space-between",
+                padding:"8px 10px", borderRadius:6, marginBottom:2,
+                color: count || hasExtra ? C.accent : C.textSub, fontSize:12, textDecoration:"none", ...SANS,
+                background: count || hasExtra ? `${C.accent}10` : "transparent",
+              }}>
+                <span style={{fontWeight: count || hasExtra ? 600 : 400}}>{section.label}</span>
+                {(count > 0) && (
+                  <span style={{ fontSize:10, fontWeight:700, background:`${C.accent}22`, color:C.accent,
+                    border:`1px solid ${C.accent}44`, borderRadius:9, padding:"1px 6px" }}>
+                    {count}
+                  </span>
+                )}
+              </a>
+            );
+          })}
+
+          <div style={{ marginTop:20, paddingTop:16, borderTop:`1px solid ${C.border}` }}>
+            <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase", letterSpacing:".12em", marginBottom:8, paddingLeft:4}}>Summary</div>
+            <div style={{fontSize:12, color:C.textSub, padding:"0 4px", ...SANS}}>
+              <div style={{marginBottom:4}}><span style={{fontWeight:700, color:C.accent}}>{totalDocs}</span> docs uploaded</div>
+              <div style={{marginBottom:4}}><span style={{fontWeight:700, color:"#7B1FA2"}}>{modelDetails.frameworks?.length||0}</span> industry frameworks</div>
+              <div><span style={{fontWeight:700, color:"#E65100"}}>{modelDetails.threatFrameworks?.length||0}</span> threat frameworks</div>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Main Content ── */}
+        <div style={{ flex:1, overflowY:"auto", padding:"28px 32px", maxWidth:860 }}>
+
+          {/* GROUP A */}
+          <div id="group-a" style={{ marginBottom:32 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+              <Building2 size={18} style={{ color:C.accent }}/>
+              <div>
+                <div style={{...SANS, fontSize:15, fontWeight:700, color:C.text}}>Enterprise Context</div>
+                <div style={{fontSize:12, color:C.textMuted}}>Architecture and product documentation that defines scope and platform context</div>
+              </div>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {DOC_CATEGORIES.filter(c => c.group === "A").map(renderUploadCard)}
+            </div>
+          </div>
+
+          {/* KEY FEATURES */}
+          <div id="key-feat" style={{ marginBottom:32 }}>
+            <div style={{
+              background:C.surface, border:`1px solid ${keyFeaturesText ? C.accent+"66" : C.border}`,
+              borderRadius:12, padding:"18px 20px",
+            }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
+                <Sparkles size={18} style={{ color: keyFeaturesText ? C.accent : C.textMuted }}/>
+                <div>
+                  <div style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>Key Features</div>
+                  <div style={{fontSize:11, color:C.textMuted}}>Describe key capabilities — enriches threat model context and intelligence queries</div>
+                </div>
+              </div>
+              <textarea
+                ref={kfRef}
+                value={keyFeaturesText}
+                onChange={e => setKeyFeaturesText(e.target.value)}
+                onBlur={saveKeyFeatures}
+                placeholder="Describe the key features and capabilities of the product being threat modeled. E.g., 'Real-time data streaming, multi-tenant architecture, REST API with OAuth 2.0, stores PII in encrypted DynamoDB tables...'"
+                style={{
+                  width:"100%", boxSizing:"border-box", minHeight:90, resize:"none", overflow:"hidden",
+                  background:C.bg, border:`1px solid ${C.border}`, borderRadius:8,
+                  color:C.text, fontSize:12, padding:"10px 12px", lineHeight:1.6,
+                  outline:"none", ...SANS, transition:"border-color .15s",
+                }}
+                onFocus={e=>e.target.style.borderColor=C.accent}
+                onBlurCapture={e=>e.target.style.borderColor=C.border}
+              />
+            </div>
+          </div>
+
+          {/* GROUP B */}
+          <div id="group-b" style={{ marginBottom:32 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+              <Shield size={18} style={{ color:"#E53935" }}/>
+              <div>
+                <div style={{...SANS, fontSize:15, fontWeight:700, color:C.text}}>Security & Compliance</div>
+                <div style={{fontSize:12, color:C.textMuted}}>Security controls, CSPM posture findings, compliance guides, and trust documentation</div>
+              </div>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {DOC_CATEGORIES.filter(c => c.group === "B").map(renderUploadCard)}
+            </div>
+          </div>
+
+          {/* GROUP C — Frameworks */}
+          <div id="frameworks" style={{ marginBottom:40 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+              <SquareStack size={18} style={{ color:"#7B1FA2" }}/>
+              <div>
+                <div style={{...SANS, fontSize:15, fontWeight:700, color:C.text}}>Analysis Frameworks</div>
+                <div style={{fontSize:12, color:C.textMuted}}>Select the frameworks in scope — they will inform intelligence queries and threat model generation</div>
+              </div>
+            </div>
+
+            <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+              {/* Industry */}
+              <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14 }}>
+                  <ClipboardList size={16} style={{ color:"#7B1FA2" }}/>
+                  <span style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>Industry & Compliance Frameworks</span>
+                  {(modelDetails.frameworks?.length > 0) && (
+                    <span style={{ fontSize:11, color:"#7B1FA2", background:"#7B1FA210", border:"1px solid #7B1FA244", borderRadius:9, padding:"1px 7px", marginLeft:"auto" }}>
+                      {modelDetails.frameworks.length} selected
+                    </span>
+                  )}
+                </div>
+                {renderChips(INDUSTRY_FRAMEWORKS, modelDetails.frameworks || [], fw => toggleFramework(fw, true), "#7B1FA2")}
+              </div>
+
+              {/* Threat */}
+              <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14 }}>
+                  <Zap size={16} style={{ color:"#E65100" }}/>
+                  <span style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>Threat Modeling Frameworks</span>
+                  {(modelDetails.threatFrameworks?.length > 0) && (
+                    <span style={{ fontSize:11, color:"#E65100", background:"#E6510010", border:"1px solid #E6510044", borderRadius:9, padding:"1px 7px", marginLeft:"auto" }}>
+                      {modelDetails.threatFrameworks.length} selected
+                    </span>
+                  )}
+                </div>
+                {renderChips(THREAT_FRAMEWORKS, modelDetails.threatFrameworks || [], fw => toggleFramework(fw, false), "#E65100")}
+              </div>
+            </div>
+          </div>
+
+          {/* Spacer */}
+          <div style={{height:48}}/>
+        </div>
+      </div>
+
+      {/* Spinner keyframe */}
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LANDING PAGE — Threat model selection / creation
+// ─────────────────────────────────────────────────────────────────────────────
+function LandingPage({ onCreateModel, onOpenModel, onDeleteModel, threatModels }) {
+  const [newName, setNewName] = useState("");
+  const EXAMPLES = ["Kinesis Data Analytics","Amazon EKS Platform","API Gateway + Lambda","RDS Multi-Region","S3 Data Lake","MSK Kafka Cluster"];
+
+  const handleCreate = () => {
+    const n = newName.trim();
+    if (!n) return;
+    onCreateModel(n);
+  };
+
+  const GRADE_COLORS = { A:"#43A047", B:"#7CB342", C:"#F57C00", D:"#E64A19", F:"#B71C1C" };
+
+  return (
+    <div style={{...SANS, minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column", alignItems:"center", padding:"72px 24px 60px"}}>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+
+      {/* Hero */}
+      <div style={{textAlign:"center", maxWidth:640, marginBottom:56}}>
+        <div style={{
+          width:72, height:72, borderRadius:20, margin:"0 auto 22px",
+          background:"linear-gradient(135deg,#FF6B35,#FF9900)",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          boxShadow:"0 8px 32px #FF990050",
+        }}><Shield size={36} color="#fff"/></div>
+        <div style={{fontSize:40, fontWeight:800, color:C.text, letterSpacing:"-.03em", lineHeight:1.1, marginBottom:14}}>
+          Threataform
+        </div>
+        <div style={{fontSize:15, color:C.textSub, lineHeight:1.75, maxWidth:520, margin:"0 auto"}}>
+          Enterprise Terraform Threat Intelligence. Upload your infrastructure-as-code,
+          auto-generate DFD diagrams, discover threats, and assess zero-trust posture.
+        </div>
+      </div>
+
+      {/* New model card */}
+      <div style={{
+        width:"100%", maxWidth:660, background:C.surface,
+        border:`1px solid ${C.border}`, borderRadius:18,
+        padding:"32px 36px", marginBottom:48,
+        boxShadow:"0 8px 48px #00000060",
+      }}>
+        <div style={{fontSize:20, fontWeight:700, color:C.text, marginBottom:6}}>
+          Start New Threat Model
+        </div>
+        <div style={{fontSize:12, color:C.textSub, lineHeight:1.7, marginBottom:22}}>
+          The <strong style={{color:C.text}}>product name</strong> (e.g., "Kinesis Data Analytics") is used to infer
+          what services are in scope, enrich threat analysis, and seed the intelligence engine.
+        </div>
+        <div style={{display:"flex", gap:10, marginBottom:14}}>
+          <input
+            value={newName}
+            onChange={e=>setNewName(e.target.value)}
+            onKeyDown={e=>{if(e.key==="Enter"&&newName.trim())handleCreate();}}
+            placeholder='e.g. "Kinesis Data Analytics", "EKS Multi-Tenant Platform"'
+            autoFocus
+            style={{
+              flex:1, background:C.bg, border:`1px solid ${C.border2}`,
+              borderRadius:10, padding:"13px 16px", color:C.text, fontSize:14,
+              outline:"none", ...SANS,
+            }}
+          />
+          <button onClick={handleCreate} disabled={!newName.trim()} style={{
+            background:newName.trim()?"linear-gradient(135deg,#FF6B35,#FF9900)":C.surface2,
+            border:"none", borderRadius:10, padding:"13px 26px",
+            color:newName.trim()?"#fff":C.textMuted,
+            fontSize:14, cursor:newName.trim()?"pointer":"not-allowed",
+            fontWeight:700, ...SANS, flexShrink:0, transition:"all .15s",
+          }}>
+            Create →
+          </button>
+        </div>
+        {/* Quick examples */}
+        <div style={{display:"flex", flexWrap:"wrap", gap:7}}>
+          <span style={{fontSize:11, color:C.textMuted, alignSelf:"center", marginRight:2}}>Quick:</span>
+          {EXAMPLES.map(ex=>(
+            <button key={ex} onClick={()=>setNewName(ex)} style={{
+              background:"transparent", border:`1px solid ${C.border}`,
+              borderRadius:20, padding:"4px 12px", fontSize:11, color:C.textMuted,
+              cursor:"pointer", ...SANS, transition:"all .15s",
+            }}
+            onMouseEnter={e=>e.currentTarget.style.borderColor=C.accent}
+            onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}
+            >{ex}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Existing models */}
+      {threatModels.length > 0 && (
+        <div style={{width:"100%", maxWidth:880}}>
+          <div style={{fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
+            letterSpacing:".12em", marginBottom:18}}>
+            Existing Threat Models
+          </div>
+          <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(260px, 1fr))", gap:12}}>
+            {threatModels.map(model=>(
+              <div key={model.id}
+                onClick={()=>onOpenModel(model)}
+                style={{
+                  background:C.surface, border:`1px solid ${C.border}`, borderRadius:14,
+                  padding:"20px 22px", cursor:"pointer", position:"relative",
+                  transition:"all .2s",
+                }}
+                onMouseEnter={e=>{e.currentTarget.style.borderColor=C.accent; e.currentTarget.style.transform="translateY(-2px)"; e.currentTarget.style.boxShadow=`0 8px 24px ${C.accent}20`;}}
+                onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border; e.currentTarget.style.transform="translateY(0)"; e.currentTarget.style.boxShadow="none";}}
+              >
+                {/* Grade badge */}
+                {model.grade && (
+                  <div style={{
+                    position:"absolute", top:14, right:40,
+                    fontSize:13, fontWeight:800, color:GRADE_COLORS[model.grade]||C.accent,
+                    background:`${GRADE_COLORS[model.grade]||C.accent}18`,
+                    border:`1px solid ${GRADE_COLORS[model.grade]||C.accent}40`,
+                    borderRadius:6, padding:"2px 8px",
+                  }}>{model.grade}</div>
+                )}
+                {/* Delete */}
+                <button onClick={e=>{e.stopPropagation();onDeleteModel(model.id);}} style={{
+                  position:"absolute", top:10, right:10, background:"transparent", border:"none",
+                  color:C.textMuted, cursor:"pointer", fontSize:14, padding:"4px 6px",
+                  borderRadius:4, lineHeight:1,
+                }} title="Delete model"><X size={13}/></button>
+
+                <div style={{fontSize:15, fontWeight:700, color:C.text, marginBottom:6, paddingRight:56,
+                  lineHeight:1.3, wordBreak:"break-word"}}>{model.name}</div>
+                <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:8}}>
+                  {model.environment && (
+                    <span style={{fontSize:10, color:C.textMuted, background:C.surface2,
+                      border:`1px solid ${C.border}`, borderRadius:4, padding:"1px 6px"}}>
+                      {model.environment}
+                    </span>
+                  )}
+                  <span style={{fontSize:10, color:C.textMuted}}>
+                    {model.tfFileCount ? `${model.tfFileCount} TF files` : "No TF files"}
+                  </span>
+                  {model.docCount > 0 && (
+                    <span style={{fontSize:10, color:C.textMuted}}>{model.docCount} docs</span>
+                  )}
+                </div>
+                <div style={{fontSize:10, color:C.textMuted}}>
+                  {model.updatedAt
+                    ? `Updated ${new Date(model.updatedAt).toLocaleDateString()}`
+                    : `Created ${new Date(model.createdAt).toLocaleDateString()}`}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARCHITECTURE IMAGE VIEWER
+// User exports XML → imports to Lucidchart → exports diagram image → uploads here
+// ─────────────────────────────────────────────────────────────────────────────
+function ArchitectureImageViewer({ image, onUpload }) {
+  const inputRef = useRef(null);
+
+  const handleFile = (file) => {
+    if (!file) return;
+    if (!/^image\//i.test(file.type) && !/\.(png|jpg|jpeg|svg|webp|gif)$/i.test(file.name)) return;
+    const reader = new FileReader();
+    reader.onload = (e) => onUpload(e.target.result, file.name);
+    reader.readAsDataURL(file);
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault();
+    handleFile(e.dataTransfer.files[0]);
+  };
+
+  if (!image) {
+    return (
+      <div
+        onDrop={onDrop}
+        onDragOver={e => e.preventDefault()}
+        style={{
+          display:"flex", alignItems:"center", justifyContent:"center",
+          height:"calc(100vh - 130px)", flexDirection:"column", gap:20,
+        }}
+      >
+        <div style={{
+          border:`2px dashed ${C.border}`, borderRadius:16,
+          padding:"56px 64px", textAlign:"center",
+          display:"flex", flexDirection:"column", alignItems:"center", gap:16,
+          maxWidth:560, cursor:"pointer", transition:"border-color .2s",
+        }}
+          onClick={() => inputRef.current?.click()}
+          onMouseEnter={e => e.currentTarget.style.borderColor = C.accent}
+          onMouseLeave={e => e.currentTarget.style.borderColor = C.border}
+        >
+          <ImageIcon size={48} style={{color:C.textMuted, opacity:0.5}}/>
+          <div style={{fontSize:16, fontWeight:700, color:C.text}}>Upload Architecture Diagram</div>
+          <div style={{fontSize:13, color:C.textMuted, lineHeight:1.6}}>
+            Export the XML from the <strong style={{color:C.accent}}>XML Output</strong> tab,
+            import it into <strong style={{color:C.accent}}>Lucidchart</strong>,
+            then export your diagram as an image and upload it here.
+          </div>
+          <div style={{
+            marginTop:4, background:`${C.accent}18`, border:`1px solid ${C.accent}30`,
+            borderRadius:8, padding:"8px 20px", fontSize:12, color:C.accent, fontWeight:600,
+          }}>
+            Click to upload or drag & drop
+          </div>
+          <div style={{fontSize:11, color:C.textMuted}}>PNG · JPG · SVG · WebP</div>
+        </div>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          style={{display:"none"}}
+          onChange={e => handleFile(e.target.files[0])}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{position:"relative", height:"calc(100vh - 130px)", overflow:"auto", background:"#080810"}}>
+      {/* Replace button */}
+      <button
+        onClick={() => inputRef.current?.click()}
+        style={{
+          position:"absolute", top:16, right:16, zIndex:10,
+          background:`${C.accent}22`, border:`1px solid ${C.accent}50`,
+          borderRadius:8, padding:"6px 16px", color:C.accent,
+          fontSize:12, fontWeight:600, cursor:"pointer", ...SANS,
+        }}
+      >
+        Replace Image
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*"
+        style={{display:"none"}}
+        onChange={e => handleFile(e.target.files[0])}
+      />
+      <img
+        src={image}
+        alt="Architecture Diagram"
+        style={{
+          display:"block", maxWidth:"100%", height:"auto",
+          margin:"0 auto", padding:24,
+        }}
+      />
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTELLIGENCE PANEL
+// Enterprise Threat Model Intelligence — zero hallucination, verbatim retrieval
+// ─────────────────────────────────────────────────────────────────────────────
+function IntelligencePanel({ intelligence, userDocs, parseResult }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState(null); // null = not searched yet
+  const [iTab, setITab] = useState("query");    // query | misconfigs | attacks | threats | scope | resources
+
+  const summary = useMemo(() => {
+    if (!intelligence?._built) return null;
+    return intelligence.getArchitectureSummary(parseResult?.resources || [], userDocs || []);
+  }, [intelligence, parseResult, userDocs]);
+
+  const handleQuery = () => {
+    if (!query.trim() || !intelligence) return;
+    setResults(intelligence.query(query.trim(), 8));
+  };
+
+  const STRIDE_COLORS = {
+    spoofing:"#E91E63", tampering:"#FF5722", repudiation:"#9C27B0",
+    infoDisclose:"#F44336", dos:"#FF9800", elevPriv:"#B71C1C",
+  };
+  const STRIDE_LABELS = {
+    spoofing:"Spoofing", tampering:"Tampering", repudiation:"Repudiation",
+    infoDisclose:"Info Disclosure", dos:"Denial of Service", elevPriv:"Elevation of Privilege",
+  };
+  const COMPLIANCE_LABELS = {
+    hipaa:"HIPAA", fedramp:"FedRAMP", soc2:"SOC 2", pci:"PCI DSS",
+    gdpr:"GDPR", cmmc:"CMMC", iso27001:"ISO 27001",
+  };
+
+  const noData = !intelligence?._built || (summary?.chunkCount || 0) === 0;
+  const hasUserDocs = (userDocs?.length || 0) > 0;
+
+  const catPill = (label, color) => (
+    <span style={{
+      background:`${color}22`, color, border:`1px solid ${color}44`,
+      borderRadius:10, padding:"1px 8px", fontSize:10, fontWeight:600,
+    }}>{label}</span>
+  );
+
+  const catColor = (cat) => ({
+    "threat-model":"#E53935","compliance":"#0277BD","architecture":"#4527A0",
+    "runbook":"#6A1B9A","terraform":"#5C4033"
+  }[cat]||"#78909C");
+
+  const chunkCard = (chunk, i) => (
+    <div key={i} style={{
+      background:C.surface, border:`1px solid ${C.border}`,
+      borderRadius:8, padding:"12px 14px", marginBottom:8,
+    }}>
+      <div style={{display:"flex", gap:8, alignItems:"center", marginBottom:6, flexWrap:"wrap"}}>
+        <span style={{background:`${C.accent}22`, color:C.accent, border:`1px solid ${C.accent}44`,
+          borderRadius:10, padding:"1px 8px", fontSize:10, fontWeight:600}}>{chunk.source}</span>
+        {catPill(chunk.category, catColor(chunk.category))}
+        {/* Confidence meter */}
+        {chunk.confidence != null && (
+          <span style={{marginLeft:"auto", display:"flex", alignItems:"center", gap:5}}>
+            <span style={{fontSize:9,color:C.textMuted}}>match</span>
+            <span style={{fontSize:11, fontWeight:700,
+              color:chunk.confidence>=80?"#2E7D32":chunk.confidence>=50?"#F57C00":"#E53935"}}>
+              {chunk.confidence}%
+            </span>
+            <div style={{width:40,height:4,background:C.border,borderRadius:2,overflow:"hidden"}}>
+              <div style={{width:`${chunk.confidence}%`,height:"100%",borderRadius:2,
+                background:chunk.confidence>=80?"#2E7D32":chunk.confidence>=50?"#F57C00":"#E53935"}}/>
+            </div>
+          </span>
+        )}
+      </div>
+      {/* Compressed context highlight */}
+      {chunk.compressed && chunk.compressed !== chunk.text && (
+        <div style={{...MONO, fontSize:11, color:C.accent, lineHeight:1.6,
+          background:`${C.accent}08`, padding:"5px 8px", borderRadius:5,
+          border:`1px solid ${C.accent}22`, marginBottom:4, whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+          ✦ {chunk.compressed}
+        </div>
+      )}
+      <div style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.65,
+        background:C.bg, padding:"8px 10px", borderRadius:6,
+        border:`1px solid ${C.border}`, whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+        &ldquo;{chunk.text}&rdquo;
+      </div>
+      {/* Entity + ATT&CK tags */}
+      {Object.entries(chunk.entities||{}).some(([,s])=>Object.keys(s).length>0) && (
+        <div style={{display:"flex", gap:4, flexWrap:"wrap", marginTop:6}}>
+          {Object.entries(chunk.entities.stride||{}).map(([k])=>(
+            <span key={k} style={{background:`${STRIDE_COLORS[k]||"#999"}18`,color:STRIDE_COLORS[k]||"#999",
+              border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+              STRIDE·{STRIDE_LABELS[k]||k}
+            </span>
+          ))}
+          {Object.entries(chunk.entities.attack||{}).slice(0,3).map(([k])=>(
+            <span key={k} style={{background:"#E5393514",color:"#E53935",border:"1px solid #E5393530",
+              borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>{k}</span>
+          ))}
+          {Object.entries(chunk.entities.compliance||{}).map(([k])=>(
+            <span key={k} style={{background:"#0277BD18",color:"#0277BD",border:"1px solid #0277BD44",
+              borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>{COMPLIANCE_LABELS[k]||k}</span>
+          ))}
+          {Object.entries(chunk.entities.security||{}).slice(0,2).map(([k])=>(
+            <span key={k} style={{background:"#2E7D3218",color:"#2E7D32",border:"1px solid #2E7D3244",
+              borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>{k}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  if (noData && !hasUserDocs) {
+    return (
+      <div style={{padding:"48px 40px", maxWidth:720, textAlign:"center"}}>
+        <div style={{fontSize:48, marginBottom:16, opacity:0.4}}>🧠</div>
+        <div style={{fontSize:18, fontWeight:600, color:C.text, marginBottom:8}}>Intelligence Engine</div>
+        <div style={{fontSize:13, color:C.textSub, lineHeight:1.7, maxWidth:480, margin:"0 auto"}}>
+          Upload architecture documents, runbooks, threat models, or compliance docs.
+          The intelligence engine will index them and let you query your architecture knowledge
+          base with zero hallucination — every answer is a verbatim passage from your documents.
+        </div>
+        <div style={{marginTop:24, padding:"16px 20px", background:C.surface,
+          border:`1px solid ${C.border}`, borderRadius:10, maxWidth:480, margin:"24px auto 0",
+          textAlign:"left"}}>
+          <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:8, textTransform:"uppercase", letterSpacing:".08em"}}>Supported document types</div>
+          {["Architecture diagrams (.txt, .md, .json, .yaml)","Threat model documents (STRIDE, MITRE templates)",
+            "Compliance policies (HIPAA, FedRAMP, SOC 2, PCI)","Runbooks and incident response procedures",
+            "Network topology descriptions","Security control inventories"].map((s,i)=>(
+            <div key={i} style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
+              <span style={{color:C.accent,fontSize:10}}>›</span>
+              <span style={{fontSize:12,color:C.textSub}}>{s}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const SEV_COLOR = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
+
+  const ITABS = [
+    {id:"query",     label:"Query",                Icon: Search},
+    {id:"posture",   label:"Security Posture",     Icon: ShieldCheck},
+    {id:"controls",  label:"Control Inventory",    Icon: ListChecks},
+    {id:"crossdoc",  label:"Cross-Doc Correlation",Icon: GitCompare},
+    {id:"misconfigs",label:"Misconfig Checks",     Icon: ShieldAlert},
+    {id:"attacks",   label:"ATT&CK Mapping",       Icon: Zap},
+    {id:"threats",   label:"Doc Threat Findings",  Icon: TriangleAlert},
+    {id:"scope",     label:"Scope Analysis",       Icon: ScanLine},
+    {id:"resources", label:"Resource Intelligence",Icon: Layers},
+  ];
+
+  return (
+    <div style={{display:"flex", height:"calc(100vh - 58px)"}}>
+      {/* Sub-nav */}
+      <div style={{width:210, background:C.surface, borderRight:`1px solid ${C.border}`,
+        padding:"14px 8px", display:"flex", flexDirection:"column", gap:2, flexShrink:0}}>
+        <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
+          letterSpacing:".1em", padding:"0 8px 8px"}}>Intelligence</div>
+        {ITABS.map(tab=>(
+          <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
+            display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
+            padding:"8px 12px", background:iTab===tab.id?`${C.accent}15`:"transparent",
+            border:"none", borderRadius:8, color:iTab===tab.id?C.accent:C.textSub,
+            fontSize:12, cursor:"pointer", ...SANS, fontWeight:iTab===tab.id?600:400,
+          }}>
+            <tab.Icon size={14} />
+            <span>{tab.label}</span>
+          </button>
+        ))}
+
+        {/* Stats */}
+        {summary && (
+          <div style={{marginTop:"auto", padding:"12px 8px", borderTop:`1px solid ${C.border}`}}>
+            {/* Posture grade badge */}
+            {summary.posture && (
+              <div style={{marginBottom:10, textAlign:"center"}}>
+                <div style={{fontSize:9, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
+                  letterSpacing:".08em", marginBottom:4}}>Security Posture</div>
+                <div style={{display:"inline-flex", alignItems:"center", gap:6, background:`${summary.posture.gradeColor}18`,
+                  border:`1px solid ${summary.posture.gradeColor}44`, borderRadius:8, padding:"4px 12px"}}>
+                  <span style={{fontSize:22, fontWeight:800, color:summary.posture.gradeColor, lineHeight:1}}>
+                    {summary.posture.grade}
+                  </span>
+                  <div style={{textAlign:"left"}}>
+                    <div style={{fontSize:13, fontWeight:700, color:summary.posture.gradeColor}}>{summary.posture.score}/100</div>
+                    <div style={{fontSize:9, color:C.textMuted}}>{summary.posture.maturity}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
+              letterSpacing:".08em", marginBottom:8}}>Index Stats</div>
+            {[
+              {label:"Docs indexed",         val:summary.docCount},
+              {label:"Text chunks",          val:summary.chunkCount},
+              {label:"ATT&CK techniques",    val:summary.attackTechniqueCount||0, color:"#E53935"},
+              {label:"Misconfigurations",    val:summary.misconfigCount||0,       color:"#F57C00"},
+              {label:"Controls present",     val:summary.controlInventory?.present?.length||0, color:"#43A047"},
+              {label:"Control gaps",         val:summary.controlInventory?.absent?.length||0,  color:"#E53935"},
+              {label:"Doc threat findings",  val:summary.threatChunks?.length||0},
+              {label:"Scope references",     val:summary.scopeChunks?.length||0},
+            ].map(({label,val,color},i)=>(
+              <div key={i} style={{display:"flex", justifyContent:"space-between", marginBottom:4, fontSize:11}}>
+                <span style={{color:C.textMuted}}>{label}</span>
+                <span style={{color:color||C.accent, fontWeight:600}}>{val}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Content */}
+      <div style={{flex:1, overflowY:"auto", padding:"24px 28px"}}>
+
+        {/* ── QUERY TAB ── */}
+        {iTab==="query" && (
+          <div style={{maxWidth:800}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Architecture Intelligence Query
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Ask any question about your enterprise architecture. Results are verbatim passages
+              from your uploaded documents — zero hallucination, fully cited.
+            </div>
+            <div style={{display:"flex", gap:8, marginBottom:20}}>
+              <input
+                value={query}
+                onChange={e=>setQuery(e.target.value)}
+                onKeyDown={e=>{if(e.key==="Enter")handleQuery();}}
+                placeholder="e.g. What are the in-scope services? Which resources handle PHI? What encryption is used?"
+                style={{
+                  flex:1, background:C.surface, border:`1px solid ${C.border2}`,
+                  borderRadius:8, padding:"10px 14px", color:C.text, fontSize:13,
+                  outline:"none", ...SANS,
+                }}
+              />
+              <button onClick={handleQuery} style={{
+                background:`linear-gradient(135deg,${C.accent},#FF9900)`,
+                border:"none", borderRadius:8, padding:"10px 20px",
+                color:"#fff", fontSize:13, cursor:"pointer", fontWeight:600, ...SANS,
+                flexShrink:0,
+              }}>Search</button>
+            </div>
+
+            {/* Suggested queries */}
+            {results===null && (
+              <div>
+                <div style={{fontSize:11, color:C.textMuted, fontWeight:600,
+                  textTransform:"uppercase", letterSpacing:".08em", marginBottom:10}}>
+                  Suggested Queries
+                </div>
+                <div style={{display:"flex", flexWrap:"wrap", gap:8, marginBottom:24}}>
+                  {[
+                    "What services are in scope for the threat model?",
+                    "What encryption controls are mentioned?",
+                    "Which resources handle sensitive data or PHI?",
+                    "What STRIDE threats apply to this architecture?",
+                    "Are there any IAM privilege escalation risks?",
+                    "What compliance frameworks are in scope?",
+                    "IMDSv2 instance metadata credential access",
+                    "CloudTrail logging disabled defense evasion",
+                    "S3 bucket public access data exfiltration",
+                    "RDS encryption at rest database security",
+                    "What network boundaries and trust zones exist?",
+                    "Which components are out of scope?",
+                  ].map((s,i)=>(
+                    <button key={i} onClick={()=>{setQuery(s);setTimeout(()=>{
+                      if(intelligence)setResults(intelligence.query(s,8));
+                    },0);}} style={{
+                      background:C.surface, border:`1px solid ${C.border}`,
+                      borderRadius:16, padding:"5px 12px", color:C.textSub,
+                      fontSize:12, cursor:"pointer", ...SANS,
+                      transition:"all .15s",
+                    }}>{s}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {results !== null && (
+              <div>
+                <div style={{fontSize:12, color:C.textMuted, marginBottom:14, display:"flex", alignItems:"center", gap:12}}>
+                  <span>{results.length} passage{results.length!==1?"s":""} found
+                    {results.length===0?" — no matching content. Try different keywords or expand query.":""}</span>
+                  {results.length>0 && (
+                    <span style={{fontSize:10,color:C.textMuted}}>
+                      (BM25 + TF-IDF cosine · RRF fusion · query expansion)
+                    </span>
+                  )}
+                </div>
+                {results.map((chunk,i)=>chunkCard(chunk,i))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── THREAT FINDINGS TAB ── */}
+        {iTab==="threats" && (
+          <div style={{maxWidth:800}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Threat Findings from Documents
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18}}>
+              STRIDE threats identified in uploaded architecture documents. Each finding is a verbatim excerpt.
+            </div>
+
+            {/* STRIDE summary grid */}
+            {summary?.entitySummary?.stride && Object.keys(summary.entitySummary.stride).length > 0 && (
+              <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",
+                gap:10, marginBottom:20}}>
+                {Object.entries(summary.entitySummary.stride).map(([k,terms])=>(
+                  <div key={k} style={{
+                    background:C.surface, border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,
+                    borderRadius:8, padding:"10px 12px",
+                    borderLeft:`3px solid ${STRIDE_COLORS[k]||"#999"}`,
+                  }}>
+                    <div style={{fontSize:11, fontWeight:700, color:STRIDE_COLORS[k]||"#999",
+                      textTransform:"uppercase", letterSpacing:".06em", marginBottom:6}}>
+                      {STRIDE_LABELS[k]||k}
+                    </div>
+                    <div style={{fontSize:11, color:C.textSub, lineHeight:1.5}}>
+                      {terms.join(", ")}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Threat chunks */}
+            {(summary?.threatChunks||[]).length === 0 ? (
+              <div style={{color:C.textMuted, fontSize:13}}>
+                No explicit threat indicators found in uploaded documents.
+                Upload threat model docs, STRIDE assessments, or security reviews.
+              </div>
+            ) : (
+              summary.threatChunks.map((chunk,i)=>(
+                <div key={i} style={{
+                  background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+                  padding:"12px 14px", marginBottom:8,
+                }}>
+                  <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:6}}>
+                    <span style={{background:`${C.accent}22`, color:C.accent,
+                      border:`1px solid ${C.accent}44`, borderRadius:10,
+                      padding:"1px 8px", fontSize:10, fontWeight:600}}>{chunk.source}</span>
+                    {chunk.threats.map(t=>(
+                      <span key={t} style={{background:`${STRIDE_COLORS[t]||"#999"}18`,
+                        color:STRIDE_COLORS[t]||"#999",border:`1px solid ${STRIDE_COLORS[t]||"#999"}44`,
+                        borderRadius:8,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                        {STRIDE_LABELS[t]||t}
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.65,
+                    background:C.bg, padding:"8px 10px", borderRadius:6, border:`1px solid ${C.border}`,
+                    whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                    &ldquo;{chunk.excerpt}&rdquo;
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* ── SCOPE ANALYSIS TAB ── */}
+        {iTab==="scope" && (
+          <div style={{maxWidth:800}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Scope Analysis
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18}}>
+              In-scope and out-of-scope declarations detected in uploaded documents.
+              These define the threat model boundary for this assessment.
+            </div>
+
+            {(summary?.scopeChunks||[]).length === 0 ? (
+              <div>
+                <div style={{color:C.textMuted, fontSize:13, marginBottom:16}}>
+                  No explicit scope declarations found in uploaded documents.
+                  Include phrases like &ldquo;in scope&rdquo; / &ldquo;out of scope&rdquo; in your architecture docs.
+                </div>
+                {/* Show all resources as assumed in scope */}
+                {parseResult?.resources?.length > 0 && (
+                  <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, padding:"14px 16px"}}>
+                    <div style={{fontSize:12, fontWeight:600, color:C.text, marginBottom:10}}>
+                      All Terraform resources (assumed in scope — no scope docs uploaded)
+                    </div>
+                    <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
+                      {parseResult.resources.map((r,i)=>(
+                        <span key={i} style={{background:"#2E7D3218", color:"#2E7D32",
+                          border:"1px solid #2E7D3244", borderRadius:8,
+                          padding:"2px 8px", fontSize:10, fontWeight:500}}>
+                          {r.type}/{r.name||r.id}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              summary.scopeChunks.map((chunk,i)=>(
+                <div key={i} style={{
+                  background:C.surface, border:`1px solid ${C.border}`,
+                  borderRadius:8, padding:"12px 14px", marginBottom:8,
+                }}>
+                  <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:6}}>
+                    <span style={{background:`${C.accent}22`, color:C.accent,
+                      border:`1px solid ${C.accent}44`, borderRadius:10,
+                      padding:"1px 8px", fontSize:10, fontWeight:600}}>{chunk.source}</span>
+                    {chunk.inScope.length>0 && (
+                      <span style={{background:"#2E7D3218", color:"#2E7D32",
+                        border:"1px solid #2E7D3244", borderRadius:8,
+                        padding:"1px 6px", fontSize:9, fontWeight:600}}>
+                        IN SCOPE: {chunk.inScope.join(", ")}
+                      </span>
+                    )}
+                    {chunk.outOfScope.length>0 && (
+                      <span style={{background:"#F4433618", color:"#F44336",
+                        border:"1px solid #F4433644", borderRadius:8,
+                        padding:"1px 6px", fontSize:9, fontWeight:600}}>
+                        OUT OF SCOPE: {chunk.outOfScope.join(", ")}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.65,
+                    background:C.bg, padding:"8px 10px", borderRadius:6, border:`1px solid ${C.border}`,
+                    whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                    &ldquo;{chunk.excerpt}&rdquo;
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* ── MISCONFIG CHECKS TAB ── */}
+        {iTab==="misconfigs" && (
+          <div style={{maxWidth:900}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Misconfiguration Checks
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Automated security configuration analysis of your Terraform resources — modeled after
+              Checkov/tfsec rules. Each finding includes CWE weakness ID, ATT&CK technique, and remediation.
+            </div>
+
+            {(!parseResult?.resources?.length) ? (
+              <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to run misconfiguration checks.</div>
+            ) : !intelligence?._built ? (
+              <div style={{color:C.textMuted, fontSize:13}}>Intelligence engine not ready.</div>
+            ) : (() => {
+              const sev=['Critical','High','Medium','Low'];
+              const allFindings = (summary?.topMisconfigs||[]);
+              if (allFindings.length===0) return (
+                <div style={{background:C.surface,border:`1px solid #2E7D3244`,borderRadius:10,padding:"20px 22px"}}>
+                  <div style={{color:"#2E7D32",fontWeight:600,fontSize:14,marginBottom:6}}>No Misconfigurations Detected</div>
+                  <div style={{color:C.textSub,fontSize:12}}>All checked resources pass security configuration checks. Ensure resource attributes are fully defined in your Terraform files for complete analysis.</div>
+                </div>
+              );
+              // Group by severity
+              const bySev = {};
+              allFindings.forEach(f=>{ if(!bySev[f.severity]) bySev[f.severity]=[]; bySev[f.severity].push(f); });
+              return (
+                <div>
+                  {/* Severity summary bar */}
+                  <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+                    {sev.map(s=>bySev[s]?.length ? (
+                      <div key={s} style={{background:`${SEV_COLOR[s]}18`,border:`1px solid ${SEV_COLOR[s]}44`,
+                        borderRadius:8,padding:"8px 14px",display:"flex",flexDirection:"column",alignItems:"center",minWidth:80}}>
+                        <span style={{fontSize:20,fontWeight:700,color:SEV_COLOR[s]}}>{bySev[s].length}</span>
+                        <span style={{fontSize:10,fontWeight:600,color:SEV_COLOR[s],textTransform:"uppercase",letterSpacing:".06em"}}>{s}</span>
+                      </div>
+                    ) : null)}
+                  </div>
+                  {/* Findings list grouped by severity */}
+                  {sev.filter(s=>bySev[s]?.length).map(s=>(
+                    <div key={s} style={{marginBottom:20}}>
+                      <div style={{fontSize:11,fontWeight:700,color:SEV_COLOR[s],textTransform:"uppercase",
+                        letterSpacing:".08em",marginBottom:10,display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{width:8,height:8,borderRadius:"50%",background:SEV_COLOR[s],display:"inline-block"}}/>
+                        {s} ({bySev[s].length})
+                      </div>
+                      {bySev[s].map((f,i)=>(
+                        <div key={i} style={{background:C.surface,border:`1px solid ${SEV_COLOR[f.severity]}33`,
+                          borderLeft:`3px solid ${SEV_COLOR[f.severity]}`,borderRadius:8,padding:"12px 14px",marginBottom:8}}>
+                          <div style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6,flexWrap:"wrap"}}>
+                            <span style={{...MONO,fontSize:10,color:SEV_COLOR[f.severity],fontWeight:700,flexShrink:0}}>{f.id}</span>
+                            <span style={{fontSize:12,color:C.text,fontWeight:600,flex:1}}>{f.title}</span>
+                          </div>
+                          <div style={{...MONO,fontSize:10,color:C.textMuted,marginBottom:8}}>
+                            Resource: {f.resourceType}/{f.resourceName}
+                          </div>
+                          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+                            {(f.cwe||[]).map(c=>(
+                              <span key={c} title={CWE_DETAILS[c]?.desc||''} style={{background:"#0277BD18",color:"#0277BD",
+                                border:"1px solid #0277BD44",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600,cursor:"help"}}>
+                                {c}: {CWE_DETAILS[c]?.name||c}
+                              </span>
+                            ))}
+                            {(f.attack||[]).map(t=>(
+                              <span key={t} style={{background:"#E5393518",color:"#E53935",
+                                border:"1px solid #E5393544",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600}}>
+                                {t} {ATTACK_TECHNIQUES[t]?.name||''}
+                              </span>
+                            ))}
+                          </div>
+                          <div style={{fontSize:11,color:C.textSub,lineHeight:1.6,
+                            background:C.bg,padding:"6px 10px",borderRadius:6,border:`1px solid ${C.border}`}}>
+                            <span style={{color:C.textMuted,fontWeight:600}}>Remediation: </span>{f.remediation}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ── ATT&CK MAPPING TAB ── */}
+        {iTab==="attacks" && (
+          <div style={{maxWidth:900}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              MITRE ATT&CK Mapping
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Techniques from MITRE ATT&CK Cloud mapped to your Terraform resources.
+              Hover over technique IDs for full descriptions.
+            </div>
+
+            {(!parseResult?.resources?.length) ? (
+              <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to see ATT&CK mapping.</div>
+            ) : (() => {
+              // Build: technique → resources that trigger it
+              const techMap = {};
+              const tactic_order = ['Initial Access/Persistence','Persistence','Credential Access','Privilege Escalation',
+                'Defense Evasion','Discovery','Lateral Movement','Collection','Execution','Exfiltration','Impact'];
+              parseResult.resources.forEach(r => {
+                (TF_ATTACK_MAP[r.type]||[]).forEach(tid => {
+                  if (!techMap[tid]) techMap[tid]={resources:[]};
+                  techMap[tid].resources.push(`${r.type}/${r.name||r.id}`);
+                });
+              });
+              const entries = Object.entries(techMap);
+              if (entries.length===0) return (
+                <div style={{color:C.textMuted,fontSize:13}}>No ATT&CK techniques mapped to current resource types.</div>
+              );
+              // Group by tactic
+              const byTactic = {};
+              entries.forEach(([tid,data]) => {
+                const tech = ATTACK_TECHNIQUES[tid];
+                const tactic = tech?.tactic||'Other';
+                if (!byTactic[tactic]) byTactic[tactic]=[];
+                byTactic[tactic].push({tid,tech,resources:data.resources});
+              });
+              const sevColor = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
+              return (
+                <div>
+                  {/* Coverage summary */}
+                  <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+                    {['Critical','High','Medium','Low'].map(s=>{
+                      const cnt=entries.filter(([t])=>ATTACK_TECHNIQUES[t]?.severity===s).length;
+                      return cnt>0 ? (
+                        <div key={s} style={{background:`${sevColor[s]}18`,border:`1px solid ${sevColor[s]}44`,
+                          borderRadius:8,padding:"8px 14px",display:"flex",flexDirection:"column",alignItems:"center",minWidth:80}}>
+                          <span style={{fontSize:20,fontWeight:700,color:sevColor[s]}}>{cnt}</span>
+                          <span style={{fontSize:10,fontWeight:600,color:sevColor[s],textTransform:"uppercase",letterSpacing:".06em"}}>{s}</span>
+                        </div>
+                      ) : null;
+                    })}
+                    <div style={{background:`${C.accent}18`,border:`1px solid ${C.accent}44`,
+                      borderRadius:8,padding:"8px 14px",display:"flex",flexDirection:"column",alignItems:"center",minWidth:80}}>
+                      <span style={{fontSize:20,fontWeight:700,color:C.accent}}>{entries.length}</span>
+                      <span style={{fontSize:10,fontWeight:600,color:C.accent,textTransform:"uppercase",letterSpacing:".06em"}}>Total</span>
+                    </div>
+                  </div>
+                  {/* Per-tactic sections */}
+                  {tactic_order.filter(t=>byTactic[t]?.length).map(tactic=>(
+                    <div key={tactic} style={{marginBottom:18}}>
+                      <div style={{fontSize:11,fontWeight:700,color:C.textMuted,textTransform:"uppercase",
+                        letterSpacing:".08em",marginBottom:8}}>{tactic}</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                        {byTactic[tactic].map(({tid,tech,resources})=>(
+                          <div key={tid} style={{background:C.surface,border:`1px solid ${C.border}`,
+                            borderLeft:`3px solid ${sevColor[tech?.severity||'Low']}`,
+                            borderRadius:8,padding:"10px 14px"}}>
+                            <div style={{display:"flex",gap:10,alignItems:"flex-start",flexWrap:"wrap"}}>
+                              <a href={`https://attack.mitre.org/techniques/${tid.replace('.','/').replace('.','/')}`}
+                                target="_blank" rel="noopener noreferrer" style={{
+                                  ...MONO,fontSize:11,color:"#E53935",fontWeight:700,flexShrink:0,textDecoration:"none",
+                                  background:"#E5393518",border:"1px solid #E5393544",borderRadius:6,padding:"1px 8px",
+                                }}>{tid}</a>
+                              <div style={{flex:1}}>
+                                <div style={{fontSize:12,color:C.text,fontWeight:600,marginBottom:3}}>
+                                  {tech?.name||tid}
+                                  <span style={{marginLeft:8,fontSize:10,color:sevColor[tech?.severity||'Low'],
+                                    fontWeight:600,background:`${sevColor[tech?.severity||'Low']}18`,
+                                    border:`1px solid ${sevColor[tech?.severity||'Low']}44`,
+                                    borderRadius:6,padding:"0 6px"}}>{tech?.severity||'?'}</span>
+                                </div>
+                                <div style={{fontSize:11,color:C.textSub,lineHeight:1.5,marginBottom:6}}>{tech?.desc}</div>
+                                <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                                  {[...new Set(resources)].slice(0,6).map((r,ri)=>(
+                                    <span key={ri} style={{...MONO,fontSize:9,color:C.textMuted,
+                                      background:C.bg,border:`1px solid ${C.border}`,borderRadius:4,padding:"1px 6px"}}>
+                                      {r}
+                                    </span>
+                                  ))}
+                                  {resources.length>6 && <span style={{fontSize:9,color:C.textMuted}}>+{resources.length-6} more</span>}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  {/* Any unclassified tactic */}
+                  {Object.entries(byTactic).filter(([t])=>!tactic_order.includes(t)).map(([tactic,items])=>(
+                    <div key={tactic} style={{marginBottom:18}}>
+                      <div style={{fontSize:11,fontWeight:700,color:C.textMuted,textTransform:"uppercase",letterSpacing:".08em",marginBottom:8}}>{tactic}</div>
+                      {items.map(({tid,tech,resources})=>(
+                        <div key={tid} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",marginBottom:6}}>
+                          <span style={{...MONO,fontSize:11,color:"#E53935",fontWeight:700}}>{tid}</span>
+                          <span style={{fontSize:12,color:C.text,marginLeft:10}}>{tech?.name||tid}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ── SECURITY POSTURE TAB ── */}
+        {iTab==="posture" && (
+          <div style={{maxWidth:860}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>Security Posture</div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Weighted composite score across NIST CSF 2.0 (40%), Defense-in-Depth (35%), and Zero Trust (25%).
+              Grades reflect actual Terraform resource configuration — zero hallucination.
+            </div>
+            {!summary?.posture ? (
+              <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to generate posture assessment.</div>
+            ) : (()=>{
+              const p = summary.posture;
+              const GC = p.gradeColor;
+              return (
+                <div>
+                  {/* Grade hero */}
+                  <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                    padding:"24px 28px", marginBottom:20, display:"flex", alignItems:"center", gap:28}}>
+                    <div style={{textAlign:"center"}}>
+                      <div style={{fontSize:64, fontWeight:900, color:GC, lineHeight:1}}>{p.grade}</div>
+                      <div style={{fontSize:11, color:C.textMuted, marginTop:2}}>Grade</div>
+                    </div>
+                    <div style={{flex:1}}>
+                      <div style={{display:"flex", alignItems:"baseline", gap:8, marginBottom:6}}>
+                        <span style={{fontSize:32, fontWeight:700, color:GC}}>{p.score}</span>
+                        <span style={{fontSize:14, color:C.textMuted}}>/100</span>
+                        <span style={{fontSize:12, color:C.textMuted, marginLeft:4}}>· {p.maturity}</span>
+                      </div>
+                      {/* Score bar */}
+                      <div style={{height:8, background:C.border, borderRadius:4, marginBottom:16, overflow:"hidden"}}>
+                        <div style={{height:"100%", width:`${p.score}%`, background:`linear-gradient(90deg,${GC},${GC}88)`,
+                          borderRadius:4, transition:"width .6s"}} />
+                      </div>
+                      <div style={{display:"flex", gap:16, flexWrap:"wrap"}}>
+                        {[
+                          {label:"NIST CSF 2.0",      val:`${p.nist?.score??'—'}%`,  color:"#0277BD"},
+                          {label:"Defense-in-Depth",  val:`${p.did?.overallScore??'—'}%`,color:"#6A1B9A"},
+                          {label:"Zero Trust",        val:`${p.zt?.overallScore??'—'}%`, color:"#00695C"},
+                        ].map(({label,val,color},i)=>(
+                          <div key={i} style={{background:C.bg, border:`1px solid ${C.border}`,
+                            borderRadius:8, padding:"8px 14px", minWidth:110}}>
+                            <div style={{fontSize:10, color:C.textMuted, marginBottom:2}}>{label}</div>
+                            <div style={{fontSize:18, fontWeight:700, color}}>{val}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Defense-in-Depth layers */}
+                  {p.did?.layers && (
+                    <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                      padding:"18px 20px", marginBottom:16}}>
+                      <div style={{fontSize:13, fontWeight:700, color:C.text, marginBottom:12}}>
+                        Defense-in-Depth Coverage
+                      </div>
+                      {Object.entries(p.did.layers).map(([name,layer])=>(
+                        <div key={name} style={{marginBottom:10}}>
+                          <div style={{display:"flex", justifyContent:"space-between", marginBottom:3}}>
+                            <div style={{display:"flex", alignItems:"center", gap:6}}>
+                              {(()=>{const dl=Object.values(DID_LAYERS).find(l=>l.name===name); return dl ? <dl.Icon size={14} style={{color:dl.color}}/> : <Shield size={14}/>;})()}
+                              <span style={{fontSize:12, fontWeight:600, color:C.text}}>{name}</span>
+                            </div>
+                            <span style={{fontSize:11, fontWeight:600, color:layer.score>=60?"#43A047":"#E53935"}}>
+                              {layer.score}%
+                            </span>
+                          </div>
+                          <div style={{height:5, background:C.border, borderRadius:3, overflow:"hidden"}}>
+                            <div style={{height:"100%", width:`${layer.score}%`,
+                              background:layer.score>=60?"#43A047":layer.score>=30?"#F57C00":"#E53935",
+                              borderRadius:3}} />
+                          </div>
+                          {layer.absent?.length>0 && (
+                            <div style={{fontSize:10, color:C.textMuted, marginTop:3}}>
+                              Missing: {layer.absent.map(c=>c.name).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Zero Trust pillars */}
+                  {p.zt?.pillars && (
+                    <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                      padding:"18px 20px", marginBottom:16}}>
+                      <div style={{fontSize:13, fontWeight:700, color:C.text, marginBottom:12}}>
+                        Zero Trust Pillar Assessment (NIST SP 800-207)
+                      </div>
+                      <div style={{display:"flex", flexWrap:"wrap", gap:10}}>
+                        {Object.entries(p.zt.pillars).map(([name,pillar])=>{
+                          const ztp = ZT_PILLARS[name];
+                          const ZtpIcon = ztp?.Icon || Target;
+                          return (
+                            <div key={name} style={{flex:"1 1 140px", background:C.bg,
+                              border:`1px solid ${C.border}`, borderRadius:8, padding:"12px 14px"}}>
+                              <div style={{marginBottom:6}}><ZtpIcon size={18} style={{color:ztp?.color||C.accent}}/></div>
+                              <div style={{fontSize:11, fontWeight:700, color:C.text, marginBottom:6}}>{name}</div>
+                              <div style={{height:4, background:C.border, borderRadius:2, marginBottom:6, overflow:"hidden"}}>
+                                <div style={{height:"100%", width:`${pillar.score}%`,
+                                  background:pillar.score>=60?"#43A047":pillar.score>=30?"#F57C00":"#E53935",
+                                  borderRadius:2}} />
+                              </div>
+                              <div style={{fontSize:13, fontWeight:700,
+                                color:pillar.score>=60?"#43A047":pillar.score>=30?"#F57C00":"#E53935"}}>
+                                {pillar.score}%
+                              </div>
+                              {pillar.controls?.filter(c=>c.present).slice(0,2).map((c,j)=>(
+                                <div key={j} style={{fontSize:9, color:"#43A047", marginTop:2}}>✓ {c.name}</div>
+                              ))}
+                              {pillar.controls?.filter(c=>!c.present).slice(0,2).map((c,j)=>(
+                                <div key={j} style={{fontSize:9, color:"#E53935", marginTop:2}}>✗ {c.name}</div>
+                              ))}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* NIST CSF breakdown */}
+                  {p.nist?.byFn && (
+                    <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                      padding:"18px 20px"}}>
+                      <div style={{fontSize:13, fontWeight:700, color:C.text, marginBottom:12}}>
+                        NIST CSF 2.0 by Function
+                      </div>
+                      <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+                        {Object.entries(p.nist.byFn).map(([fn,data])=>(
+                          <div key={fn} style={{flex:"1 1 90px", background:C.bg,
+                            border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 12px", textAlign:"center"}}>
+                            <div style={{fontSize:10, fontWeight:700, color:C.textMuted, marginBottom:4}}>{fn}</div>
+                            <div style={{fontSize:18, fontWeight:700,
+                              color:data.pct>=70?"#43A047":data.pct>=40?"#F57C00":"#E53935"}}>
+                              {data.pct}%
+                            </div>
+                            <div style={{fontSize:9, color:C.textMuted}}>{data.pass}/{data.total}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ── CONTROL INVENTORY TAB ── */}
+        {iTab==="controls" && (
+          <div style={{maxWidth:860}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>Control Inventory</div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Security controls detected (or missing) from your Terraform configuration,
+              organized by defense-in-depth layer. All findings are derived from parsed resource types — no inference.
+            </div>
+            {!summary?.controlInventory ? (
+              <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to generate control inventory.</div>
+            ) : (()=>{
+              const ci = summary.controlInventory;
+              const byLayer = {};
+              [...(ci.present||[]), ...(ci.absent||[])].forEach(c=>{
+                if(!byLayer[c.layer]) byLayer[c.layer]={present:[],absent:[]};
+                if(c.present!==false) byLayer[c.layer].present.push(c);
+                else byLayer[c.layer].absent.push(c);
+              });
+              const presentCount = ci.present?.length||0;
+              const absentCount  = ci.absent?.length||0;
+              const totalCount   = presentCount + absentCount;
+              const coveragePct  = totalCount ? Math.round(presentCount/totalCount*100) : 0;
+              return (
+                <div>
+                  {/* Coverage bar */}
+                  <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                    padding:"16px 20px", marginBottom:20, display:"flex", alignItems:"center", gap:20}}>
+                    <div style={{flex:1}}>
+                      <div style={{display:"flex", justifyContent:"space-between", marginBottom:6}}>
+                        <span style={{fontSize:12, fontWeight:600, color:C.text}}>Overall Control Coverage</span>
+                        <span style={{fontSize:12, fontWeight:700, color:coveragePct>=70?"#43A047":coveragePct>=40?"#F57C00":"#E53935"}}>
+                          {presentCount} / {totalCount} ({coveragePct}%)
+                        </span>
+                      </div>
+                      <div style={{height:8, background:C.border, borderRadius:4, overflow:"hidden"}}>
+                        <div style={{height:"100%", width:`${coveragePct}%`,
+                          background:coveragePct>=70?"#43A047":coveragePct>=40?"#F57C00":"#E53935",
+                          borderRadius:4}} />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* By layer */}
+                  {DID_LAYERS.map(didLayer=>{
+                    const layerData = byLayer[didLayer.name] || {present:[],absent:[]};
+                    if(!layerData.present.length && !layerData.absent.length) return null;
+                    return (
+                      <div key={didLayer.name} style={{background:C.surface, border:`1px solid ${C.border}`,
+                        borderRadius:12, padding:"16px 20px", marginBottom:12}}>
+                        <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:12}}>
+                          <didLayer.Icon size={16} style={{color:didLayer.color}} />
+                          <span style={{fontSize:13, fontWeight:700, color:C.text}}>{didLayer.name}</span>
+                          <span style={{fontSize:11, color:C.textMuted, marginLeft:"auto"}}>
+                            {layerData.present.length} present · {layerData.absent.length} missing
+                          </span>
+                        </div>
+                        <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
+                          {layerData.present.map((c,i)=>(
+                            <div key={i} style={{background:"#43A04710", border:"1px solid #43A04740",
+                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", alignItems:"center", gap:4}}>
+                              <span>✓</span><span style={{fontWeight:600}}>{c.name}</span>
+                            </div>
+                          ))}
+                          {layerData.absent.map((c,i)=>(
+                            <div key={i} style={{background:"#E5393510", border:"1px solid #E5393540",
+                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#E53935", display:"flex", alignItems:"center", gap:4}}>
+                              <span>✗</span><span style={{fontWeight:600}}>{c.name}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ── CROSS-DOC CORRELATION TAB ── */}
+        {iTab==="crossdoc" && (
+          <div style={{maxWidth:860}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Cross-Document Correlation
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+              Links your uploaded documents (threat models, runbooks, compliance docs) to actual Terraform resources.
+              Contradictions are flagged where docs describe controls that are absent in configuration.
+            </div>
+            {!summary?.crossDocCorrelations || !summary.crossDocCorrelations.length ? (
+              <div style={{color:C.textMuted, fontSize:13}}>
+                {!parseResult?.resources?.length
+                  ? "Upload Terraform files to enable cross-doc correlation."
+                  : "Upload context documents (threat models, runbooks, compliance docs) to correlate against your Terraform."}
+              </div>
+            ) : (
+              <div>
+                {/* Contradiction summary */}
+                {(()=>{
+                  const allContradictions = (summary.crossDocCorrelations||[])
+                    .flatMap(c=>c.contradictions||[]);
+                  return allContradictions.length > 0 ? (
+                    <div style={{background:"#E5393510", border:"1px solid #E5393540",
+                      borderRadius:12, padding:"14px 18px", marginBottom:18}}>
+                      <div style={{fontSize:13, fontWeight:700, color:"#E53935", marginBottom:8}}>
+                        {allContradictions.length} Contradiction{allContradictions.length!==1?"s":""} Detected
+                      </div>
+                      <div style={{fontSize:11, color:C.textSub, marginBottom:8, lineHeight:1.5}}>
+                        Documents describe controls that are absent or misconfigured in your Terraform.
+                      </div>
+                      {allContradictions.slice(0,5).map((c,i)=>(
+                        <div key={i} style={{marginBottom:6, padding:"6px 10px",
+                          background:"#E5393508", borderRadius:6, fontSize:11}}>
+                          <span style={{fontWeight:700, color:"#E53935"}}>{c.type}: </span>
+                          <span style={{color:C.text}}>{c.msg}</span>
+                          {c.docRef && <span style={{color:C.textMuted}}> [source: {c.docRef}]</span>}
+                        </div>
+                      ))}
+                      {allContradictions.length>5 && (
+                        <div style={{fontSize:11, color:C.textMuted}}>
+                          +{allContradictions.length-5} more contradictions — expand individual resources below.
+                        </div>
+                      )}
+                    </div>
+                  ) : null;
+                })()}
+
+                {/* Per-resource correlations */}
+                {summary.crossDocCorrelations.filter(c=>c.docHits?.length>0||c.contradictions?.length>0).map((corr,i)=>(
+                  <div key={i} style={{background:C.surface, border:`1px solid ${
+                    corr.contradictions?.length ? "#E5393544" : C.border}`,
+                    borderRadius:10, padding:"14px 18px", marginBottom:10}}>
+                    <div style={{display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:8}}>
+                      <div>
+                        <span style={{fontSize:12, fontWeight:700, color:C.text}}>
+                          {corr.resource?.name || corr.resource?.id}
+                        </span>
+                        <span style={{fontSize:10, color:C.textMuted, marginLeft:8}}>
+                          {corr.resource?.type}
+                        </span>
+                      </div>
+                      {corr.contradictions?.length > 0 && (
+                        <span style={{fontSize:10, fontWeight:700, color:"#E53935",
+                          background:"#E5393515", border:"1px solid #E5393544",
+                          borderRadius:6, padding:"2px 8px"}}>
+                          {corr.contradictions.length} contradiction{corr.contradictions.length!==1?"s":""}
+                        </span>
+                      )}
+                    </div>
+                    {/* Doc hits */}
+                    {corr.docHits?.slice(0,2).map((hit,j)=>(
+                      <div key={j} style={{...MONO, fontSize:10, color:C.textSub,
+                        background:C.bg, padding:"5px 8px", borderRadius:5,
+                        border:`1px solid ${C.border}`, lineHeight:1.6, marginBottom:6,
+                        whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                        <span style={{color:C.textMuted, fontSize:9}}>[{hit.source}] </span>
+                        {hit.compressed||hit.text?.substring(0,220)}{((hit.compressed||hit.text||"").length>220?"…":"")}
+                      </div>
+                    ))}
+                    {/* Contradictions */}
+                    {corr.contradictions?.map((ct,j)=>(
+                      <div key={j} style={{fontSize:10, color:"#E53935",
+                        background:"#E5393508", border:"1px solid #E5393530",
+                        borderRadius:5, padding:"4px 8px", marginBottom:4}}>
+                        <span style={{fontWeight:700}}>{ct.type}: </span>{ct.msg}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── RESOURCE INTELLIGENCE TAB ── */}
+        {iTab==="resources" && (
+          <div style={{maxWidth:900}}>
+            <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>
+              Resource Intelligence
+            </div>
+            <div style={{fontSize:12, color:C.textSub, marginBottom:18}}>
+              For each Terraform resource, the engine finds relevant passages in your uploaded documents.
+              Shows compliance requirements, threat relevance, and architectural context.
+            </div>
+
+            {(!parseResult?.resources?.length) ? (
+              <div style={{color:C.textMuted, fontSize:13}}>
+                Upload Terraform files to see resource intelligence.
+              </div>
+            ) : (
+              <div style={{display:"flex", flexDirection:"column", gap:10}}>
+                {parseResult.resources.slice(0,30).map((r,i)=>{
+                  const meta = RT[r.type]||RT._default;
+                  const hits = intelligence?._built ? intelligence.analyzeResource(r.type, r.name||r.id) : [];
+                  const strideHits = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.stride||{})))];
+                  const compHits  = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.compliance||{})))];
+                  const threats   = intelligence?._built ? intelligence.getThreats(r) : null;
+                  const misconfigs = intelligence?._built ? intelligence.getMisconfigurations(r) : [];
+                  return (
+                    <div key={i} style={{background:C.surface, border:`1px solid ${C.border}`,
+                      borderRadius:8, padding:"12px 14px"}}>
+                      <div style={{display:"flex", gap:8, alignItems:"center", marginBottom:6, flexWrap:"wrap"}}>
+                        <div style={{width:10,height:10,borderRadius:2,background:meta.c,flexShrink:0}}/>
+                        <span style={{...MONO, fontSize:12, color:C.text, fontWeight:600}}>
+                          {r.type}/{r.name||r.id}
+                        </span>
+                        {/* STRIDE badges */}
+                        {(threats?.stride||[]).map(k=>(
+                          <span key={k} style={{background:`${STRIDE_COLORS[k]||"#999"}18`,
+                            color:STRIDE_COLORS[k]||"#999",border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,
+                            borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                            {STRIDE_LABELS[k]||k}
+                          </span>
+                        ))}
+                        {/* ATT&CK badges */}
+                        {(threats?.attackTechniques||[]).slice(0,3).map(t=>(
+                          <span key={t.techniqueId} style={{background:"#E5393514",color:"#E53935",
+                            border:"1px solid #E5393530",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                            {t.techniqueId}
+                          </span>
+                        ))}
+                        {/* Misconfig severity badges */}
+                        {misconfigs.length>0 && (
+                          <span style={{background:`${SEV_COLOR[misconfigs[0].severity]||"#999"}18`,
+                            color:SEV_COLOR[misconfigs[0].severity]||"#999",
+                            border:`1px solid ${SEV_COLOR[misconfigs[0].severity]||"#999"}44`,
+                            borderRadius:6,padding:"1px 8px",fontSize:9,fontWeight:700}}>
+                            {misconfigs.length} check{misconfigs.length>1?"s":""} failed
+                          </span>
+                        )}
+                        {compHits.map(k=>(
+                          <span key={k} style={{background:"#0277BD18",color:"#0277BD",
+                            border:"1px solid #0277BD44",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                            {COMPLIANCE_LABELS[k]||k}
+                          </span>
+                        ))}
+                      </div>
+                      {/* Doc hits */}
+                      {hits.length>0 && (
+                        <div style={{display:"flex", flexDirection:"column", gap:5, marginBottom:misconfigs.length?6:0}}>
+                          {hits.slice(0,2).map((chunk,j)=>(
+                            <div key={j} style={{...MONO, fontSize:10, color:C.textSub,
+                              background:C.bg, padding:"5px 8px", borderRadius:5,
+                              border:`1px solid ${C.border}`, lineHeight:1.6, whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                              <span style={{color:C.textMuted,fontSize:9}}>[{chunk.source}] </span>
+                              {chunk.compressed||chunk.text.substring(0,200)}{(chunk.compressed||chunk.text).length>200?"…":""}
+                              {chunk.confidence && (
+                                <span style={{marginLeft:6,fontSize:9,color:C.textMuted}}>({chunk.confidence}% match)</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {/* Misconfig inline */}
+                      {misconfigs.length>0 && (
+                        <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+                          {misconfigs.slice(0,2).map((f,j)=>(
+                            <div key={j} style={{fontSize:10,color:SEV_COLOR[f.severity],background:`${SEV_COLOR[f.severity]}10`,
+                              border:`1px solid ${SEV_COLOR[f.severity]}30`,borderRadius:5,padding:"4px 8px"}}>
+                              <span style={{fontWeight:700}}>{f.id} </span>{f.title}
+                            </div>
+                          ))}
+                          {misconfigs.length>2 && (
+                            <div style={{fontSize:10,color:C.textMuted}}>+{misconfigs.length-2} more — see Misconfig Checks tab</div>
+                          )}
+                        </div>
+                      )}
+                      {hits.length===0 && misconfigs.length===0 && (
+                        <div style={{fontSize:10,color:C.textMuted,fontStyle:"italic"}}>No document matches or config checks for this resource type.</div>
+                      )}
+                    </div>
+                  );
+                })}
+                {parseResult.resources.length > 30 && (
+                  <div style={{color:C.textMuted, fontSize:12}}>
+                    Showing first 30 resources.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -3969,72 +6972,286 @@ export default function App() {
   const [error, setError] = useState("");
   const [scopeFiles, setScopeFiles] = useState(null); // null = all in scope
 
-  // User documents (persisted in localStorage)
-  const [userDocs, setUserDocs] = useState(() => {
+  // ── Threat Model Management ─────────────────────────────────────────────────
+  const [appMode, setAppMode] = useState("landing"); // "landing" | "documents" | "workspace"
+  const [currentModel, setCurrentModel] = useState(null);
+  const [threatModels, setThreatModels] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("tf-threat-models") || "[]"); } catch { return []; }
+  });
+  const [modelDetails, setModelDetails] = useState({
+    environment:"", scope:"", dataClassification:[], frameworks:[], owner:"", description:"",
+    threatFrameworks:[], keyFeatures:""
+  });
+  const [diagramImage, setDiagramImage] = useState(null); // base64 data URL from Lucidchart export
+  const [archAnalysis, setArchAnalysis] = useState(null);     // analyzeArchitecture() result
+  const [archOverrides, setArchOverrides] = useState({});      // user edits (narrative + attributes)
+  const [archAnalyzing, setArchAnalyzing] = useState(false);  // spinner while computing
+
+  const saveModels = useCallback((models) => {
+    setThreatModels(models);
+    try { localStorage.setItem("tf-threat-models", JSON.stringify(models)); } catch {}
+  }, []);
+
+  const createModel = useCallback((name) => {
+    const id = Date.now().toString();
+    const model = { id, name, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(),
+      environment:"", tfFileCount:0, docCount:0, grade:null };
+    const updated = [model, ...threatModels];
+    saveModels(updated);
+    setCurrentModel(model);
+    setModelDetails({ environment:"", scope:"", dataClassification:[], frameworks:[], owner:"", description:"", threatFrameworks:[], keyFeatures:"" });
+    setDiagramImage(null);
+    setArchAnalysis(null); setArchOverrides({});
+    setAppMode("documents");
+    setMainTab("upload");
+    // Clear previous session data for clean slate
+    setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
+    // Load model docs from localStorage (none yet for new model)
+    try {
+      const docs = JSON.parse(localStorage.getItem(`tf-model-${id}-docs`) || "[]");
+      setUserDocsState(docs);
+    } catch { setUserDocsState([]); }
+  }, [threatModels, saveModels]); // eslint-disable-line
+
+  const openModel = useCallback((model) => {
+    setCurrentModel(model);
+    setModelDetails(() => {
+      try { return JSON.parse(localStorage.getItem(`tf-model-${model.id}-details`) || "{}"); }
+      catch { return { environment:"", scope:"", dataClassification:[], frameworks:[], owner:"", description:"", threatFrameworks:[], keyFeatures:"" }; }
+    });
+    setAppMode("documents");
+    setMainTab("upload");
+    setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
+    // Restore TF files for this model
+    try {
+      const savedTF = JSON.parse(localStorage.getItem(`tf-model-${model.id}-files`) || "[]");
+      if (savedTF.length) {
+        setFiles(savedTF);
+        // Trigger reparse with saved files — done after state settles via useEffect
+      }
+    } catch {}
+    // Restore docs
+    try {
+      const docs = JSON.parse(localStorage.getItem(`tf-model-${model.id}-docs`) || "[]");
+      setUserDocsState(docs);
+    } catch { setUserDocsState([]); }
+    // Restore architecture diagram image (from Lucidchart export)
+    try {
+      const img = localStorage.getItem(`tf-model-${model.id}-diagram-image`);
+      setDiagramImage(img || null);
+    } catch { setDiagramImage(null); }
+    // Restore arch analysis overrides
+    try {
+      const saved = JSON.parse(localStorage.getItem(`tf-model-${model.id}-arch-analysis`) || "{}");
+      setArchAnalysis(saved.base || null);
+      setArchOverrides(saved.overrides || {});
+    } catch { setArchAnalysis(null); setArchOverrides({}); }
+  }, []); // eslint-disable-line
+
+  const deleteModel = useCallback((id) => {
+    const updated = threatModels.filter(m => m.id !== id);
+    saveModels(updated);
+    // Clean up per-model storage
+    try { localStorage.removeItem(`tf-model-${id}-docs`); } catch {}
+    try { localStorage.removeItem(`tf-model-${id}-arch-analysis`); } catch {}
+    try { localStorage.removeItem(`tf-model-${id}-details`); } catch {}
+    try { localStorage.removeItem(`tf-model-${id}-diagram-image`); } catch {}
+    try { localStorage.removeItem(`tf-model-${id}-files`); } catch {}
+  }, [threatModels, saveModels]);
+
+  const saveModelDetails = useCallback((details) => {
+    setModelDetails(details);
+    if (currentModel) {
+      try { localStorage.setItem(`tf-model-${currentModel.id}-details`, JSON.stringify(details)); } catch {}
+    }
+  }, [currentModel]);
+
+  // Update model metadata (grade, file count, etc.) after analysis
+  const updateModelMeta = useCallback((patch) => {
+    if (!currentModel) return;
+    setCurrentModel(prev => { const u={...prev,...patch,updatedAt:new Date().toISOString()}; return u; });
+    setThreatModels(prev => {
+      const updated = prev.map(m => m.id===currentModel.id ? {...m,...patch,updatedAt:new Date().toISOString()} : m);
+      try { localStorage.setItem("tf-threat-models", JSON.stringify(updated)); } catch {}
+      return updated;
+    });
+  }, [currentModel]);
+
+  // Intelligence engine — rebuilt whenever userDocs or parseResult changes
+  const intelligenceRef = useRef(new ThreatModelIntelligence());
+  const [intelligenceVersion, setIntelligenceVersion] = useState(0); // triggers re-render after rebuild
+
+  // User documents — per-model, backed by localStorage[tf-model-{id}-docs]
+  const [userDocs, setUserDocsState] = useState(() => {
     try { const s = localStorage.getItem("tf-intel-user-docs"); return s ? JSON.parse(s) : []; }
     catch { return []; }
   });
   const saveUserDocs = useCallback((docsOrFn) => {
-    setUserDocs(prev => {
+    setUserDocsState(prev => {
       const next = typeof docsOrFn === "function" ? docsOrFn(prev) : docsOrFn;
-      try { localStorage.setItem("tf-intel-user-docs", JSON.stringify(next)); } catch {}
+      // Save per-model if a model is active, else legacy global key
+      const key = currentModel ? `tf-model-${currentModel.id}-docs` : "tf-intel-user-docs";
+      try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+      // Update model doc count in metadata
+      if (currentModel) updateModelMeta({ docCount: next.length });
       return next;
     });
+  }, [currentModel, updateModelMeta]); // eslint-disable-line
+
+  // Convenience alias so existing code that references `setUserDocs` still works
+  const setUserDocs = saveUserDocs;
+
+  // Remove a single user doc by path or name
+  const removeUserDoc = useCallback((pathOrName) => {
+    saveUserDocs(prev => prev.filter(d => (d.path || d.name) !== pathOrName));
+  }, [saveUserDocs]);
+
+  // Keep a ref so reparse (stable callback) can always access latest userDocs
+  const userDocsRef = useRef(userDocs);
+  const parseResultRef = useRef(parseResult);
+  useEffect(() => { userDocsRef.current = userDocs; }, [userDocs]);
+  useEffect(() => { parseResultRef.current = parseResult; }, [parseResult]);
+
+  // Stable refs so reparse ([] deps) and grade effect can always read current values
+  const currentModelRef    = useRef(currentModel);
+  const modelDetailsRef    = useRef(modelDetails);
+  const updateModelMetaRef = useRef(updateModelMeta);
+  useEffect(() => { currentModelRef.current    = currentModel;    }, [currentModel]);
+  useEffect(() => { modelDetailsRef.current    = modelDetails;    }, [modelDetails]);
+  useEffect(() => { updateModelMetaRef.current = updateModelMeta; }, [updateModelMeta]);
+
+  // Synthetic "model context" doc injected as the first document in every .build() call.
+  // Seeds retrieval with product name, environment, data classification, and compliance scope
+  // so queries like "what frameworks are in scope?" return model-level metadata.
+  const buildModelContextDoc = useCallback(() => {
+    const m = currentModelRef.current;
+    const d = modelDetailsRef.current;
+    if (!m?.name) return null;
+    const lines = [
+      `Threat Model Product: ${m.name}`,
+      d.environment                  ? `Environment: ${d.environment}` : null,
+      d.dataClassification?.length   ? `Data Classification: ${d.dataClassification.join(', ')}` : null,
+      d.frameworks?.length           ? `Industry Compliance Scope: ${d.frameworks.join(', ')}` : null,
+      d.threatFrameworks?.length     ? `Threat Modeling Frameworks: ${d.threatFrameworks.join(', ')}` : null,
+      d.keyFeatures                  ? `Key Features: ${d.keyFeatures}` : null,
+      d.owner                        ? `Team / Owner: ${d.owner}` : null,
+      d.description                  ? `Architecture Notes: ${d.description}` : null,
+    ].filter(Boolean);
+    return { name:'__model_context__', path:'__model_context__', ext:'txt',
+             content: lines.join('\n'), size:0, _synthetic:true };
   }, []);
-  const addUserDocs = useCallback((fileList) => {
-    // Skip: images, compiled binaries, archives, lock files with no text value
-    const SKIP_EXT = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
-    // Files that are text-readable (attempt readAsText on everything else)
+
+  // After every intelligence rebuild, compute posture grade and persist it to the model card
+  useEffect(() => {
+    if (!parseResultRef.current || !currentModelRef.current) return;
+    try {
+      const posture = intelligenceRef.current.getSecurityPosture(parseResultRef.current.resources||[]);
+      if (posture?.grade) {
+        updateModelMetaRef.current({
+          grade:       posture.grade,
+          gradeColor:  posture.gradeColor,
+          tfFileCount: parseResultRef.current.resources?.length || 0,
+        });
+      }
+    } catch(_) {}
+  }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Rebuild intelligence whenever userDocs or modelDetails (Application Details form) changes.
+  // modelDetails is in deps so filling in env / compliance scope / description immediately
+  // re-indexes the synthetic model-context doc — no file upload required.
+  useEffect(() => {
+    const pr = parseResultRef.current;
+    const ctxDoc = buildModelContextDoc();
+    const docsWithCtx = ctxDoc ? [ctxDoc, ...userDocs] : userDocs;
+    intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[]);
+    setIntelligenceVersion(v => v+1);
+    // Regenerate XML with enriched intelligence if we have parsed data
+    if (pr && (pr.resources.length > 0 || pr.modules.length > 0)) {
+      const x = generateDFDXml(pr.resources, pr.modules, pr.connections, intelligenceRef.current);
+      setXml(x);
+    }
+  }, [userDocs, modelDetails]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-populate Architecture Analysis after each intelligence rebuild
+  useEffect(() => {
+    if (!parseResult && !userDocs.length) return;
+    setArchAnalyzing(true);
+    const timeout = setTimeout(() => {
+      try {
+        const result = intelligenceRef.current.analyzeArchitecture(
+          parseResult?.resources || [], userDocs, modelDetails
+        );
+        setArchAnalysis(result);
+        if (currentModel) {
+          try {
+            localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
+              JSON.stringify({ base: result, overrides: archOverrides }));
+          } catch {}
+        }
+      } finally { setArchAnalyzing(false); }
+    }, 0);
+    return () => clearTimeout(timeout);
+  }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addUserDocs = useCallback((fileList, docCategory = "general", onProgress) => {
+    // Accept PDFs, images, and text files; skip compiled binaries, archives, web assets
+    const SKIP_EXT = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
     const candidates = Array.from(fileList)
-      .filter(f => !SKIP_EXT.test(f.name) && f.size < 5 * 1024 * 1024); // skip >5MB
-    if (!candidates.length) return;
-    Promise.all(candidates.map(f => new Promise((res) => {
+      .filter(f => !SKIP_EXT.test(f.name) && f.size < 50 * 1024 * 1024); // skip >50MB
+    if (!candidates.length) return Promise.resolve([]);
+    return Promise.all(candidates.map(async f => {
       const path = f.webkitRelativePath || f.name;
       const name = f.name;
       const ext  = name.includes(".") ? name.split(".").pop().toLowerCase() : "txt";
-      const r = new FileReader();
-      r.onload = ev => {
-        const content = ev.target.result;
-        // Heuristic: if first 512 bytes contain many non-printable chars it's binary
-        const sample = content.slice(0, 512);
-        const nonPrint = (sample.match(/[\x00-\x08\x0E-\x1F\x7F]/g) || []).length;
-        if (nonPrint > 20) {
-          res({ path, name, ext, content:"[binary file — not displayed]", binary:true, size:f.size });
-        } else {
-          res({ path, name, ext, content, binary:false, size:f.size });
-        }
-      };
-      r.onerror = () => res(null);
-      r.readAsText(f);
-    }))).then(loaded => {
+      if (onProgress) onProgress(name, "processing");
+      try {
+        const content = await extractTextFromFile(f);
+        if (onProgress) onProgress(name, "done");
+        return { path, name, ext, content, binary: false, size: f.size, docCategory };
+      } catch {
+        if (onProgress) onProgress(name, "error");
+        return { path, name, ext, content: `[Extraction failed: ${name}]`, binary: false, size: f.size, docCategory };
+      }
+    })).then(loaded => {
       const valid = loaded.filter(Boolean);
-      if (!valid.length) return;
-      // Deduplicate by path against existing docs
+      if (!valid.length) return valid;
       const existingPaths = new Set(userDocs.map(d => d.path || d.name));
       const newDocs = valid.filter(d => !existingPaths.has(d.path || d.name));
       if (newDocs.length) saveUserDocs([...userDocs, ...newDocs]);
+      return newDocs;
     });
   }, [userDocs, saveUserDocs]);
 
   // Re-run parse + DFD whenever the TF files list changes
+  // Uses userDocsRef so this callback stays stable without needing userDocs in deps.
   const reparse = useCallback((tfFiles) => {
-    if (!tfFiles.length) { setParseResult(null); setXml(""); return; }
+    const ctxDoc = buildModelContextDoc();
+    if (!tfFiles.length) {
+      setParseResult(null); setXml("");
+      intelligenceRef.current.build(ctxDoc ? [ctxDoc] : [], [], []);
+      setIntelligenceVersion(v=>v+1);
+      return;
+    }
     const result = parseTFMultiFile(tfFiles);
     setParseResult(result);
+    // Rebuild intelligence: model context + uploaded docs + parsed resources
+    const docsWithCtx = ctxDoc ? [ctxDoc, ...userDocsRef.current] : userDocsRef.current;
+    intelligenceRef.current.build(docsWithCtx, result.resources, result.modules);
+    setIntelligenceVersion(v => v+1);
     if (result.resources.length > 0 || result.modules.length > 0) {
-      const x = generateDFDXml(result.resources, result.modules, result.connections);
+      const x = generateDFDXml(result.resources, result.modules, result.connections, intelligenceRef.current);
       setXml(x);
     } else {
       setXml("");
     }
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Accept ALL file types. TF/HCL/sentinel/tfvars → files state (parsed).
   // Everything else → userDocs (context). append=true merges instead of replacing.
-  const readFiles = useCallback((fileList, append = false) => {
-    const SKIP_BINARY = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
+  const readFiles = useCallback((fileList, append = false, docCategory = "general") => {
+    const SKIP_BINARY = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
     const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name);
-    const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 10*1024*1024);
+    const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 50*1024*1024);
     if (!all.length) return;
     setError("");
 
@@ -4050,10 +7267,18 @@ export default function App() {
 
     Promise.all([
       Promise.all(tfCandidates.map(readAsText)),
-      Promise.all(ctxCandidates.map(readAsText)),
+      Promise.all(ctxCandidates.map(f =>
+        extractTextFromFile(f).then(content => ({
+          path: f.webkitRelativePath || f.name,
+          name: f.name,
+          content,
+          size: f.size,
+          docCategory,
+        })).catch(() => null)
+      )),
     ]).then(([tfLoaded, ctxLoaded]) => {
       const validTF = tfLoaded.filter(Boolean);
-      const validCtx = ctxLoaded.filter(Boolean).filter(d => !d.content.includes('\x00'));
+      const validCtx = ctxLoaded.filter(Boolean);
 
       // Merge or replace TF files
       setFiles(prev => {
@@ -4064,6 +7289,11 @@ export default function App() {
         setScopeFiles(null);
         reparse(merged);
         if (merged.length > 0) setMainTab("analysis");
+        // Persist TF files per model (text is safe to store in localStorage)
+        if (currentModel) {
+          try { localStorage.setItem(`tf-model-${currentModel.id}-files`, JSON.stringify(merged)); } catch {}
+          updateModelMeta({ tfFileCount: merged.length });
+        }
         return merged;
       });
 
@@ -4073,7 +7303,7 @@ export default function App() {
           const existPaths = new Set(prev.map(d => d.path || d.name));
           const newDocs = validCtx
             .filter(d => !existPaths.has(d.path))
-            .map(d => ({ ...d, ext: d.name.split('.').pop().toLowerCase() }));
+            .map(d => ({ ...d, ext: (d.name.split('.').pop() || "txt").toLowerCase() }));
           return newDocs.length ? [...prev, ...newDocs] : prev;
         });
       }
@@ -4101,10 +7331,18 @@ export default function App() {
   }, []);
 
   const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files, true); }, [readFiles]);
-  // Full <mxfile> wrapper matching draw.io's own export format.
-  // Lucidchart's draw.io importer requires host/version/type attributes for correct parsing.
+  // Full <mxfile> wrapper with correct document-level indentation matching the working reference XML:
+  //   <mxfile>            ← 0 spaces
+  //     <diagram>         ← 2 spaces
+  //       <mxGraphModel>  ← 4 spaces
+  //         <root>        ← 6 spaces
+  //           <mxCell>    ← 8 spaces
+  //             <mxGeometry/> ← 10 spaces
+  //           </mxCell>   ← 8 spaces
+  // The inner xml (from generateDFDXml) starts at 0 — each line is indented +4 spaces
+  // so that <mxGraphModel> sits at 4 spaces inside <diagram>.
   const drawioXml = xml
-    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="app.diagrams.net" modified="${new Date().toISOString()}" agent="Threataform" version="21.0.0" type="device">\n  <diagram name="Enterprise Terraform DFD" id="enterprise-tf-dfd">\n${xml}\n  </diagram>\n</mxfile>`
+    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="app.diagrams.net" modified="${new Date().toISOString()}" agent="Threataform" version="21.0.0" type="device">\n  <diagram name="Enterprise Terraform DFD" id="enterprise-tf-dfd">\n${xml.split('\n').map(l=>'    '+l).join('\n')}\n  </diagram>\n</mxfile>`
     : "";
   // Download as .xml — Lucidchart enterprise lists "Draw.io (.xml, .drawio)" and .xml
   // extension passes more corporate DLP/firewall policies than .drawio.
@@ -4142,25 +7380,60 @@ export default function App() {
   }, [parseResult]);
 
   const KB_DOMAINS = [
-    {id:"xsphere",  label:"xSphere Cloud",         color:"#0277BD"},
-    {id:"spinnaker",label:"Spinnaker.io",           color:"#00838F"},
-    {id:"iam",      label:"IAM · Org · OUs · SCPs", color:"#B71C1C"},
-    {id:"jenkins",  label:"Jenkins / Jules",        color:"#BF360C"},
-    {id:"dfd",      label:"Enterprise DFD",         color:"#4527A0"},
-    {id:"wiz",      label:"Wiz CSPM",               color:"#1A73E8"},
-    {id:"attack",   label:"MITRE ATT&CK®",          color:"#B71C1C"},
-    {id:"cwe",      label:"MITRE CWE",              color:"#E65100"},
-    {id:"stride",   label:"STRIDE-LM",              color:"#4527A0"},
-    {id:"tfePave",  label:"TFE-Pave / Hier. IAM",  color:"#2E7D32"},
-    {id:"userdocs", label:"My Documents",           color:"#78909C"},
+    {id:"xsphere",  label:"xSphere Cloud",         color:"#0277BD", Icon: Cloud},
+    {id:"spinnaker",label:"Spinnaker.io",           color:"#00838F", Icon: Settings},
+    {id:"iam",      label:"IAM · Org · OUs · SCPs", color:"#B71C1C", Icon: KeyRound},
+    {id:"jenkins",  label:"Jenkins / Jules",        color:"#BF360C", Icon: Server},
+    {id:"dfd",      label:"Enterprise DFD",         color:"#4527A0", Icon: MapIcon},
+    {id:"wiz",      label:"Wiz CSPM",               color:"#1A73E8", Icon: ShieldAlert},
+    {id:"attack",   label:"MITRE ATT&CK®",          color:"#B71C1C", Icon: Zap},
+    {id:"cwe",      label:"MITRE CWE",              color:"#E65100", Icon: TriangleAlert},
+    {id:"stride",   label:"STRIDE-LM",              color:"#4527A0", Icon: Target},
+    {id:"tfePave",  label:"TFE-Pave / Hier. IAM",  color:"#2E7D32", Icon: Layers},
+    {id:"userdocs", label:"My Documents",           color:"#78909C", Icon: FileText},
   ];
 
   const MAIN_TABS = [
-    {id:"knowledge", label:"Knowledge Base",      icon:"📚"},
-    {id:"upload",    label:"Upload & Analyze",    icon:"📤"},
-    {id:"analysis",  label:"Threataform Analysis",icon:"🔬"},
-    {id:"dfd",       label:"DFD Output",          icon:"🗺"},
+    {id:"knowledge",     label:"Knowledge Base",        Icon: BookOpen},
+    {id:"upload",        label:"Upload & Analyze",      Icon: Upload},
+    {id:"arch-analysis", label:"Architecture Analysis", Icon: Building2},
+    {id:"intelligence",  label:"Intelligence",           Icon: Brain},
+    {id:"analysis",      label:"Threataform Analysis",  Icon: Microscope},
+    {id:"dfd",           label:"DFD Output",            Icon: MapIcon},
   ];
+
+  // Landing page render
+  if (appMode === "landing") {
+    return (
+      <>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+        <LandingPage
+          threatModels={threatModels}
+          onCreateModel={createModel}
+          onOpenModel={openModel}
+          onDeleteModel={deleteModel}
+        />
+      </>
+    );
+  }
+
+  if (appMode === "documents") {
+    return (
+      <>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+        <DocumentsPage
+          model={currentModel}
+          modelDetails={modelDetails}
+          userDocs={userDocs}
+          onSaveDetails={saveModelDetails}
+          onAddDocs={addUserDocs}
+          onRemoveDoc={removeUserDoc}
+          onContinue={() => { setAppMode("workspace"); setMainTab("upload"); }}
+          onBack={() => setAppMode("landing")}
+        />
+      </>
+    );
+  }
 
   return (
     <div style={{...SANS, background:C.bg, minHeight:"100vh", color:C.text}}>
@@ -4169,24 +7442,32 @@ export default function App() {
       {/* ── HEADER ── */}
       <div style={{
         background:C.surface, borderBottom:`1px solid ${C.border}`,
-        padding:"0 24px", display:"flex", alignItems:"center", height:58,
+        padding:"0 16px", display:"flex", alignItems:"center", height:58,
         position:"sticky", top:0, zIndex:100,
       }}>
-        {/* Brand */}
-        <div style={{display:"flex", alignItems:"center", gap:12, marginRight:36, flexShrink:0}}>
+        {/* Back to landing + brand */}
+        <div style={{display:"flex", alignItems:"center", gap:10, marginRight:20, flexShrink:0}}>
+          <button onClick={()=>setAppMode("landing")} title="All threat models" style={{
+            background:"transparent", border:`1px solid ${C.border}`, borderRadius:6,
+            padding:"5px 10px", color:C.textMuted, cursor:"pointer", fontSize:11, ...SANS,
+            display:"flex", alignItems:"center", gap:4,
+          }}><ChevronLeft size={13}/> Home</button>
           <div style={{
-            width:34, height:34, borderRadius:8, flexShrink:0,
+            width:30, height:30, borderRadius:7, flexShrink:0,
             background:"linear-gradient(135deg,#FF6B35,#FF9900)",
             display:"flex", alignItems:"center", justifyContent:"center",
-            fontSize:16, boxShadow:"0 2px 8px #FF990040"
-          }}>⬡</div>
+            boxShadow:"0 2px 8px #FF990040"
+          }}><Shield size={16} color="#fff"/></div>
           <div>
-            <div style={{fontSize:14, fontWeight:700, color:C.text, letterSpacing:"-.01em", lineHeight:1.2}}>
+            <div style={{fontSize:13, fontWeight:700, color:C.text, letterSpacing:"-.01em", lineHeight:1.1}}>
               Threataform
             </div>
-            <div style={{fontSize:10, color:C.textMuted, marginTop:1}}>
-              Enterprise Terraform Intelligence
-            </div>
+            {currentModel && (
+              <div style={{fontSize:10, color:C.accent, marginTop:1, fontWeight:600,
+                maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                {currentModel.name}
+              </div>
+            )}
           </div>
         </div>
 
@@ -4194,25 +7475,31 @@ export default function App() {
         <nav style={{display:"flex", gap:2, alignItems:"center"}}>
           {MAIN_TABS.map(t => {
             const active = mainTab === t.id;
-            const hasData = t.id === "analysis" || t.id === "dfd" ? !!parseResult : true;
+            const hasData = (t.id === "analysis" || t.id === "dfd") ? !!parseResult : true;
             return (
               <button key={t.id} onClick={()=>setMainTab(t.id)} style={{
                 display:"flex", alignItems:"center", gap:7,
                 background: active ? `${C.accent}12` : "transparent",
                 border: active ? `1px solid ${C.accent}40` : "1px solid transparent",
-                borderRadius:7, padding:"7px 16px",
+                borderRadius:7, padding:"7px 14px",
                 color: active ? C.accent : hasData ? C.textSub : C.textMuted,
-                fontSize:13, cursor:"pointer", ...SANS,
+                fontSize:12, cursor:"pointer", ...SANS,
                 fontWeight: active ? 600 : 400,
                 transition:"all .15s",
                 opacity: !hasData && t.id !== "upload" ? 0.5 : 1,
               }}>
-                <span style={{fontSize:14}}>{t.icon}</span>
+                <t.Icon size={14} />
                 <span>{t.label}</span>
                 {(t.id === "analysis" || t.id === "dfd") && parseResult && (
                   <span style={{
                     width:6, height:6, borderRadius:"50%",
                     background:C.green, flexShrink:0
+                  }}/>
+                )}
+                {t.id === "intelligence" && intelligenceRef.current._built && (userDocs.length > 0 || parseResult) && (
+                  <span style={{
+                    width:6, height:6, borderRadius:"50%",
+                    background:"#9C27B0", flexShrink:0
                   }}/>
                 )}
               </button>
@@ -4232,7 +7519,7 @@ export default function App() {
               display:"flex", alignItems:"center", gap:6,
               fontWeight:700,
             }}>
-              ⬇ Export .xml
+              <Download size={13}/> Export .xml
             </button>
             {/* SECONDARY: Copy XML */}
             <button onClick={copy} style={{
@@ -4244,7 +7531,7 @@ export default function App() {
               display:"flex", alignItems:"center", gap:5,
               transition:"all .15s",
             }}>
-              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML"}
+              {copied ? <CheckCircle2 size={13}/> : <CheckSquare size={13} style={{opacity:0.6}}/>} {copied ? "Copied!" : "Copy XML"}
             </button>
             {/* TERTIARY: .lucid — for Lucidchart versions that support Lucid Standard Import */}
             <button onClick={downloadLucid} title="Lucid Standard Import format (.lucid) — supported in some Lucidchart versions" style={{
@@ -4254,7 +7541,7 @@ export default function App() {
               color:C.textMuted, fontSize:12, cursor:"pointer", ...SANS,
               display:"flex", alignItems:"center", gap:5,
             }}>
-              ⬇ .lucid
+              <Download size={13}/> .lucid
             </button>
           </div>
         )}
@@ -4274,7 +7561,7 @@ export default function App() {
             <div style={{flex:1, padding:"0 8px"}}>
               {KB_DOMAINS.map(d => {
                 const active = kbDomain === d.id;
-                const icon = d.id === "userdocs" ? "📄" : (KB[d.id]?.icon || "◆");
+                const DomainIcon = d.Icon || BookOpen;
                 const badge = d.id === "userdocs" && userDocs.length > 0 ? userDocs.length : null;
                 return (
                   <div key={d.id}>
@@ -4299,8 +7586,8 @@ export default function App() {
                         background: active ? `${d.color}20` : C.surface2,
                         border:`1px solid ${active ? d.color+"44" : C.border}`,
                         display:"flex", alignItems:"center", justifyContent:"center",
-                        fontSize:14,
-                      }}>{icon}</span>
+                        color: active ? d.color : C.textMuted,
+                      }}><DomainIcon size={14}/></span>
                       <span style={{flex:1, lineHeight:1.3}}>{d.label}</span>
                       {badge && (
                         <span style={{
@@ -4353,12 +7640,95 @@ export default function App() {
           {/* Page heading */}
           <div style={{marginBottom:22}}>
             <div style={{...SANS, fontSize:22, fontWeight:700, color:C.text, marginBottom:6, letterSpacing:"-.02em"}}>
-              Upload & Analyze
+              {currentModel ? currentModel.name : "Upload & Analyze"}
             </div>
             <div style={{fontSize:13, color:C.textSub, lineHeight:1.6, maxWidth:680}}>
               Drop any Terraform, HCL, Sentinel, JSON, YAML, docs, or any other file. TF/HCL files are parsed for resources and connections; all other files become context documents that inform the analysis.
             </div>
           </div>
+
+          {/* ── APPLICATION DETAILS ── */}
+          {currentModel && (()=>{
+            const envOptions = ["Production","Staging","Development","DR / Disaster Recovery","Sandbox"];
+            const dataCls   = ["PII (Personal Data)","PHI (Health Data)","PCI (Payment Data)","Financial Data","Internal","Public"];
+            const frameworks = ["SOC 2 Type II","HIPAA","PCI-DSS v4","FedRAMP Moderate","FedRAMP High","GDPR","ISO 27001","CMMC Level 2","NIST 800-53"];
+            const md = modelDetails;
+            const toggleArr = (arr, val) => arr.includes(val) ? arr.filter(x=>x!==val) : [...arr, val];
+            return (
+              <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:14,
+                padding:"20px 24px", marginBottom:24}}>
+                <div style={{fontSize:14, fontWeight:700, color:C.text, marginBottom:16, display:"flex", alignItems:"center", gap:8}}>
+                  <span>Application Details</span>
+                  <span style={{fontSize:10, color:C.textMuted, fontWeight:400}}>— enriches intelligence context</span>
+                </div>
+                <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:14}}>
+                  {/* Environment */}
+                  <div>
+                    <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:6}}>Environment</div>
+                    <select value={md.environment||""} onChange={e=>saveModelDetails({...md,environment:e.target.value})} style={{
+                      width:"100%", background:C.bg, border:`1px solid ${C.border2}`, borderRadius:8,
+                      padding:"8px 12px", color:md.environment?C.text:C.textMuted, fontSize:13, ...SANS, outline:"none",
+                    }}>
+                      <option value="">Select environment...</option>
+                      {envOptions.map(o=><option key={o} value={o}>{o}</option>)}
+                    </select>
+                  </div>
+                  {/* Owner */}
+                  <div>
+                    <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:6}}>Team / Owner</div>
+                    <input value={md.owner||""} onChange={e=>saveModelDetails({...md,owner:e.target.value})}
+                      placeholder="e.g. Platform Security Team" style={{
+                        width:"100%", boxSizing:"border-box", background:C.bg, border:`1px solid ${C.border2}`,
+                        borderRadius:8, padding:"8px 12px", color:C.text, fontSize:13, ...SANS, outline:"none",
+                      }} />
+                  </div>
+                </div>
+                {/* Data classification */}
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:8}}>Data Classification</div>
+                  <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
+                    {dataCls.map(cls=>{
+                      const on = (md.dataClassification||[]).includes(cls);
+                      return (
+                        <button key={cls} onClick={()=>saveModelDetails({...md,dataClassification:toggleArr(md.dataClassification||[],cls)})} style={{
+                          background:on?"#0277BD20":"transparent", border:`1px solid ${on?"#0277BD":"#33333A"}`,
+                          borderRadius:20, padding:"4px 12px", fontSize:11,
+                          color:on?"#4FC3F7":C.textMuted, cursor:"pointer", ...SANS,
+                        }}>{cls}</button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {/* Compliance frameworks */}
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:8}}>Compliance Scope</div>
+                  <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
+                    {frameworks.map(fw=>{
+                      const on = (md.frameworks||[]).includes(fw);
+                      return (
+                        <button key={fw} onClick={()=>saveModelDetails({...md,frameworks:toggleArr(md.frameworks||[],fw)})} style={{
+                          background:on?"#6A1B9A20":"transparent", border:`1px solid ${on?"#9C27B0":"#33333A"}`,
+                          borderRadius:20, padding:"4px 12px", fontSize:11,
+                          color:on?"#CE93D8":C.textMuted, cursor:"pointer", ...SANS,
+                        }}>{fw}</button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {/* Description */}
+                <div>
+                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:6}}>Architecture Description / Notes</div>
+                  <textarea value={md.description||""} onChange={e=>saveModelDetails({...md,description:e.target.value})}
+                    placeholder="Describe the architecture, key data flows, trust boundaries, and threat model scope..."
+                    rows={3} style={{
+                      width:"100%", boxSizing:"border-box", background:C.bg, border:`1px solid ${C.border2}`,
+                      borderRadius:8, padding:"8px 12px", color:C.text, fontSize:12, ...SANS, outline:"none",
+                      resize:"vertical", lineHeight:1.6, ...MONO,
+                    }} />
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Drop zone — always visible for adding more */}
           <div
@@ -4373,8 +7743,8 @@ export default function App() {
               boxShadow: dragging ? `0 0 24px ${C.accent}20` : "none",
             }}
           >
-            <div style={{fontSize: files.length ? 28 : 40, marginBottom:8, opacity:dragging?1:0.6}}>
-              {dragging ? "⬇" : "📁"}
+            <div style={{marginBottom:8, opacity:dragging?1:0.6, display:"flex", justifyContent:"center"}}>
+              {dragging ? <Download size={files.length?28:40}/> : <FolderOpen size={files.length?28:40}/>}
             </div>
             <div style={{...SANS, color:C.textSub, fontSize:14, marginBottom:4, fontWeight:500}}>
               {dragging ? "Drop to add files" : files.length ? "Drop more files to add them" : "Drag & drop files or a folder here"}
@@ -4389,7 +7759,7 @@ export default function App() {
                 color:C.textSub, fontSize:13, cursor:"pointer", ...SANS,
                 display:"flex", alignItems:"center", gap:7, fontWeight:500,
               }}>
-                <span>📄</span> {files.length ? "Add Files" : "Select Files"}
+                <FileText size={14}/> {files.length ? "Add Files" : "Select Files"}
                 <input type="file" multiple
                   onChange={e=>{if(e.target.files?.length)readFiles(e.target.files, files.length>0);e.target.value="";}}
                   style={{display:"none"}}/>
@@ -4416,7 +7786,7 @@ export default function App() {
               color:"#FF8A80", fontSize:13, marginBottom:16,
               display:"flex", gap:10, alignItems:"flex-start"
             }}>
-              <span style={{fontSize:16}}>⚠</span>
+              <TriangleAlert size={16} style={{flexShrink:0}}/>
               <span>{error}</span>
             </div>
           )}
@@ -4436,7 +7806,7 @@ export default function App() {
               <div style={{...card(C.green+"33"), marginBottom:16}}>
                 <div style={{...sectionBar(C.green), justifyContent:"space-between"}}>
                   <div style={{display:"flex", alignItems:"center", gap:8}}>
-                    <span>✓</span>
+                    <CheckCircle2 size={14}/>
                     <span>{files.length} Terraform file{files.length!==1?"s":""} loaded</span>
                     {parseResult && <span style={{fontSize:11, color:C.textMuted}}>· {parseResult.resources.length} resources · {parseResult.connections.length} connections</span>}
                   </div>
@@ -4450,8 +7820,8 @@ export default function App() {
                   {Object.entries(grouped).map(([folder, fls]) => (
                     <div key={folder} style={{marginBottom: folder ? 10 : 0}}>
                       {folder && (
-                        <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:4, paddingLeft:2, textTransform:"uppercase", letterSpacing:".06em"}}>
-                          📁 {folder}
+                        <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:4, paddingLeft:2, textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5}}>
+                          <FolderOpen size={11}/> {folder}
                         </div>
                       )}
                       {fls.map(f => (
@@ -4480,7 +7850,7 @@ export default function App() {
                             onMouseEnter={e=>{ e.currentTarget.style.color=C.red; e.currentTarget.style.background=C.red+"15"; }}
                             onMouseLeave={e=>{ e.currentTarget.style.color=C.textMuted; e.currentTarget.style.background="transparent"; }}
                             title="Remove file"
-                          >✕</button>
+                          ><X size={12}/></button>
                         </div>
                       ))}
                     </div>
@@ -4493,7 +7863,7 @@ export default function App() {
           {parseResult && (
             <div style={{...card(), marginBottom:20}}>
               <div style={{...sectionBar(C.accent)}}>
-                <span>📊</span>
+                <BarChart2 size={14}/>
                 <span>Parse Results</span>
               </div>
               <div style={{padding:"20px 18px"}}>
@@ -4563,6 +7933,259 @@ export default function App() {
         </div>
       )}
 
+      {/* ── ARCHITECTURE ANALYSIS TAB ── */}
+      {mainTab==="arch-analysis" && (() => {
+        const NARRATIVE_FIELDS = [
+          { key:"entryPoints",           label:"Entry Points",               Icon:DoorOpen },
+          { key:"dataFlow",              label:"Data Flow",                  Icon:ArrowLeftRight },
+          { key:"securityBoundaries",    label:"Security Boundaries",        Icon:Lock },
+          { key:"publicPrivateResources",label:"Public & Private Resources", Icon:Globe },
+          { key:"securityControls",      label:"Security Controls",          Icon:Shield },
+          { key:"faultTolerance",        label:"Fault Tolerance",            Icon:RefreshCw },
+          { key:"authAndAuthz",          label:"Authentication & AuthZ",     Icon:KeyRound },
+          { key:"externalDependencies",  label:"External Dependencies",      Icon:LinkIcon },
+          { key:"storageAndDataSecurity",label:"Storage & Data Security",    Icon:Database },
+        ];
+
+        const ATTR_CHIPS = {
+          applicationType: ["Web App","REST API","Serverless","Microservices","Container-Based","VM-Based","Static Site","Data Pipeline","Streaming","ML/AI"],
+          entryPointTypes: ["HTTPS","REST API","GraphQL","gRPC","CLI","SDK","Webhook","Event Stream","File Transfer","Web UI"],
+          developedBy:     ["Vendor (AWS)","Vendor (Azure)","Vendor (GCP)","Vendor (3rd Party)","Internal","Hybrid"],
+          users:           ["Internal Employees","Internal Apps/Services","External End Users","3rd Party Systems","Business Partners"],
+          inboundDataSource:  ["Internal Corporate Network","External 3rd Party","External Public","Trusted Partner","IoT/Edge"],
+          inboundDataFlow:    ["API Request","Event/Message","Network Traffic","User Input","Data Streaming","File Upload","DB Replication"],
+          outboundDataFlow:   ["API Response","Event/Message","Network Traffic","Data Streaming","File Export","DB Write"],
+          outboundDataDestination: ["Internal Corporate Network","External 3rd Party","External Public","Trusted Partner","Data Warehouse"],
+          integrations:    ["REST API","GraphQL","SDK","Webhook","File Transfer","Message Queue (SQS/SNS)","Event Stream (Kinesis/Kafka)","Middleware","DB Replication"],
+          exposure:        ["Public Internet","Intranet Only","VPN Required","Trusted Partner Network","Air-Gapped"],
+          facilityType:    ["AWS Cloud","Azure Cloud","GCP Cloud","Enterprise Data Center","3rd Party DC","Mobile","Desktop"],
+          computeType:     ["Cloud Managed Service","Serverless","Container (ECS/EKS)","VM (EC2)","On-Premises","Hybrid"],
+          authMethods:     ["OAuth 2.0","SSO/SAML","PKI/mTLS","ADFS/LDAP","API Key","MFA","AWS IAM","Kerberos","Passwordless"],
+        };
+
+        const ATTR_GROUPS = [
+          { label:"Application Profile",     keys:["applicationType","entryPointTypes","developedBy","users"] },
+          { label:"Data & Integration",       keys:["inboundDataSource","inboundDataFlow","outboundDataFlow","outboundDataDestination","integrations"] },
+          { label:"Deployment & Infrastructure", keys:["exposure","facilityType","computeType"] },
+          { label:"Security",                 keys:["authMethods"] },
+        ];
+
+        const ATTR_LABELS = {
+          applicationType:"Application / Solution Type", entryPointTypes:"Entry Points",
+          developedBy:"Developed By", users:"Users / Consumers",
+          inboundDataSource:"Inbound Data Source", inboundDataFlow:"Inbound Data Flow",
+          outboundDataFlow:"Outbound Data Flow", outboundDataDestination:"Outbound Destination",
+          integrations:"Integrations", exposure:"Exposure", facilityType:"Facility Type",
+          computeType:"Compute Type", authMethods:"Authentication Methods",
+        };
+
+        const SINGLE_SELECT = ["developedBy"];
+
+        // Merge base + overrides
+        const baseNarrative = archAnalysis?.narrative || {};
+        const baseAttrs     = archAnalysis?.attributes || {};
+        const ovNarrative   = archOverrides?.narrative || {};
+        const ovAttrs       = archOverrides?.attributes || {};
+        const narrative     = { ...baseNarrative, ...ovNarrative };
+        const attrs         = { ...baseAttrs, ...ovAttrs };
+
+        const saveNarrativeField = (key, value) => {
+          const updated = { ...archOverrides, narrative: { ...ovNarrative, [key]: value } };
+          setArchOverrides(updated);
+          if (currentModel) {
+            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
+              JSON.stringify({ base: archAnalysis, overrides: updated })); } catch {}
+          }
+        };
+
+        const toggleAttrChip = (attrKey, chip) => {
+          const single = SINGLE_SELECT.includes(attrKey);
+          const current = attrs[attrKey];
+          let updated;
+          if (single) {
+            updated = current === chip ? "" : chip;
+          } else {
+            const arr = Array.isArray(current) ? current : [];
+            updated = arr.includes(chip) ? arr.filter(c => c !== chip) : [...arr, chip];
+          }
+          const newAttrs = { ...ovAttrs, [attrKey]: updated };
+          const newOverrides = { ...archOverrides, attributes: newAttrs };
+          setArchOverrides(newOverrides);
+          if (currentModel) {
+            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
+              JSON.stringify({ base: archAnalysis, overrides: newOverrides })); } catch {}
+          }
+        };
+
+        const reanalyze = () => {
+          setArchAnalyzing(true);
+          setTimeout(() => {
+            try {
+              const result = intelligenceRef.current.analyzeArchitecture(parseResult?.resources||[], userDocs, modelDetails);
+              setArchAnalysis(result);
+              if (currentModel) {
+                try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
+                  JSON.stringify({ base: result, overrides: archOverrides })); } catch {}
+              }
+            } finally { setArchAnalyzing(false); }
+          }, 0);
+        };
+
+        const resetOverrides = () => {
+          setArchOverrides({});
+          if (currentModel) {
+            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
+              JSON.stringify({ base: archAnalysis, overrides: {} })); } catch {}
+          }
+        };
+
+        return (
+          <div style={{ height:"calc(100vh - 58px)", overflow:"hidden", display:"flex", flexDirection:"column" }}>
+            {/* Header bar */}
+            <div style={{ padding:"16px 28px", borderBottom:`1px solid ${C.border}`, background:C.surface,
+              display:"flex", alignItems:"center", gap:16, flexShrink:0 }}>
+              <div style={{ flex:1 }}>
+                <div style={{...SANS, fontSize:16, fontWeight:700, color:C.text}}>Architecture Analysis</div>
+                <div style={{ fontSize:11, color:C.textMuted, marginTop:2 }}>
+                  Auto-populated from Terraform resources and uploaded documents · editable per-model
+                  {archAnalysis && <span style={{marginLeft:10, color:C.accent, fontWeight:600}}>· Confidence: {archAnalysis.confidence}%</span>}
+                </div>
+              </div>
+              {archAnalyzing && <Loader2 size={16} style={{color:C.accent, animation:"spin 1s linear infinite"}}/>}
+              <button onClick={reanalyze} style={{
+                ...SANS, fontSize:12, fontWeight:600, padding:"6px 14px",
+                background:C.surface2, border:`1px solid ${C.border2}`, borderRadius:7,
+                color:C.textSub, cursor:"pointer", display:"flex", alignItems:"center", gap:5,
+              }}><RotateCcw size={12}/> Re-analyze</button>
+              <button onClick={resetOverrides} style={{
+                ...SANS, fontSize:12, fontWeight:600, padding:"6px 14px",
+                background:"transparent", border:`1px solid ${C.border}`, borderRadius:7,
+                color:C.textMuted, cursor:"pointer", display:"flex", alignItems:"center", gap:5,
+              }}><RefreshCw size={12}/> Reset edits</button>
+            </div>
+
+            {/* Body — 2-column */}
+            {!archAnalysis && !archAnalyzing ? (
+              <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:12 }}>
+                <Building2 size={40} style={{color:C.textMuted, opacity:.4}}/>
+                <div style={{...SANS, fontSize:14, color:C.textMuted}}>Upload Terraform files or documents to generate architecture analysis</div>
+                <button onClick={()=>setMainTab("upload")} style={{
+                  ...SANS, fontSize:12, padding:"7px 16px", borderRadius:7,
+                  background:`${C.accent}18`, border:`1px solid ${C.accent}44`, color:C.accent, cursor:"pointer",
+                }}>Go to Upload & Analyze</button>
+              </div>
+            ) : (
+              <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", overflow:"hidden" }}>
+                {/* LEFT — Narrative Fields */}
+                <div style={{ overflowY:"auto", padding:"20px 24px", borderRight:`1px solid ${C.border}` }}>
+                  <div style={{...SANS, fontSize:12, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
+                    letterSpacing:".1em", marginBottom:16}}>Narrative Findings</div>
+                  {NARRATIVE_FIELDS.map(({ key, label, Icon: FieldIcon }) => {
+                    const value = narrative[key] || "";
+                    const isOverridden = !!ovNarrative[key];
+                    return (
+                      <div key={key} style={{ marginBottom:16 }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
+                          <FieldIcon size={14} style={{ color:C.accent }}/>
+                          <span style={{...SANS, fontSize:12, fontWeight:700, color:C.text}}>{label}</span>
+                          {!isOverridden && value && (
+                            <span style={{ fontSize:9, fontWeight:700, background:"#FF980018", color:"#FF9800",
+                              border:"1px solid #FF980044", borderRadius:8, padding:"1px 6px", marginLeft:4 }}>AI</span>
+                          )}
+                          {isOverridden && (
+                            <span style={{ fontSize:9, fontWeight:700, background:`${C.accent}18`, color:C.accent,
+                              border:`1px solid ${C.accent}44`, borderRadius:8, padding:"1px 6px", marginLeft:4 }}>edited</span>
+                          )}
+                        </div>
+                        <textarea
+                          value={value}
+                          onChange={e => saveNarrativeField(key, e.target.value)}
+                          placeholder={`Describe ${label.toLowerCase()}...`}
+                          rows={3}
+                          style={{
+                            width:"100%", boxSizing:"border-box", resize:"vertical",
+                            background:C.bg, border:`1px solid ${isOverridden ? C.accent+"66" : C.border}`,
+                            borderRadius:7, color:C.text, fontSize:12, padding:"9px 11px",
+                            lineHeight:1.6, outline:"none", ...SANS, transition:"border-color .15s",
+                          }}
+                          onFocus={e=>e.target.style.borderColor=C.accent}
+                          onBlur={e=>e.target.style.borderColor=isOverridden?C.accent+"66":C.border}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* RIGHT — Structured Attributes */}
+                <div style={{ overflowY:"auto", padding:"20px 24px" }}>
+                  <div style={{...SANS, fontSize:12, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
+                    letterSpacing:".1em", marginBottom:16}}>Structured Attributes</div>
+                  {ATTR_GROUPS.map((group, gi) => (
+                    <div key={gi} style={{ marginBottom:20 }}>
+                      <div style={{ fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
+                        letterSpacing:".08em", marginBottom:12, paddingBottom:6,
+                        borderBottom:`1px solid ${C.border}` }}>{group.label}</div>
+                      {group.keys.map(attrKey => {
+                        const options = ATTR_CHIPS[attrKey] || [];
+                        const single = SINGLE_SELECT.includes(attrKey);
+                        const selected = attrs[attrKey];
+                        const isSelected = (opt) => single
+                          ? selected === opt
+                          : Array.isArray(selected) && selected.includes(opt);
+                        const isAI = (opt) => {
+                          const base = baseAttrs[attrKey];
+                          return single ? base === opt : Array.isArray(base) && base.includes(opt);
+                        };
+                        return (
+                          <div key={attrKey} style={{ marginBottom:12 }}>
+                            <div style={{...SANS, fontSize:11, fontWeight:600, color:C.textSub, marginBottom:6}}>
+                              {ATTR_LABELS[attrKey]}
+                              {single && <span style={{fontSize:10, color:C.textMuted, fontWeight:400}}> · single select</span>}
+                            </div>
+                            <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                              {options.map(opt => {
+                                const active = isSelected(opt);
+                                const ai = isAI(opt);
+                                return (
+                                  <button key={opt} onClick={() => toggleAttrChip(attrKey, opt)} style={{
+                                    ...SANS, fontSize:11, fontWeight: active ? 700 : 400,
+                                    padding:"4px 10px", borderRadius:14, cursor:"pointer",
+                                    background: active ? `${C.accent}22` : C.surface2,
+                                    border: `1px solid ${active ? C.accent : C.border2}`,
+                                    color: active ? C.accent : C.textMuted,
+                                    transition:"all .12s", position:"relative",
+                                  }}>
+                                    {opt}
+                                    {ai && active && (
+                                      <span style={{ fontSize:8, color:"#FF9800", position:"absolute", top:-3, right:-3,
+                                        background:C.surface, borderRadius:"50%", padding:"0 2px" }}>✦</span>
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* ── INTELLIGENCE TAB ── */}
+      {mainTab==="intelligence" && (
+        <IntelligencePanel
+          intelligence={intelligenceRef.current}
+          userDocs={userDocs}
+          parseResult={parseResult}
+          key={intelligenceVersion}
+        />
+      )}
+
       {/* ── THREATAFORM ANALYSIS TAB ── */}
       {mainTab==="analysis" && (
         <div style={{flex:1, overflow:"auto", background:C.bg, height:"calc(100vh - 58px)"}}>
@@ -4610,11 +8233,12 @@ export default function App() {
             padding:"0 24px", display:"flex", gap:4, alignItems:"center", height:48,
           }}>
             {[
-              {id:"stats",    label:"Stats",              icon:"📊"},
-              {id:"xml",      label:"XML Output",         icon:"⌨"},
-              {id:"guide",    label:"Import Guide",       icon:"📖"},
-              {id:"legend",   label:"Legend",             icon:"🗂"},
-              {id:"analysis", label:"Analysis",           icon:"🔬"},
+              {id:"arch",     label:"Architecture",       Icon: ImageIcon},
+              {id:"stats",    label:"Stats",              Icon: BarChart2},
+              {id:"xml",      label:"XML Output",         Icon: Code2},
+              {id:"guide",    label:"Import Guide",       Icon: BookMarked},
+              {id:"legend",   label:"Legend",             Icon: LayoutList},
+              {id:"analysis", label:"Analysis",           Icon: Microscope},
             ].map(t => {
               const active = dfdTab === t.id;
               return (
@@ -4628,7 +8252,7 @@ export default function App() {
                   fontWeight: active ? 600 : 400,
                   transition:"all .15s",
                 }}>
-                  <span style={{fontSize:13}}>{t.icon}</span>
+                  <t.Icon size={14} />
                   <span>{t.label}</span>
                 </button>
               );
@@ -4642,6 +8266,19 @@ export default function App() {
 
           <div style={{flex:1, overflow:"auto", background:"#080810"}}>
 
+            {/* ── ARCHITECTURE IMAGE (uploaded from Lucidchart export) ── */}
+            {dfdTab==="arch" && (
+              <ArchitectureImageViewer
+                image={diagramImage}
+                onUpload={(dataUrl, _name) => {
+                  setDiagramImage(dataUrl);
+                  if (currentModel) {
+                    try { localStorage.setItem(`tf-model-${currentModel.id}-diagram-image`, dataUrl); } catch {}
+                  }
+                }}
+              />
+            )}
+
             {/* STATS */}
             {dfdTab==="stats" && parseResult && (
               <div style={{padding:"20px 28px", maxWidth:800}}>
@@ -4649,7 +8286,7 @@ export default function App() {
 
                 {/* Files */}
                 <div style={{marginBottom:20}}>
-                  <div style={{fontSize:11, color:"#FF9900", fontWeight:600, marginBottom:8}}>📁 Analyzed Files ({files.length})</div>
+                  <div style={{fontSize:11, color:"#FF9900", fontWeight:600, marginBottom:8, display:"flex", alignItems:"center", gap:5}}><FolderOpen size={11}/> Analyzed Files ({files.length})</div>
                   <div style={{display:"flex", flexDirection:"column", gap:3}}>
                     {files.map((f,i)=>(
                       <div key={i} style={{fontSize:10, color:"#3A5A3A", ...MONO, display:"flex", justifyContent:"space-between"}}>
@@ -4661,7 +8298,7 @@ export default function App() {
 
                 {/* Resource table */}
                 <div style={{marginBottom:20}}>
-                  <div style={{fontSize:11, color:"#4CAF50", fontWeight:600, marginBottom:8}}>🧩 Resources ({parseResult.resources.length})</div>
+                  <div style={{fontSize:11, color:"#4CAF50", fontWeight:600, marginBottom:8, display:"flex", alignItems:"center", gap:5}}><Layers size={11}/> Resources ({parseResult.resources.length})</div>
                   <div style={{background:"#0C0C18", border:"1px solid #1E1E2E", borderRadius:6, overflow:"hidden"}}>
                     <div style={{display:"grid", gridTemplateColumns:"1fr 1fr auto", background:"#111120", padding:"6px 12px", fontSize:9, color:"#444", textTransform:"uppercase", letterSpacing:".1em"}}>
                       <span>Resource ID</span><span>Label</span><span>Tier</span>
@@ -4685,7 +8322,7 @@ export default function App() {
                 {/* Modules */}
                 {parseResult.modules.length > 0 && (
                   <div style={{marginBottom:20}}>
-                    <div style={{fontSize:11, color:"#FF9900", fontWeight:600, marginBottom:8}}>📦 Modules & Remote State ({parseResult.modules.length})</div>
+                    <div style={{fontSize:11, color:"#FF9900", fontWeight:600, marginBottom:8, display:"flex", alignItems:"center", gap:5}}><Package size={11}/> Modules & Remote State ({parseResult.modules.length})</div>
                     <div style={{background:"#0C0C18", border:"1px solid #1E1E2E", borderRadius:6, overflow:"hidden"}}>
                       {parseResult.modules.map((m,i)=>(
                         <div key={i} style={{padding:"6px 12px", borderTop:i>0?"1px solid #111120":"none", background:i%2===0?"#0A0A14":"#0C0C18", display:"flex", justifyContent:"space-between", alignItems:"center"}}>
@@ -4746,7 +8383,7 @@ export default function App() {
                     {
                       name:"Lucidchart (Enterprise)", color:"#FF7043", badge:"✦ Primary — Draw.io Import",
                       steps:[
-                        "Click ⬇ Export .xml in the top-right — saves enterprise-tf-dfd.xml to your machine",
+                        "Click Export .xml in the top-right — saves enterprise-tf-dfd.xml to your machine",
                         "In Lucidchart: click File → Import Documents",
                         "In the Import dialog select Draw.io (.xml, .drawio) and upload your enterprise-tf-dfd.xml file",
                         "All tier boundaries, resource nodes, and connection arrows will import correctly",
@@ -4756,7 +8393,7 @@ export default function App() {
                     {
                       name:"draw.io / diagrams.net", color:"#1E88E5", badge:"Secondary",
                       steps:[
-                        "Click ⬇ Export .xml to save the file",
+                        "Click Export .xml to save the file",
                         "Open app.diagrams.net in any browser (free, no account needed)",
                         "Drag and drop the .drawio file onto the canvas — or use File → Import From → Device",
                         "All tier blocks, nodes, and connection arrows are preserved automatically",
@@ -4766,7 +8403,7 @@ export default function App() {
                     {
                       name:"Microsoft Visio", color:"#2E7D32", badge:null,
                       steps:[
-                        "Download the .xml file via the ⬇ Export .xml button",
+                        "Download the .xml file via the Export .xml button",
                         "In draw.io, use File → Export As → Visio (.vsdx) to convert",
                         "Or install the Diagrams.net add-in for Visio from the Microsoft AppSource store",
                       ]
