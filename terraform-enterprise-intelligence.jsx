@@ -1562,6 +1562,185 @@ function generateDFDXml(resources, modules, connections) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LUCID STANDARD IMPORT (.lucid) GENERATOR
+// .lucid = ZIP archive containing document.json (Lucid Standard Import schema)
+// This is the most reliable Lucidchart import format — no XML parse failures.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Minimal CRC-32 + single-file ZIP creator (no external dependencies)
+const _CRC32T=(()=>{const t=new Uint32Array(256);for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[i]=c;}return t;})();
+function _crc32(buf){let c=0xFFFFFFFF;for(let i=0;i<buf.length;i++)c=_CRC32T[(c^buf[i])&0xFF]^(c>>>8);return(c^0xFFFFFFFF)>>>0;}
+function _u16(v){return[v&0xFF,(v>>8)&0xFF];}
+function _u32(v){return[v&0xFF,(v>>8)&0xFF,(v>>16)&0xFF,(v>>24)&0xFF];}
+
+function makeZipOneFile(filename, contentStr) {
+  const enc=new TextEncoder();
+  const name=enc.encode(filename);
+  const data=enc.encode(contentStr);
+  const crc=_crc32(data);
+  const d=new Date();
+  const dt=((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1))&0xFFFF;
+  const dd=(((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate())&0xFFFF;
+  // Local file header (signature + version + flags + compression + time + date + crc + sizes + name-len + extra + name)
+  const lfh=new Uint8Array([
+    0x50,0x4B,0x03,0x04, // local file header sig
+    0x14,0x00,           // version needed (2.0)
+    0x00,0x00,           // general purpose bit flags
+    0x00,0x00,           // compression: stored (0)
+    ..._u16(dt),..._u16(dd),
+    ..._u32(crc),
+    ..._u32(data.length), // compressed size = uncompressed (stored)
+    ..._u32(data.length), // uncompressed size
+    ..._u16(name.length),
+    0x00,0x00,           // extra field length
+    ...name
+  ]);
+  // Central directory entry
+  const cde=new Uint8Array([
+    0x50,0x4B,0x01,0x02, // central dir sig
+    0x14,0x00,           // version made by
+    0x14,0x00,           // version needed
+    0x00,0x00,           // bit flags
+    0x00,0x00,           // compression: stored
+    ..._u16(dt),..._u16(dd),
+    ..._u32(crc),
+    ..._u32(data.length),
+    ..._u32(data.length),
+    ..._u16(name.length),
+    0x00,0x00,           // extra field length
+    0x00,0x00,           // file comment length
+    0x00,0x00,           // disk number start
+    0x00,0x00,           // internal file attrs
+    0x00,0x00,0x00,0x00, // external file attrs
+    ..._u32(0),          // offset of local header (always 0 — first file)
+    ...name
+  ]);
+  const cdOff=lfh.length+data.length;
+  // End of central directory
+  const eocd=new Uint8Array([
+    0x50,0x4B,0x05,0x06, // EOCD sig
+    0x00,0x00,           // disk number
+    0x00,0x00,           // disk with central dir
+    0x01,0x00,           // entries on this disk
+    0x01,0x00,           // total entries
+    ..._u32(cde.length), // size of central dir
+    ..._u32(cdOff),      // offset of central dir
+    0x00,0x00            // comment length
+  ]);
+  const zip=new Uint8Array(lfh.length+data.length+cde.length+eocd.length);
+  let off=0;
+  zip.set(lfh,off); off+=lfh.length;
+  zip.set(data,off); off+=data.length;
+  zip.set(cde,off); off+=cde.length;
+  zip.set(eocd,off);
+  return zip;
+}
+
+// Generates Lucid Standard Import JSON from parsed TF resources/modules/connections.
+// Uses identical layout math to generateDFDXml (same tier order, column/row calc, spacing).
+function generateLucidJson(resources, modules, connections) {
+  const TORD=["xsphere","org","security","cicd","network","compute","storage"];
+  const groups={};
+  TORD.forEach(t=>{groups[t]=[];});
+  resources.forEach(r=>{
+    const meta=RT[r.type]||RT._default;
+    if(!groups[meta.t])groups[meta.t]=[];
+    groups[meta.t].push({...r,_meta:meta,_isModule:false});
+  });
+  modules.forEach(m=>{
+    const t="cicd";
+    if(!groups[t])groups[t]=[];
+    const mc=m.srcType==="sentinel"?"#E65100":m.srcType==="remote_state"?"#1565C0":"#558B2F";
+    groups[t].push({...m,_meta:{l:m.name,t,i:"-",c:mc},_isModule:true});
+  });
+
+  const activeTiers=TORD.filter(t=>groups[t]&&groups[t].length>0);
+  const maxNodes=activeTiers.reduce((mx,t)=>Math.max(mx,groups[t].length),1);
+  const effectiveCols=Math.min(maxNodes,MAXCOLS);
+  const tierW=TPAD*2+effectiveCols*(NW+HGAP)-HGAP;
+  let globalY=CPAD;
+  const shapes=[], lines=[];
+  const idMap=new Map();
+  let shapeN=1, lineN=1;
+
+  activeTiers.forEach(t=>{
+    const nodes=groups[t];
+    const rows=Math.ceil(nodes.length/MAXCOLS);
+    const tH=HDRH+TVPAD+rows*(NH+LH+VGAP)-VGAP+TVPAD;
+    const tm=TIERS[t]||{label:t,bg:"#F5F5F5",border:"#999",hdr:"#555"};
+
+    // Tier swim-lane container
+    shapes.push({
+      id:`tier-${t}`,
+      type:"rectangle",
+      boundingBox:{x:CPAD,y:globalY,w:tierW,h:tH},
+      style:{fill:tm.bg,stroke:tm.border,strokeWidth:2},
+      text:`${tm.label} (${nodes.length})`,
+      textStyle:{color:tm.hdr,bold:true,fontSize:13,verticalAlignment:"top"}
+    });
+
+    nodes.forEach((n,i)=>{
+      const col=i%MAXCOLS, row=Math.floor(i/MAXCOLS);
+      const nx=CPAD+TPAD+col*(NW+HGAP);
+      const ny=globalY+HDRH+TVPAD+row*(NH+LH+VGAP);
+      const meta=n._meta;
+      const shortType=n._isModule
+        ?`${n.srcType||"module"}`
+        :(n.type||"").replace(/^aws_|^xsphere_/,"").replace(/_/g," ").substring(0,20);
+      const rawName=(n.label||n.name||"").substring(0,18)+(n.multi?` [${n.multi}]`:"");
+      const shapeId=`node-${shapeN++}`;
+      idMap.set(n.id,shapeId);
+      shapes.push({
+        id:shapeId,
+        type:"rectangle",
+        boundingBox:{x:nx,y:ny,w:NW,h:NH+LH},
+        style:{
+          fill:n._isModule?"#FAFFF5":"#FFFFFF",
+          stroke:meta.c||"#546E7A",
+          strokeWidth:2,
+          strokeStyle:(n._isModule||n.srcType==="remote_state")?"dashed":"solid"
+        },
+        text:`${rawName}\n${shortType}`,
+        textStyle:{fontSize:9,color:"#333333"}
+      });
+    });
+    globalY+=tH+TGAP;
+  });
+
+  // Connection lines
+  const seenE=new Set();
+  connections.forEach(c=>{
+    const srcId=idMap.get(c.from), tgtId=idMap.get(c.to);
+    if(!srcId||!tgtId)return;
+    const ek=`${srcId}|${tgtId}`;
+    if(seenE.has(ek))return;
+    seenE.add(ek);
+    const color=c.kind==="explicit"?"#E53935":c.kind==="module-input"?"#2E7D32":"#78909C";
+    // Route: downward = exit bottom/enter top; upward = exit top/enter bottom
+    lines.push({
+      id:`line-${lineN++}`,
+      lineType:"elbow",
+      stroke:color,
+      strokeWidth:2,
+      strokeStyle:c.kind==="explicit"?"dashed":"solid",
+      text:c.kind==="explicit"?"depends_on":c.kind==="module-input"?"input":"",
+      endpoint1:{type:"shapeEndpoint",style:"none",shapeId:srcId,position:{x:0.5,y:1}},
+      endpoint2:{type:"shapeEndpoint",style:"arrow",shapeId:tgtId,position:{x:0.5,y:0}}
+    });
+  });
+
+  return JSON.stringify({
+    version:1,
+    pages:[{
+      id:"page-1",
+      title:"Enterprise Terraform DFD",
+      shapes,
+      lines
+    }]
+  },null,2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SYNTAX HIGHLIGHT
 // ─────────────────────────────────────────────────────────────────────────────
 function hlXml(raw) {
@@ -3920,6 +4099,19 @@ export default function App() {
     }
   };
 
+  // ── Download .lucid (Lucid Standard Import — native Lucidchart format) ───────
+  const downloadLucid = useCallback(() => {
+    if (!parseResult) return;
+    const json = generateLucidJson(parseResult.resources, parseResult.modules, parseResult.connections);
+    const zipBytes = makeZipOneFile("document.json", json);
+    const blob = new Blob([zipBytes], {type:"application/octet-stream"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "enterprise-tf-dfd.lucid";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, [parseResult]);
+
   const KB_DOMAINS = [
     {id:"xsphere",  label:"xSphere Cloud",         color:"#0277BD"},
     {id:"spinnaker",label:"Spinnaker.io",           color:"#00838F"},
@@ -4002,26 +4194,39 @@ export default function App() {
         {/* Action buttons */}
         {xml && (
           <div style={{marginLeft:"auto", display:"flex", gap:8, alignItems:"center"}}>
+            {/* PRIMARY: Lucidchart native format */}
+            <button onClick={downloadLucid} style={{
+              background:"linear-gradient(135deg,#FF9900,#FF6B35)",
+              border:"none",
+              borderRadius:7, padding:"7px 18px",
+              color:"#000", fontSize:12, cursor:"pointer", ...SANS,
+              display:"flex", alignItems:"center", gap:6,
+              fontWeight:700,
+              boxShadow:"0 2px 10px #FF990044",
+            }}>
+              ⬇ Export .lucid
+            </button>
+            {/* SECONDARY: Copy draw.io XML */}
             <button onClick={copy} style={{
               background: copied ? "#0D2010" : C.surface2,
               border:`1px solid ${copied ? C.green+"66" : C.border2}`,
-              borderRadius:7, padding:"7px 16px",
-              color: copied ? C.green : C.textSub,
+              borderRadius:7, padding:"7px 13px",
+              color: copied ? C.green : C.textMuted,
               fontSize:12, cursor:"pointer", ...SANS,
-              display:"flex", alignItems:"center", gap:6,
+              display:"flex", alignItems:"center", gap:5,
               transition:"all .15s",
             }}>
-              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy Full XML"}
+              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML"}
             </button>
+            {/* SECONDARY: draw.io download */}
             <button onClick={download} style={{
-              background:"linear-gradient(135deg,#FF6B3520,#FF990020)",
-              border:`1px solid ${C.accent}55`,
-              borderRadius:7, padding:"7px 16px",
-              color:C.accent, fontSize:12, cursor:"pointer", ...SANS,
-              display:"flex", alignItems:"center", gap:6,
-              fontWeight:600,
+              background:C.surface2,
+              border:`1px solid ${C.border2}`,
+              borderRadius:7, padding:"7px 13px",
+              color:C.textMuted, fontSize:12, cursor:"pointer", ...SANS,
+              display:"flex", alignItems:"center", gap:5,
             }}>
-              ⬇ Export .drawio
+              ⬇ .drawio
             </button>
           </div>
         )}
@@ -4511,9 +4716,19 @@ export default function App() {
                 <div style={{display:"flex", flexDirection:"column", gap:14, marginBottom:28}}>
                   {[
                     {
-                      name:"draw.io / diagrams.net", color:"#1E88E5", badge:"Recommended",
+                      name:"Lucidchart", color:"#FF7043", badge:"✦ Primary — Native Format",
                       steps:[
-                        "Click the ⬇ Download button in the top-right to save your .drawio file",
+                        "Click ⬇ Export .lucid in the top-right — this downloads enterprise-tf-dfd.lucid (Lucid Standard Import format)",
+                        "In Lucidchart: click File → Import → Lucid Standard Import (or just drag the .lucid file onto the canvas)",
+                        "Select the downloaded enterprise-tf-dfd.lucid file and click Import — all tiers, nodes, and arrows import reliably",
+                        "If the menu option says 'Other' or similar, look for a file picker; upload the .lucid file directly",
+                        "Fallback only: click ⬇ .drawio → File → Import → Diagrams.net → upload the .drawio file (results may vary)",
+                      ]
+                    },
+                    {
+                      name:"draw.io / diagrams.net", color:"#1E88E5", badge:"Secondary",
+                      steps:[
+                        "Click the ⬇ .drawio button in the top-right to save your .drawio file",
                         "Open app.diagrams.net in any browser (free, no account needed)",
                         "Drag and drop the .drawio file onto the canvas — or use File → Import From → Device",
                         "All tier swim lanes, nodes, and connection arrows are preserved automatically",
@@ -4521,19 +4736,9 @@ export default function App() {
                       ]
                     },
                     {
-                      name:"Lucidchart", color:"#FF7043", badge:"File upload required",
-                      steps:[
-                        "Click ⬇ Export .drawio to download the diagram file (the file uses compressed=\"false\" for Lucidchart compatibility)",
-                        "In Lucidchart: click File → Import → select Diagrams.net (.drawio) from the list",
-                        "Upload the downloaded .drawio file — do NOT attempt to paste XML, Lucidchart has no paste-XML dialog",
-                        "Alternatively: click ⎘ Copy Full XML, paste into a text editor, save as yourfile.drawio, then import that file",
-                        "Tier swim lanes and connection arrows are preserved; node icons may render as labeled rectangles",
-                      ]
-                    },
-                    {
                       name:"Microsoft Visio", color:"#2E7D32", badge:null,
                       steps:[
-                        "Download the .drawio file",
+                        "Download the .drawio file via the ⬇ .drawio button",
                         "In draw.io, use File → Export As → Visio (.vsdx) to convert",
                         "Or install the Diagrams.net add-in for Visio from the Microsoft AppSource store",
                       ]
