@@ -9,7 +9,14 @@
       "Bash(where npx)",
       "WebFetch(domain:attack.mitre.org)",
       "Bash(node -e \":*)",
-      "Bash(node --input-type=module --eval \":*)"
+      "Bash(node --input-type=module --eval \":*)",
+      "WebFetch(domain:help.lucid.co)",
+      "WebFetch(domain:community.lucid.co)",
+      "WebFetch(domain:www.drawio.com)",
+      "WebFetch(domain:j2r2b.github.io)",
+      "Bash(node --input-type=module --eval \"import\\(''./terraform-enterprise-intelligence.jsx''\\).catch\\(e=>console.error\\(e.message\\)\\)\")",
+      "Bash(npx --yes acorn --ecma2020 --module terraform-enterprise-intelligence.jsx)",
+      "Bash(npx vite build)"
     ]
   }
 }

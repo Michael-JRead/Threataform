@@ -1181,15 +1181,54 @@ const TIERS = {
 // ─────────────────────────────────────────────────────────────────────────────
 // TERRAFORM PARSER
 // ─────────────────────────────────────────────────────────────────────────────
+// Detect TFE-Pave layer from file path (L0=org, L1=vending, L2=account-pave, L3=product, L4=service)
+function detectPaveLayer(filePath) {
+  const p = filePath.toLowerCase();
+  if (/\bl0[_/-]|org[_/-]mgmt|management[_/-]|control[_/-]tower/.test(p)) return "L0";
+  if (/\bl1[_/-]|vend|aft[_/-]|account[_/-]vend/.test(p)) return "L1";
+  if (/\bl2[_/-]|account[_/-]pave|pave[_/-]account|baseline/.test(p)) return "L2";
+  if (/\bl3[_/-]|product[_/-]pave|platform[_/-]|shared[_/-]/.test(p)) return "L3";
+  if (/\bl4[_/-]|service[_/-]|workload[_/-]|app[_/-]/.test(p)) return "L4";
+  return null;
+}
+
 function parseTFMultiFile(files) {
   const resources=[], modules=[], connections=[], outputs=[], variables=[], remoteStates=[];
+  // Build an output index keyed by "output_name" → value for cross-file resolution
+  const outputIndex = {}; // populated on second pass
+  // Map variable defaults for resolution
+  const varIndex = {};    // "file::varname" → defaultValue
 
   files.forEach(({path, content}) => {
     const fname = path.split("/").pop();
+    const paveLayer = detectPaveLayer(path);
 
-    // Resources
-    const rRe = /resource\s+"([^"]+)"\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
+    // ── Variables (first pass — needed for reference resolution) ───────────
+    const vRe = /\bvariable\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
     let m;
+    while ((m = vRe.exec(content)) !== null) {
+      const [,vname,body] = m;
+      const dM = body.match(/default\s*=\s*"?([^"\n]+)"?/);
+      const tM = body.match(/type\s*=\s*(\S+)/);
+      const senM = /sensitive\s*=\s*true/.test(body);
+      const desc = (body.match(/description\s*=\s*"([^"]+)"/) || [])[1] || "";
+      variables.push({name:vname, type:tM?tM[1]:"any", hasDefault:!!dM, defaultVal:dM?dM[1]:null, sensitive:senM, description:desc, file:path, paveLayer});
+      varIndex[`${path}::${vname}`] = dM ? dM[1] : null;
+    }
+
+    // ── Outputs (first pass) ───────────────────────────────────────────────
+    const oRe = /\boutput\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
+    while ((m = oRe.exec(content)) !== null) {
+      const [,oname,body] = m;
+      const vM = body.match(/value\s*=\s*(.+)/);
+      const senM = /sensitive\s*=\s*true/.test(body);
+      const val = vM ? vM[1].trim() : "";
+      outputs.push({name:oname, value:val, sensitive:senM, file:path, paveLayer});
+      outputIndex[oname] = val;
+    }
+
+    // ── Resources ─────────────────────────────────────────────────────────
+    const rRe = /resource\s+"([^"]+)"\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
     while ((m = rRe.exec(content)) !== null) {
       const [,rtype,rname,body] = m;
       const id = `${rtype}.${rname}`;
@@ -1200,23 +1239,32 @@ function parseTFMultiFile(files) {
         if (lm) { label = lm[1]; break; }
       }
       const multi = /\bfor_each\s*=/.test(body) ? "for_each" : /\bcount\s*=/.test(body) ? "count" : null;
-      resources.push({id, type:rtype, name:rname, label, body, multi, file:path});
-      // implicit deps
+      resources.push({id, type:rtype, name:rname, label, body, multi, file:path, paveLayer});
+
+      // Implicit deps: resource type references (aws_*, xsphere_*)
       const depRe = /\b(aws_[\w]+|xsphere_[\w]+)\.([\w-]+)\b/g; let rm;
       while ((rm = depRe.exec(body)) !== null) {
         const to = `${rm[1]}.${rm[2]}`;
         if (to !== id) connections.push({from:id, to, kind:"implicit", file:path});
       }
-      // explicit depends_on
+      // Explicit depends_on
       const dm = body.match(/depends_on\s*=\s*\[([^\]]+)\]/);
       if (dm) {
         const dr = /\b(aws_[\w]+|xsphere_[\w]+)\.([\w-]+)\b/g; let d;
         while ((d = dr.exec(dm[1])) !== null)
           connections.push({from:id, to:`${d[1]}.${d[2]}`, kind:"explicit", file:path});
       }
+      // Module output references: module.<name>.<output>
+      const modRefRe = /\bmodule\.([\w-]+)\.([\w-]+)\b/g; let mr;
+      while ((mr = modRefRe.exec(body)) !== null)
+        connections.push({from:id, to:`module.${mr[1]}`, kind:"module-output", file:path});
+      // Data source references: data.<type>.<name>
+      const dataRefRe = /\bdata\.([\w]+)\.([\w-]+)\b/g; let dr2;
+      while ((dr2 = dataRefRe.exec(body)) !== null)
+        connections.push({from:id, to:`data.${dr2[1]}.${dr2[2]}`, kind:"data-ref", file:path});
     }
 
-    // Modules
+    // ── Modules ───────────────────────────────────────────────────────────
     const mRe = /\bmodule\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
     while ((m = mRe.exec(content)) !== null) {
       const [,mname,body] = m;
@@ -1229,49 +1277,39 @@ function parseTFMultiFile(files) {
                     : src === "remote_state" ? "remote_state"
                     : "registry";
       const shortSrc = src.split("/").slice(-2).join("/").substring(0,30);
-      modules.push({id:`module.${mname}`, name:mname, source:src, shortSrc, version:ver, srcType, body, file:path});
+      const pinned = ver ? /^[~>=!]/.test(ver) ? "constrained" : "exact" : "unpinned";
+      modules.push({id:`module.${mname}`, name:mname, source:src, shortSrc, version:ver, srcType, pinned, body, file:path, paveLayer});
       // module inputs referencing resources
       const refRe = /\b(aws_[\w]+|xsphere_[\w]+)\.([\w-]+)\b/g; let rm;
       while ((rm = refRe.exec(body)) !== null)
         connections.push({from:`module.${mname}`, to:`${rm[1]}.${rm[2]}`, kind:"module-input", file:path});
     }
 
-    // Outputs
-    const oRe = /\boutput\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|\s*$))/g;
-    while ((m = oRe.exec(content)) !== null) {
-      const [,oname,body] = m;
-      const vM = body.match(/value\s*=\s*(.+)/);
-      outputs.push({name:oname, value:vM?vM[1].trim():"", file:path});
+    // ── Data sources (all types, not just remote_state) ───────────────────
+    const dRe = /\bdata\s+"([^"]+)"\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|locals|terraform)\s|\s*$)/g;
+    while ((m = dRe.exec(content)) !== null) {
+      const [,dtype,dname,body] = m;
+      const dsId = `data.${dtype}.${dname}`;
+      if (dtype === "terraform_remote_state") {
+        const keyM = body.match(/key\s*=\s*"([^"]+)"/);
+        const buckM = body.match(/bucket\s*=\s*"([^"]+)"/);
+        remoteStates.push({name:dname, key:keyM?keyM[1]:null, bucket:buckM?buckM[1]:null, file:path});
+        modules.push({id:`remote_state.${dname}`, name:dname, source:"remote_state", shortSrc:"remote state",
+                      version:null, srcType:"remote_state", body, file:path, paveLayer});
+      } else {
+        // All other data sources — add as lightweight module-like node for DFD and connection tracking
+        modules.push({id:dsId, name:dname, source:`data:${dtype}`, shortSrc:dtype.replace("aws_",""), version:null, srcType:"data", body, file:path, paveLayer});
+      }
     }
 
-    // Variables
-    const vRe = /\bvariable\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|variable|output|provider|\s*$))/g;
-    while ((m = vRe.exec(content)) !== null) {
-      const [,vname,body] = m;
-      const dM = body.match(/default\s*=\s*(.+)/);
-      const tM = body.match(/type\s*=\s*(\S+)/);
-      variables.push({name:vname, type:tM?tM[1]:"any", hasDefault:!!dM, file:path});
-    }
-
-    // Remote state
-    const rsRe = /data\s+"terraform_remote_state"\s+"([^"]+)"\s*\{([\s\S]*?)(?=\n(?:resource|data|module|\s*$))/g;
-    while ((m = rsRe.exec(content)) !== null) {
-      const [,rsname,body] = m;
-      const keyM = body.match(/key\s*=\s*"([^"]+)"/);
-      const buckM = body.match(/bucket\s*=\s*"([^"]+)"/);
-      remoteStates.push({name:rsname, key:keyM?keyM[1]:null, bucket:buckM?buckM[1]:null, file:path});
-      modules.push({id:`remote_state.${rsname}`, name:rsname, source:"remote_state", shortSrc:"remote state",
-                    version:null, srcType:"remote_state", body, file:path});
-    }
-
-    // Sentinel
+    // ── Sentinel ──────────────────────────────────────────────────────────
     if (fname.endsWith(".sentinel")) {
       const pname = fname.replace(".sentinel","");
-      modules.push({id:`sentinel.${pname}`, name:pname, source:"sentinel", shortSrc:"policy", version:null, srcType:"sentinel", body:"", file:path});
+      modules.push({id:`sentinel.${pname}`, name:pname, source:"sentinel", shortSrc:"policy", version:null, srcType:"sentinel", body:"", file:path, paveLayer});
     }
   });
 
-  // Dedup
+  // ── Dedup ─────────────────────────────────────────────────────────────
   const seenR=new Set(), seenM=new Set(), seenC=new Set();
   const uResources = resources.filter(r=>{if(seenR.has(r.id))return false;seenR.add(r.id);return true;});
   const uModules = modules.filter(m=>{if(seenM.has(m.id))return false;seenM.add(m.id);return true;});
@@ -1282,7 +1320,16 @@ function parseTFMultiFile(files) {
     seenC.add(k);return true;
   });
 
-  return {resources:uResources, modules:uModules, connections:uConns, outputs, variables, remoteStates};
+  // ── Pave-layer summary ────────────────────────────────────────────────
+  const paveLayers = {};
+  [...uResources,...uModules].forEach(r => {
+    if (r.paveLayer) { paveLayers[r.paveLayer] = (paveLayers[r.paveLayer]||0)+1; }
+  });
+
+  // ── Unpinned registry modules (supply chain signal) ───────────────────
+  const unpinnedModules = uModules.filter(m => m.srcType === "registry" && m.pinned === "unpinned");
+
+  return {resources:uResources, modules:uModules, connections:uConns, outputs, variables, remoteStates, paveLayers, unpinnedModules, outputIndex};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1501,8 +1548,8 @@ function generateDFDXml(resources, modules, connections) {
 
   const legendCells=buildLegendCells(totalW+40, CPAD);
   const allCells=[...containers,...edges,...vertices,...legendCells];
-  // Return bare <mxGraphModel> as root — compatible with BOTH draw.io (File→Import) AND Lucidchart (File→Import draw.io).
-  // The <mxfile> wrapper is added only when saving as .drawio (see download function).
+  // Return bare <mxGraphModel> — wrapped in <mxfile compressed="false"> when downloading/copying.
+  // Lucidchart requires the full <mxfile> wrapper with compressed="false"; file upload only (no paste-XML dialog).
   return [
     `<mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}" math="0" shadow="0">`,
     `  <root>`,
@@ -2518,13 +2565,242 @@ function buildStrideLMByTier(tierGroups) {
   return result;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// KNOWLEDGE BASE CONTEXT MINING
+// Extracts structured signals from userDocs content to augment the threat model.
+// Returns a docContext object that generateAnalysis injects as additional signals.
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-doc role classifier: identifies what role each document plays in the architecture
+function classifyDoc(doc) {
+  const name = (doc.name || "").toLowerCase();
+  const ext  = name.split(".").pop();
+  const text = (doc.content || "").toLowerCase().substring(0, 8000); // first 8KB for classification
+
+  const roles = [];
+
+  // Classify by filename patterns
+  if (/readme|overview|architecture|design|hld|lld|adr/.test(name))       roles.push("architecture-doc");
+  if (/runbook|playbook|incident|ops|operation/.test(name))                roles.push("runbook");
+  if (/security|threat|risk|pentest|vuln|cve/.test(name))                 roles.push("security-doc");
+  if (/pipeline|ci|cd|deploy|release|workflow/.test(name))                roles.push("pipeline-doc");
+  if (/iam|policy|role|permission|access|rbac/.test(name))                roles.push("iam-doc");
+  if (/network|vpc|subnet|routing|firewall|sg/.test(name))                roles.push("network-doc");
+  if (/database|rds|dynamo|redis|aurora|db/.test(name))                   roles.push("database-doc");
+  if (/monitor|alarm|alert|cloudwatch|grafana|datadog/.test(name))        roles.push("monitoring-doc");
+  if (/compliance|fedramp|hipaa|pci|soc|iso|nist/.test(name))            roles.push("compliance-doc");
+  if (/tfvars|variables|vars/.test(name) || ext === "tfvars")             roles.push("tf-variables");
+  if (/output|export|interface/.test(name))                               roles.push("tf-outputs");
+  if (ext === "json" && /policy|trust|assume/.test(name))                 roles.push("iam-policy-json");
+  if (ext === "yaml" || ext === "yml") {
+    if (/github|workflow|action/.test(name))                              roles.push("github-actions");
+    else if (/jenkins|pipeline/.test(name))                               roles.push("jenkinsfile");
+    else if (/k8s|kube|deploy|service|ingress/.test(name))               roles.push("k8s-manifest");
+    else                                                                   roles.push("yaml-config");
+  }
+  if (ext === "json") {
+    if (/package/.test(name))                                              roles.push("npm-package");
+    else                                                                   roles.push("json-config");
+  }
+  if (ext === "md" || ext === "txt")                                       roles.push("documentation");
+  if (ext === "pdf")                                                        roles.push("documentation");
+  if (ext === "py")                                                         roles.push("python-script");
+  if (ext === "sh" || ext === "bash")                                       roles.push("shell-script");
+  if (ext === "groovy" || name === "jenkinsfile")                           roles.push("jenkinsfile");
+  if (ext === "tf" || ext === "hcl")                                        roles.push("terraform");
+  if (ext === "sentinel")                                                   roles.push("sentinel-policy");
+
+  // Classify by content if no strong filename signal
+  if (!roles.length) {
+    if (/resource\s+"aws_|resource\s+"xsphere_/.test(text))              roles.push("terraform");
+    if (/pipeline\s*\{|stage\s*\{|steps\s*\{/.test(text))               roles.push("pipeline-doc");
+    if (/apiversion:|kind:\s*(deployment|service|ingress)/i.test(text))  roles.push("k8s-manifest");
+    if (/Statement.*Action.*Effect/i.test(text))                         roles.push("iam-policy-json");
+    if (roles.length === 0)                                               roles.push("general-doc");
+  }
+
+  // Determine architecture tier the doc belongs to
+  let archTier = "Unknown";
+  if (/\bl0\b|org\s+layer|management\s+account|control\s+tower|scp\b/.test(text))  archTier = "L0 Org/Management";
+  else if (/\bl1\b|account\s+vend|aft|account\s+factory/.test(text))               archTier = "L1 Account Vending";
+  else if (/\bl2\b|account\s+pave|baseline|guardduty|cloudtrail/.test(text))       archTier = "L2 Account Pave";
+  else if (/\bl3\b|product\s+pave|transit\s+gateway|shared\s+vpc/.test(text))      archTier = "L3 Product Pave";
+  else if (/\bl4\b|service\s+layer|workload|application/.test(text))                archTier = "L4 Service";
+  else if (/ci\/?cd|pipeline|deploy|build|release/.test(text))                      archTier = "CI/CD";
+  else if (/iam|role|policy|permission|assume/.test(text))                           archTier = "IAM/Security";
+  else if (/vpc|subnet|security.group|network|routing/.test(text))                  archTier = "Network";
+  else if (/rds|dynamo|s3|aurora|database|storage/.test(text))                      archTier = "Storage";
+  else if (/kubernetes|eks|lambda|ecs|fargate|compute/.test(text))                  archTier = "Compute";
+
+  return { roles: roles.length ? roles : ["general-doc"], archTier, ext };
+}
+
+function buildContextFromDocs(userDocs) {
+  if (!userDocs || !userDocs.length) return { signals: [], mentions: {}, compliance: [], paveHints: [], docInventory: [] };
+
+  const validDocs = userDocs.filter(d => d.content && !d.binary);
+  const allText = validDocs.map(d => d.content).join("\n");
+  const lower = allText.toLowerCase();
+
+  // ── Per-document classification & inventory ────────────────────────────
+  const docInventory = validDocs.map(d => {
+    const info = classifyDoc(d);
+    return { name: d.name, path: d.path, size: d.size, ...info };
+  });
+
+  const signals = [];
+  const mentions = {};
+
+  // ── Tool / platform detection ──────────────────────────────────────────
+  const TOOLS = [
+    { key:"spinnaker",    label:"Spinnaker",      sev:"MEDIUM", msg:"Spinnaker CD pipeline referenced in context docs",
+      detail:"Spinnaker manages deploy pipelines with broad AWS permissions. Verify the Spinnaker service account role is scoped per-application, not account-wide. Terraspin modules and stage-level IAM bindings should follow least-privilege." },
+    { key:"jenkins",      label:"Jenkins",        sev:"MEDIUM", msg:"Jenkins CI referenced in context docs",
+      detail:"Jenkins build agents often run with IAM roles that can trigger Terraform plan/apply. Ensure ephemeral agent instances use narrow IAM roles, OIDC-based credential injection (Vault or AWS Assume Role via OIDC), and that credentials are never stored in build logs or artifact archives." },
+    { key:"vault",        label:"HashiCorp Vault", sev:"LOW",   msg:"Vault secrets engine referenced in context docs",
+      detail:"Vault dynamic secrets reduce long-lived credential exposure. Verify the Vault AWS secrets engine role has minimum permissions, lease TTL is short (≤1h), and audit logging is enabled. Vault token orphan leakage is a common lateral movement vector." },
+    { key:"xsphere",      label:"xSphere",        sev:"MEDIUM", msg:"xSphere private cloud referenced in context docs",
+      detail:"xSphere ↔ AWS hybrid connectivity (Direct Connect or VPN) creates a trust boundary between on-prem and cloud. Verify the Direct Connect virtual interface is private (not public), BGP authentication is enabled, and cross-environment IAM roles enforce ExternalId or session conditions." },
+    { key:"terragrunt",   label:"Terragrunt",      sev:"LOW",   msg:"Terragrunt orchestration referenced in context docs",
+      detail:"Terragrunt introduces implicit run_all dependency ordering. Verify that remote_state blocks use encrypted S3 and DynamoDB locking. Circular dependencies in terragrunt.hcl dependency graphs can cause state corruption." },
+    { key:"atlantis",     label:"Atlantis",        sev:"MEDIUM", msg:"Atlantis referenced in context docs",
+      detail:"Atlantis runs terraform plan/apply from PR comments with full deployment IAM permissions. Ensure only authorized repos trigger Atlantis, plan output is not written to PR comments (credential leak risk), and the server token is rotated regularly." },
+    { key:"argo",         label:"Argo CD/Workflow", sev:"MEDIUM", msg:"Argo CD or Argo Workflows referenced in context docs",
+      detail:"Argo Workflows can execute arbitrary code in pods. Verify workflow service accounts use the minimum RBAC permissions, workflow templates enforce parameter validation, and artifact storage (S3/MinIO) is encrypted and access-controlled." },
+    { key:"datadog",      label:"Datadog",         sev:"LOW",   msg:"Datadog monitoring referenced in context docs",
+      detail:"Datadog agents use API keys that provide read access to metrics and traces — treat as sensitive credentials. Verify API keys are stored in Secrets Manager (not Lambda env vars or plaintext tfvars), and the Datadog IAM integration role has only required permissions." },
+    { key:"new relic",    label:"New Relic",        sev:"LOW",   msg:"New Relic referenced in context docs",
+      detail:"New Relic license keys and ingest keys are long-lived credentials. Rotate via Secrets Manager, restrict network policy to allow only New Relic ingest endpoints, and audit which services are exporting traces." },
+    { key:"pagerduty",    label:"PagerDuty",        sev:"LOW",   msg:"PagerDuty referenced in context docs",
+      detail:"PagerDuty integrations expose service API keys in Terraform. Ensure these keys are managed via Secrets Manager or SSM SecureString, not committed to tfvars or state." },
+    { key:"okta",         label:"Okta",             sev:"MEDIUM", msg:"Okta identity provider referenced in context docs",
+      detail:"Okta as the OIDC/SAML IdP is a high-value target — a compromised Okta account enables SSO bypass into all federated services. Verify MFA enforcement, admin role segregation, and that AWS OIDC trust policies enforce sub-claim conditions matching expected Okta groups." },
+    { key:"kubernetes",   label:"Kubernetes",       sev:"MEDIUM", msg:"Kubernetes/EKS referenced in context docs",
+      detail:"Kubernetes RBAC and IAM must be co-designed. Verify pods use IRSA (IAM Roles for Service Accounts), node instance profiles are minimal, and Network Policies restrict pod-to-pod lateral movement." },
+    { key:"wiz",          label:"Wiz CSPM",          sev:"LOW",   msg:"Wiz cloud security posture referenced in context docs",
+      detail:"Wiz reads cloud configuration via a cross-account role. Verify the Wiz role has ReadOnly permissions only, ExternalId is required in the trust policy, and the scanner role cannot write to S3 or KMS." },
+    { key:"checkov",      label:"Checkov",           sev:"LOW",   msg:"Checkov static analysis referenced in context docs",
+      detail:"Checkov findings in docs indicate a known policy baseline. Cross-reference Threataform findings with Checkov suppressions to identify intentionally suppressed controls that may require compensating control documentation." },
+    { key:"tfe\|terraform enterprise\|terraform cloud", label:"TFE/Terraform Cloud", sev:"MEDIUM", msg:"Terraform Enterprise/Cloud referenced in context docs",
+      detail:"TFE workspaces with 'remote' execution mode run plans/applies with organization-scoped tokens. Verify workspace variable sets scope secrets correctly, run triggers are restricted to authorized VCS branches, and audit logs capture all apply events." },
+    { key:"github action",label:"GitHub Actions",  sev:"MEDIUM", msg:"GitHub Actions CI/CD referenced in context docs",
+      detail:"GitHub Actions OIDC federation eliminates static IAM keys. Verify the assume-role trust policy restricts sub-claim to specific repositories and branches (not *), token expiry is ≤1h, and GITHUB_TOKEN permissions are minimal." },
+  ];
+
+  TOOLS.forEach(t => {
+    const re = new RegExp(`(?:${t.key})`, "i");
+    if (re.test(lower)) {
+      mentions[t.label] = true;
+      signals.push({ sev: t.sev, msg: t.msg, detail: t.detail, src: "context-doc" });
+    }
+  });
+
+  // ── Compliance frameworks ──────────────────────────────────────────────
+  const COMPLIANCE = [
+    { key:/fedramp/i,         label:"FedRAMP",         req:"Requires FIPS 140-2 encryption, continuous monitoring, POA&M tracking, and strict access controls. All TF resources must align with FedRAMP High/Moderate control baseline." },
+    { key:/hipaa/i,           label:"HIPAA",           req:"PHI must be encrypted at rest (AES-256) and in transit (TLS 1.2+). Audit logging required for all PHI access. Verify CloudTrail data events on S3 buckets and RDS." },
+    { key:/pci.?dss/i,        label:"PCI-DSS",         req:"CHD environments require network segmentation, encryption, vulnerability scanning, and MFA for admin access. Terraform state files may contain connection strings — treat as in-scope." },
+    { key:/soc\s*2/i,         label:"SOC 2",           req:"Availability, confidentiality, and security controls required. Verify CloudTrail, Config, and GuardDuty are enabled. Change management must be enforced (no manual AWS console changes)." },
+    { key:/iso.?27001/i,      label:"ISO 27001",       req:"ISMS controls require risk register, access control policy, and incident response. Terraform configurations must be version-controlled and reviewed before apply." },
+    { key:/cis.?aws/i,        label:"CIS AWS Benchmark",req:"Verify CIS Level 1 & 2 controls: MFA on root, CloudTrail multi-region, S3 block public access, KMS key rotation, VPC flow logs, and no access keys on root." },
+    { key:/nist\s*800/i,      label:"NIST 800-53",     req:"NIST SP 800-53 controls require IA-5 credential management, AU-2 audit events, SC-8 transmission confidentiality, and AC-6 least privilege for all IAM roles." },
+  ];
+  const complianceDetected = [];
+  COMPLIANCE.forEach(c => {
+    if (c.key.test(allText)) {
+      complianceDetected.push(c.label);
+      signals.push({
+        sev: "MEDIUM", src: "context-doc",
+        msg: `${c.label} compliance context detected in documentation`,
+        detail: c.req
+      });
+    }
+  });
+
+  // ── Architecture patterns ──────────────────────────────────────────────
+  if (/hub.?and.?spoke|hub-spoke|transit\s+gateway/i.test(allText))
+    signals.push({ sev:"LOW", src:"context-doc", msg:"Hub-and-spoke network topology detected in docs",
+      detail:"Transit Gateway hub-and-spoke topologies concentrate cross-VPC traffic at a single routing point. Ensure TGW route tables are segmented (shared services VPC ≠ workload VPCs), VPC attachment policies restrict lateral east-west traffic, and RAM shares are scoped by OU." });
+
+  if (/blue.?green|canary\s+deploy|rolling\s+deploy/i.test(allText))
+    signals.push({ sev:"LOW", src:"context-doc", msg:"Advanced deployment strategy referenced in docs (blue-green/canary)",
+      detail:"Blue-green and canary deployments require dual-environment IAM permissions and temp resource coexistence. Verify the deployment role cannot modify production state during canary phase, and that load balancer listener rules enforce traffic weight limits." });
+
+  if (/multi.?account|landing\s+zone|control\s+tower/i.test(allText))
+    signals.push({ sev:"MEDIUM", src:"context-doc", msg:"Multi-account / landing zone architecture referenced in docs",
+      detail:"Multi-account architectures require SCP guardrails at the OU level, cross-account IAM roles with ExternalId, and centralized logging aggregation. Verify the log archive account is isolated (no workload resources) and management account access is restricted to break-glass scenarios." });
+
+  // ── Per-doc-type deep analysis signals ────────────────────────────────
+  const k8sManifests = docInventory.filter(d => d.roles.includes("k8s-manifest"));
+  if (k8sManifests.length)
+    signals.push({ sev:"MEDIUM", src:"context-doc", msg:`${k8sManifests.length} Kubernetes manifest(s) in context docs`,
+      detail:`Kubernetes manifests detected (${k8sManifests.map(d=>d.name).slice(0,3).join(", ")}). These define workload identities and network exposure. Verify: (1) ServiceAccounts do not use default SA tokens — use projected volumes with bounded TTL; (2) Ingress resources have TLS termination and no wildcard hosts; (3) Pods run as non-root with readOnlyRootFilesystem; (4) NetworkPolicy resources restrict pod-to-pod traffic; (5) RBAC ClusterRoleBindings are not bound to 'system:anonymous'.` });
+
+  const ghActions = docInventory.filter(d => d.roles.includes("github-actions"));
+  if (ghActions.length)
+    signals.push({ sev:"MEDIUM", src:"context-doc", msg:`${ghActions.length} GitHub Actions workflow(s) detected`,
+      detail:`GitHub Actions workflows (${ghActions.map(d=>d.name).slice(0,3).join(", ")}) define CI/CD pipelines that interact with AWS. Verify: OIDC federation is used instead of static access keys; the aws-actions/configure-aws-credentials action specifies role-session-name; branch protection rules prevent unapproved PRs from triggering deploy workflows; secrets are stored in GitHub Encrypted Secrets, not env: blocks.` });
+
+  const jenkinsfiles = docInventory.filter(d => d.roles.includes("jenkinsfile"));
+  if (jenkinsfiles.length)
+    signals.push({ sev:"MEDIUM", src:"context-doc", msg:`${jenkinsfiles.length} Jenkinsfile/Groovy pipeline(s) detected`,
+      detail:`Jenkins pipeline definitions (${jenkinsfiles.map(d=>d.name).slice(0,3).join(", ")}) define deployment automation. Verify: credentials() binding is used (never hardcoded); ephemeral agents run in isolated pods/VMs; withCredentials blocks limit secret scope; pipeline scripts are approved in Jenkins Script Security; no sh steps that echo credentials.` });
+
+  const iamJsons = docInventory.filter(d => d.roles.includes("iam-policy-json"));
+  if (iamJsons.length) {
+    const hasStar = iamJsons.some(d => /"Action"\s*:\s*"\*"/.test(d.content || ""));
+    signals.push({ sev: hasStar ? "CRITICAL" : "MEDIUM", src:"context-doc",
+      msg:`${iamJsons.length} IAM policy JSON doc(s) in context${hasStar ? " — wildcard Action:* detected" : ""}`,
+      detail:`IAM policy documents (${iamJsons.map(d=>d.name).slice(0,3).join(", ")}) define permission boundaries. ${hasStar ? "CRITICAL: Action:* found in a standalone IAM policy JSON — this grants full control over all services. Restrict to minimum required actions." : "Review each policy statement for overly broad Action/Resource combinations. Apply least-privilege. Ensure Deny statements use StringEquals conditions, not StringLike with wildcards."}`});
+  }
+
+  const shellScripts = docInventory.filter(d => d.roles.includes("shell-script"));
+  if (shellScripts.length)
+    signals.push({ sev:"LOW", src:"context-doc", msg:`${shellScripts.length} shell script(s) in context docs`,
+      detail:`Shell scripts (${shellScripts.map(d=>d.name).slice(0,3).join(", ")}) may embed AWS CLI calls, credential exports, or terraform commands. Review for: hardcoded credentials (export AWS_ACCESS_KEY_ID), curl | bash patterns, set +e that suppresses error handling, and unquoted variable expansion enabling injection.` });
+
+  const tfVarDocs = docInventory.filter(d => d.roles.includes("tf-variables"));
+  if (tfVarDocs.length) {
+    const hasCreds = tfVarDocs.some(d => /password\s*=|secret\s*=|access_key\s*=|private_key\s*=/i.test(d.content || ""));
+    if (hasCreds)
+      signals.push({ sev:"HIGH", src:"context-doc", msg:"tfvars file(s) may contain plaintext credentials",
+        detail:`Context document tfvars files (${tfVarDocs.map(d=>d.name).slice(0,3).join(", ")}) appear to contain credential-like variable assignments. tfvars files should NEVER contain real secrets. Use -var-file with encrypted vault injection, or reference Secrets Manager ARNs as variable values. Ensure these files are in .gitignore.` });
+  }
+
+  const yamlConfigs = docInventory.filter(d => d.roles.includes("yaml-config"));
+  if (yamlConfigs.length)
+    signals.push({ sev:"LOW", src:"context-doc", msg:`${yamlConfigs.length} YAML config file(s) provide additional architecture context`,
+      detail:`YAML configuration files (${yamlConfigs.map(d=>d.name).slice(0,3).join(", ")}) may define service configuration, environment variables, or infrastructure parameters. Review for hardcoded endpoints, unencrypted database connection strings, or service discovery patterns that bypass IAM.` });
+
+  // ── Sensitive pattern warnings (any file type) ────────────────────────
+  const credDocs = validDocs.filter(d =>
+    /(?:password|secret_key|access_key|private_key|api_key|client_secret|AKIA[A-Z0-9]{16})\s*[=:]/i.test(d.content || ""));
+  if (credDocs.length)
+    signals.push({ sev:"HIGH", src:"context-doc", msg:`Potential credentials found in ${credDocs.length} context doc(s): ${credDocs.map(d=>d.name).slice(0,3).join(", ")}`,
+      detail:"Context documents contain patterns matching credentials (password=, access_key=, AKIA...). These files must not be committed to version control. Use Vault, AWS Secrets Manager, or SSM SecureString. Rotate any keys that may have been exposed." });
+
+  // ── Pave-layer hints from doc text ────────────────────────────────────
+  const paveHints = [];
+  if (/\bl0\b|org\s+layer|management\s+account|control\s+tower/i.test(allText)) paveHints.push("L0");
+  if (/\bl1\b|account\s+vend|aft|account\s+factory/i.test(allText)) paveHints.push("L1");
+  if (/\bl2\b|account\s+pave|baseline\s+account/i.test(allText)) paveHints.push("L2");
+  if (/\bl3\b|product\s+pave|platform\s+team|shared\s+service/i.test(allText)) paveHints.push("L3");
+  if (/\bl4\b|service\s+layer|workload|application\s+team/i.test(allText)) paveHints.push("L4");
+
+  return { signals, mentions, compliance: complianceDetected, paveHints, docInventory };
+}
+
 function generateAnalysis(pr, allFiles, userDocs, scopeFilePaths = null) {
-  const allResources = pr?.resources    || [];
-  const modules      = pr?.modules      || [];
-  const connections  = pr?.connections  || [];
-  const outputs      = pr?.outputs      || [];
-  const variables    = pr?.variables    || [];
-  const remoteStates = pr?.remoteStates || [];
+  const allResources   = pr?.resources      || [];
+  const modules        = pr?.modules        || [];
+  const connections    = pr?.connections    || [];
+  const outputs        = pr?.outputs        || [];
+  const variables      = pr?.variables      || [];
+  const remoteStates   = pr?.remoteStates   || [];
+  const paveLayers     = pr?.paveLayers     || {};
+  const unpinnedMods   = pr?.unpinnedModules|| [];
+
+  // ── Mine knowledge from context documents ─────────────────────────────
+  const docContext = buildContextFromDocs(userDocs);
 
   // ── Scope filtering ───────────────────────────────────────────────────────
   // null = all in scope; new Set() = none; Set([...]) = subset
@@ -2642,6 +2918,46 @@ function generateAnalysis(pr, allFiles, userDocs, scopeFilePaths = null) {
   if (outputs.length)
     signals.push({ sev:"LOW", msg:`${outputs.length} output(s) — potential sensitive data exposure`, detail:"Mark sensitive=true for credentials, keys, and connection strings to prevent leakage into downstream state." });
 
+  // ── Pave-layer signals (from file path detection) ─────────────────────
+  const paveLayerKeys = Object.keys(paveLayers);
+  if (paveLayerKeys.length > 0) {
+    const layerList = paveLayerKeys.sort().join(", ");
+    signals.push({ sev:"MEDIUM", msg:`TFE-Pave layer(s) detected from file paths: ${layerList}`,
+      detail:`File path analysis detected resources at pave layer(s): ${layerList}. The TFE-Pave pattern enforces layered IAM delegation — L0 (Org/SCPs) → L1 (Account Vending/AFT) → L2 (Account Pave/baseline) → L3 (Product Pave/shared platform) → L4 (Service/workload). Every cross-layer IAM trust must be bounded by permission boundaries defined at the parent layer. Resources from higher layers (L0/L1) must never be directly modified by lower-layer pipelines.` });
+    // Per-layer specifics
+    if (paveLayers.L0) signals.push({ sev:"HIGH", msg:"L0 Org/Management Terraform code detected — highest privilege layer",
+      detail:"L0 Terraform manages SCPs, Control Tower, and OU structure. This code has the highest blast radius of any layer — a misconfigured SCP or OU policy affects all member accounts. Apply changes only via a locked-down pipeline with required human approval, MFA-enforced IAM user, and no console access. State file for L0 must be in a dedicated isolated S3 bucket." });
+    if (paveLayers.L1) signals.push({ sev:"HIGH", msg:"L1 Account Vending (AFT) code detected",
+      detail:"L1 AFT (Account Factory for Terraform) provisions new AWS accounts and bootstraps them with permission boundaries and initial roles. Ensure AFT customizations do not grant iam:CreateRole without permission_boundary, and the AFT pipeline role cannot assume roles in any account it has not explicitly created." });
+    if (paveLayers.L2) signals.push({ sev:"MEDIUM", msg:"L2 Account Pave code detected — baseline controls layer",
+      detail:"L2 establishes per-account security baselines: CloudTrail, GuardDuty, Config, and permission boundaries. Verify all L2 resources are deployed before any L3/L4 workload resources, and that the pave role is restricted from modifying its own permission boundaries." });
+    if (paveLayers.L3) signals.push({ sev:"MEDIUM", msg:"L3 Product Pave code detected — shared platform services",
+      detail:"L3 provides shared VPC, Transit Gateway, and the ProductTeamDeployer role used by L4 service teams. Verify the ProductTeamDeployer role has a permission boundary preventing privilege escalation beyond the product account, and that TGW route tables isolate product accounts from each other." });
+    if (paveLayers.L4) signals.push({ sev:"LOW", msg:"L4 Service/workload code detected — application layer",
+      detail:"L4 service code deploys application workloads under the ProductTeamDeployer role, which is bounded by L3 permission boundaries and L0/L1 SCPs. Verify service roles use inline or managed policies that do not exceed the ProductTeamDeployer boundary, and that state files do not contain cross-layer sensitive outputs." });
+  }
+
+  // ── Unpinned registry module supply chain signals ─────────────────────
+  if (unpinnedMods.length > 0)
+    signals.push({ sev:"HIGH", msg:`${unpinnedMods.length} Terraform registry module(s) lack version constraints`,
+      detail:`Unpinned modules (no version = "x.y.z"): ${unpinnedMods.map(m=>m.name).slice(0,5).join(", ")}. Without version pinning, a registry module can be updated to a malicious version that injects unauthorized resources or IAM permissions on the next terraform init. Pin all registry modules to exact versions and vendor them to a private registry.` });
+
+  // ── Module output / data-ref connection counts ────────────────────────
+  const modOutCount = connections.filter(c=>c.kind==="module-output").length;
+  const dataRefCount = connections.filter(c=>c.kind==="data-ref").length;
+  if (modOutCount > 0)
+    signals.push({ sev:"LOW", msg:`${modOutCount} module output reference(s) detected`,
+      detail:"Resources consuming module outputs create implicit data flow dependencies. If the upstream module changes its output structure, consuming resources may receive unexpected values. Use explicit output validation and type constraints in module definitions." });
+  if (dataRefCount > 0)
+    signals.push({ sev:"LOW", msg:`${dataRefCount} data source reference(s) detected`,
+      detail:"Data sources read live cloud state into Terraform. Misconfigured data source filters (e.g., reading the wrong AMI or security group) can silently inject wrong resource attributes. Verify all data source filters are sufficiently specific." });
+
+  // ── Inject document context signals ───────────────────────────────────
+  docContext.signals.forEach(s => signals.push(s));
+
+  // ── Pave-layer hints from docs augment narrative ───────────────────────
+  const allPaveLayers = new Set([...paveLayerKeys, ...docContext.paveHints]);
+
   const tierList = Object.entries(tierGroups).filter(([k])=>k!=="_default")
     .map(([k,v])=>`${TIERS[k]?.label||k} (${v.length})`).join(", ");
 
@@ -2679,23 +2995,32 @@ function generateAnalysis(pr, allFiles, userDocs, scopeFilePaths = null) {
     }
   });
 
+  const docSignalCount = docContext.signals.length;
+  const toolMentions = Object.keys(docContext.mentions);
   const execSummary =
-    `Threataform analyzed ${allFiles.length} file(s) containing ${resources.length} managed resource(s), ` +
-    `${modules.length} module(s), and ${connections.length} connection(s). ` +
-    (tierList ? `Resources span the following infrastructure tiers: ${tierList}. ` : "") +
-    `Data flows include ${connCounts.implicit} implicit reference(s), ${connCounts.explicit} explicit depends_on(s), ` +
-    `and ${connCounts["module-input"]} module input/output(s). ` +
-    (remoteStates.length ? `${remoteStates.length} remote state backend(s) introduce cross-stack dependencies. ` : "") +
+    `Threataform analyzed ${allFiles.length} Terraform file(s)${userDocs.length ? ` + ${userDocs.length} context document(s)` : ""} ` +
+    `containing ${resources.length} managed resource(s), ${modules.length} module(s), and ${connections.length} connection(s). ` +
+    (tierList ? `Resources span tiers: ${tierList}. ` : "") +
+    (paveLayerKeys.length ? `TFE-Pave layers detected: ${paveLayerKeys.sort().join(", ")}. ` : "") +
+    `Data flows: ${connCounts.implicit} implicit, ${connCounts.explicit} explicit depends_on, ` +
+    `${connCounts["module-input"]} module input${modOutCount ? `, ${modOutCount} module output` : ""}${dataRefCount ? `, ${dataRefCount} data source` : ""}. ` +
+    (remoteStates.length ? `${remoteStates.length} remote state backend(s). ` : "") +
     `Security scan: ${critCount} CRITICAL, ${highCount} HIGH, ` +
     `${secFindings.filter(f=>f.sev==="MEDIUM").length} MEDIUM, ${secFindings.filter(f=>f.sev==="LOW").length} LOW finding(s). ` +
-    `${trustBoundaries.length} trust boundary/boundaries identified. ` +
-    `${signals.filter(s=>s.sev==="HIGH").length} HIGH, ${signals.filter(s=>s.sev==="MEDIUM").length} MEDIUM, and ` +
-    `${signals.filter(s=>s.sev==="LOW").length} LOW architecture signal(s). ` +
-    `${strideLM.length} tier(s) mapped with STRIDE-LM threat analysis.`;
+    `${trustBoundaries.length} trust boundary/boundaries. ` +
+    (toolMentions.length ? `Tools/platforms detected in context docs: ${toolMentions.slice(0,6).join(", ")}. ` : "") +
+    (docContext.compliance.length ? `Compliance frameworks: ${docContext.compliance.join(", ")}. ` : "") +
+    `${signals.filter(s=>s.sev==="HIGH").length} HIGH, ${signals.filter(s=>s.sev==="MEDIUM").length} MEDIUM, ` +
+    `${signals.filter(s=>s.sev==="LOW").length} LOW architecture signal(s)` +
+    (docSignalCount ? ` (${docSignalCount} from context docs)` : "") + `. ` +
+    `${strideLM.length} tier(s) mapped with STRIDE-LM.`;
 
   return { execSummary, tierGroups, connCounts, topR, surf, signals, modules, remoteStates,
     variables, outputs, secFindings, trustBoundaries, narrative, strideLM, attackMap, scopeInfo,
-    scale:{ resources:resources.length, modules:modules.length, connections:connections.length, files:(allFiles||[]).length },
+    docContext, paveLayers, allPaveLayers,
+    scale:{ resources:resources.length, modules:modules.length, connections:connections.length,
+            files:(allFiles||[]).length, contextDocs: (userDocs||[]).length,
+            modOutRefs: modOutCount, dataRefs: dataRefCount },
     fileNames:(allFiles||[]).map(f=>f.path), userDocs:userDocs||[], timestamp:new Date().toISOString() };
 }
 
@@ -3274,13 +3599,37 @@ function AnalysisPanel({ parseResult, files, userDocs, scopeFiles, onScopeChange
         </div>
       </Section>
 
-      {/* Supporting Documents */}
+      {/* Supporting Documents — with architecture classification */}
       {A.userDocs.length > 0 && (
-        <Section id="docs" title="Supporting Documents" color="#78909C" count={A.userDocs.length}>
-          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+        <Section id="docs" title="Context Documents & Architecture Intelligence" color="#78909C" count={A.userDocs.length}>
+          {/* Doc context summary */}
+          {A.docContext && (A.docContext.compliance.length > 0 || Object.keys(A.docContext.mentions).length > 0) && (
+            <div style={{background:C.bg, border:`1px solid ${"#78909C"}30`, borderRadius:8, padding:"12px 16px", marginBottom:14}}>
+              {A.docContext.compliance.length > 0 && (
+                <div style={{display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", marginBottom:6}}>
+                  <span style={{fontSize:11, color:C.textMuted, fontWeight:600}}>Compliance:</span>
+                  {A.docContext.compliance.map(c => (
+                    <span key={c} style={{fontSize:10, padding:"2px 8px", borderRadius:4, background:"#E65100"+"20", color:"#FF8A65", border:"1px solid #E6510030", fontWeight:600}}>{c}</span>
+                  ))}
+                </div>
+              )}
+              {Object.keys(A.docContext.mentions).length > 0 && (
+                <div style={{display:"flex", gap:6, alignItems:"center", flexWrap:"wrap"}}>
+                  <span style={{fontSize:11, color:C.textMuted, fontWeight:600}}>Platforms:</span>
+                  {Object.keys(A.docContext.mentions).slice(0,10).map(m => (
+                    <span key={m} style={{fontSize:10, padding:"2px 8px", borderRadius:4, background:"#0277BD"+"20", color:"#4FC3F7", border:"1px solid #0277BD30", fontWeight:600}}>{m}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
             {A.userDocs.map((d,i) => {
               const ext = (d.name||"").split(".").pop().toLowerCase();
               const typeMeta = DOC_TYPE_META[ext] || { label: ext.toUpperCase().slice(0,6)||"FILE", color:"#78909C" };
+              const inv = A.docContext?.docInventory?.find(di => di.name === d.name);
+              const roleLabel = inv?.roles?.[0]?.replace(/-/g," ") || "";
+              const tierLabel = inv?.archTier && inv.archTier !== "Unknown" ? inv.archTier : null;
               return (
                 <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:"9px 13px", display:"flex", gap:10, alignItems:"flex-start" }}>
                   <span style={{
@@ -3288,19 +3637,34 @@ function AnalysisPanel({ parseResult, files, userDocs, scopeFiles, onScopeChange
                     background:`${typeMeta.color}15`, border:`1px solid ${typeMeta.color}33`,
                     borderRadius:4, padding:"2px 6px", flexShrink:0, marginTop:1
                   }}>{typeMeta.label}</span>
-                  <div style={{minWidth:0}}>
-                    <div style={{ fontSize:12, color:"#90A4AE", fontWeight:600, marginBottom:3,
-                      overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                      {d.path || d.name}
+                  <div style={{minWidth:0, flex:1}}>
+                    <div style={{display:"flex", alignItems:"center", gap:7, marginBottom:3, flexWrap:"wrap"}}>
+                      <span style={{ fontSize:12, color:"#90A4AE", fontWeight:600,
+                        overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                        {d.path || d.name}
+                      </span>
+                      {tierLabel && (
+                        <span style={{fontSize:9, padding:"1px 6px", borderRadius:3, fontWeight:700, flexShrink:0,
+                          background:"#2E7D32"+"25", color:"#81C784", border:"1px solid #2E7D3240"}}>
+                          {tierLabel}
+                        </span>
+                      )}
+                      {roleLabel && (
+                        <span style={{fontSize:9, padding:"1px 6px", borderRadius:3, fontWeight:600, flexShrink:0,
+                          background:"#78909C"+"20", color:C.textMuted, border:`1px solid ${"#78909C"}30`}}>
+                          {roleLabel}
+                        </span>
+                      )}
                     </div>
-                    {!d.binary && (
+                    {!d.binary && d.content && (
                       <div style={{ fontSize:10, color:C.textMuted, ...MONO, whiteSpace:"pre-wrap",
-                        maxHeight:60, overflow:"hidden", lineHeight:1.5 }}>
-                        {(d.content||"").substring(0,300)}{(d.content||"").length>300?"…":""}
+                        maxHeight:52, overflow:"hidden", lineHeight:1.5 }}>
+                        {d.content.substring(0,280)}{d.content.length>280?"…":""}
                       </div>
                     )}
-                    {d.binary && <div style={{fontSize:10, color:C.textMuted, fontStyle:"italic"}}>binary file</div>}
+                    {d.binary && <div style={{fontSize:10, color:C.textMuted, fontStyle:"italic"}}>binary file — content not analyzed</div>}
                   </div>
+                  {d.size && <span style={{fontSize:10, color:C.textMuted, flexShrink:0, paddingTop:1}}>{d.size < 1024 ? d.size+"B" : Math.round(d.size/1024)+"K"}</span>}
                 </div>
               );
             })}
@@ -3405,9 +3769,12 @@ export default function App() {
     try { const s = localStorage.getItem("tf-intel-user-docs"); return s ? JSON.parse(s) : []; }
     catch { return []; }
   });
-  const saveUserDocs = useCallback((docs) => {
-    setUserDocs(docs);
-    try { localStorage.setItem("tf-intel-user-docs", JSON.stringify(docs)); } catch {}
+  const saveUserDocs = useCallback((docsOrFn) => {
+    setUserDocs(prev => {
+      const next = typeof docsOrFn === "function" ? docsOrFn(prev) : docsOrFn;
+      try { localStorage.setItem("tf-intel-user-docs", JSON.stringify(next)); } catch {}
+      return next;
+    });
   }, []);
   const addUserDocs = useCallback((fileList) => {
     // Skip: images, compiled binaries, archives, lock files with no text value
@@ -3444,52 +3811,110 @@ export default function App() {
     });
   }, [userDocs, saveUserDocs]);
 
-  const readFiles = useCallback((fileList) => {
-    const tf = Array.from(fileList)
-      .filter(f=>/\.(tf|hcl|sentinel|tfvars)$/.test(f.name))
-      .sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name));
-    if (!tf.length) { setError("No .tf, .hcl, or .sentinel files found."); return; }
-    setError("");
-    Promise.all(tf.map(f=>new Promise((res,rej)=>{
-      const r=new FileReader();
-      r.onload=ev=>res({path:f.webkitRelativePath||f.name, content:ev.target.result});
-      r.onerror=()=>rej(new Error("Read failed: "+f.name));
-      r.readAsText(f);
-    }))).then(loaded=>{
-      setFiles(loaded);
-      setScopeFiles(null); // null = all files in scope by default
-      const result = parseTFMultiFile(loaded);
-      setParseResult(result);
-      if (result.resources.length > 0 || result.modules.length > 0) {
-        const x = generateDFDXml(result.resources, result.modules, result.connections);
-        setXml(x);
-        setDfdTab("stats");
-        setMainTab("analysis");
-      } else {
-        setError("No resources or modules found in uploaded files.");
-      }
-    }).catch(e=>setError(e.message));
+  // Re-run parse + DFD whenever the TF files list changes
+  const reparse = useCallback((tfFiles) => {
+    if (!tfFiles.length) { setParseResult(null); setXml(""); return; }
+    const result = parseTFMultiFile(tfFiles);
+    setParseResult(result);
+    if (result.resources.length > 0 || result.modules.length > 0) {
+      const x = generateDFDXml(result.resources, result.modules, result.connections);
+      setXml(x);
+    } else {
+      setXml("");
+    }
   }, []);
 
-  const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files); }, [readFiles]);
+  // Accept ALL file types. TF/HCL/sentinel/tfvars → files state (parsed).
+  // Everything else → userDocs (context). append=true merges instead of replacing.
+  const readFiles = useCallback((fileList, append = false) => {
+    const SKIP_BINARY = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
+    const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name);
+    const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 10*1024*1024);
+    if (!all.length) return;
+    setError("");
+
+    const tfCandidates = all.filter(isTF);
+    const ctxCandidates = all.filter(f => !isTF(f));
+
+    const readAsText = f => new Promise(res => {
+      const r = new FileReader();
+      r.onload = ev => res({ path: f.webkitRelativePath || f.name, name: f.name, content: ev.target.result || "", size: f.size });
+      r.onerror = () => res(null);
+      r.readAsText(f);
+    });
+
+    Promise.all([
+      Promise.all(tfCandidates.map(readAsText)),
+      Promise.all(ctxCandidates.map(readAsText)),
+    ]).then(([tfLoaded, ctxLoaded]) => {
+      const validTF = tfLoaded.filter(Boolean);
+      const validCtx = ctxLoaded.filter(Boolean).filter(d => !d.content.includes('\x00'));
+
+      // Merge or replace TF files
+      setFiles(prev => {
+        const existing = append ? prev : [];
+        const existPaths = new Set(existing.map(f => f.path));
+        const newTF = validTF.filter(f => !existPaths.has(f.path));
+        const merged = [...existing, ...newTF].sort((a,b) => a.path.localeCompare(b.path));
+        setScopeFiles(null);
+        reparse(merged);
+        if (merged.length > 0) setMainTab("analysis");
+        return merged;
+      });
+
+      // Auto-route non-TF files to userDocs
+      if (validCtx.length) {
+        saveUserDocs(prev => {
+          const existPaths = new Set(prev.map(d => d.path || d.name));
+          const newDocs = validCtx
+            .filter(d => !existPaths.has(d.path))
+            .map(d => ({ ...d, ext: d.name.split('.').pop().toLowerCase() }));
+          return newDocs.length ? [...prev, ...newDocs] : prev;
+        });
+      }
+    }).catch(e => setError(e.message));
+  }, [reparse, saveUserDocs]);
+
+  // Delete a single TF file and re-parse the rest
+  const removeFile = useCallback((path) => {
+    setFiles(prev => {
+      const next = prev.filter(f => f.path !== path);
+      setScopeFiles(null);
+      reparse(next);
+      if (!next.length) { setParseResult(null); setXml(""); }
+      return next;
+    });
+  }, [reparse]);
+
+  // Clear all TF files
+  const clearFiles = useCallback(() => {
+    setFiles([]);
+    setParseResult(null);
+    setXml("");
+    setScopeFiles(null);
+    setError("");
+  }, []);
+
+  const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files, true); }, [readFiles]);
   // Wrap in <mxfile> for .drawio download (draw.io app double-click open)
   const drawioXml = xml
-    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="Threataform" modified="${new Date().toISOString()}" type="device" version="21.0.0">\n  <diagram id="tf-dfd" name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
+    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="app.diagrams.net" modified="${new Date().toISOString()}" type="device" version="14.6.13" compressed="false">\n  <diagram id="tf-dfd" name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
     : "";
   const download = () => {
     const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([drawioXml],{type:"application/xml"}));
     a.download="enterprise-tf-dfd.drawio"; a.click();
   };
   const copy = () => {
+    // Copy the full mxfile XML (including <mxfile> wrapper) so users can save as .drawio and upload to Lucidchart
     const done = () => { setCopied(true); setTimeout(()=>setCopied(false),2000); };
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(xml).then(done).catch(()=>{
-        const ta=document.createElement("textarea"); ta.value=xml;
+      navigator.clipboard.writeText(drawioXml).then(done).catch(()=>{
+        const ta=document.createElement("textarea"); ta.value=drawioXml;
         document.body.appendChild(ta); ta.select(); document.execCommand("copy");
         document.body.removeChild(ta); done();
       });
     } else {
-      const ta=document.createElement("textarea"); ta.value=xml;
+      const ta=document.createElement("textarea"); ta.value=drawioXml;
       document.body.appendChild(ta); ta.select(); document.execCommand("copy");
       document.body.removeChild(ta); done();
     }
@@ -3586,7 +4011,7 @@ export default function App() {
               display:"flex", alignItems:"center", gap:6,
               transition:"all .15s",
             }}>
-              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML (Lucidchart)"}
+              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy Full XML"}
             </button>
             <button onClick={download} style={{
               background:"linear-gradient(135deg,#FF6B3520,#FF990020)",
@@ -3691,61 +4116,61 @@ export default function App() {
 
       {/* ── UPLOAD TAB ── */}
       {mainTab==="upload" && (
-        <div style={{padding:"32px 40px", maxWidth:960, height:"calc(100vh - 58px)", overflowY:"auto"}}>
+        <div style={{padding:"32px 40px", maxWidth:980, height:"calc(100vh - 58px)", overflowY:"auto"}}>
           {/* Page heading */}
-          <div style={{marginBottom:28}}>
-            <div style={{...SANS, fontSize:22, fontWeight:700, color:C.text, marginBottom:8, letterSpacing:"-.02em"}}>
-              Upload Terraform Files
+          <div style={{marginBottom:22}}>
+            <div style={{...SANS, fontSize:22, fontWeight:700, color:C.text, marginBottom:6, letterSpacing:"-.02em"}}>
+              Upload & Analyze
             </div>
-            <div style={{fontSize:14, color:C.textSub, lineHeight:1.7, maxWidth:640}}>
-              Upload any combination of .tf, .hcl, .sentinel, and .tfvars files. Cross-file references, module dependency trees, remote state links, and Sentinel policy gates are detected automatically.
+            <div style={{fontSize:13, color:C.textSub, lineHeight:1.6, maxWidth:680}}>
+              Drop any Terraform, HCL, Sentinel, JSON, YAML, docs, or any other file. TF/HCL files are parsed for resources and connections; all other files become context documents that inform the analysis.
             </div>
           </div>
 
-          {/* Drop zone */}
+          {/* Drop zone — always visible for adding more */}
           <div
             onDrop={handleDrop}
             onDragOver={e=>{e.preventDefault();setDragging(true);}}
             onDragLeave={()=>setDragging(false)}
             style={{
               border:`2px dashed ${dragging ? C.accent : C.border2}`,
-              borderRadius:14, padding:"52px 32px", textAlign:"center",
+              borderRadius:12, padding: files.length ? "24px 32px" : "48px 32px", textAlign:"center",
               background: dragging ? `${C.accent}08` : C.surface,
-              transition:"all .2s", marginBottom:20,
+              transition:"all .2s", marginBottom:16,
               boxShadow: dragging ? `0 0 24px ${C.accent}20` : "none",
             }}
           >
-            <div style={{fontSize:40, marginBottom:12, opacity:dragging?1:0.6}}>📁</div>
-            <div style={{...SANS, color:C.textSub, fontSize:15, marginBottom:6, fontWeight:500}}>
-              {dragging ? "Drop files to upload" : "Drag & drop your Terraform files here"}
+            <div style={{fontSize: files.length ? 28 : 40, marginBottom:8, opacity:dragging?1:0.6}}>
+              {dragging ? "⬇" : "📁"}
             </div>
-            <div style={{fontSize:13, color:C.textMuted, marginBottom:22}}>
-              .tf · .hcl · .sentinel · .tfvars
+            <div style={{...SANS, color:C.textSub, fontSize:14, marginBottom:4, fontWeight:500}}>
+              {dragging ? "Drop to add files" : files.length ? "Drop more files to add them" : "Drag & drop files or a folder here"}
             </div>
-            <div style={{display:"flex", gap:12, justifyContent:"center"}}>
+            <div style={{fontSize:12, color:C.textMuted, marginBottom:18}}>
+              All file types accepted · .tf .hcl .sentinel .tfvars → parsed · everything else → context docs
+            </div>
+            <div style={{display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap"}}>
               <label style={{
                 background:C.surface2, border:`1px solid ${C.border2}`,
-                borderRadius:8, padding:"10px 22px",
+                borderRadius:8, padding:"9px 20px",
                 color:C.textSub, fontSize:13, cursor:"pointer", ...SANS,
-                display:"flex", alignItems:"center", gap:8, fontWeight:500,
-                transition:"all .15s",
+                display:"flex", alignItems:"center", gap:7, fontWeight:500,
               }}>
-                <span>📄</span> Select Files
-                <input type="file" accept=".tf,.hcl,.sentinel,.tfvars" multiple
-                  onChange={e=>{if(e.target.files?.length)readFiles(e.target.files);e.target.value="";}}
+                <span>📄</span> {files.length ? "Add Files" : "Select Files"}
+                <input type="file" multiple
+                  onChange={e=>{if(e.target.files?.length)readFiles(e.target.files, files.length>0);e.target.value="";}}
                   style={{display:"none"}}/>
               </label>
               <label style={{
                 background:`linear-gradient(135deg,${C.accent}18,${C.accent}08)`,
                 border:`1px solid ${C.accent}55`,
-                borderRadius:8, padding:"10px 22px",
+                borderRadius:8, padding:"9px 20px",
                 color:C.accent, fontSize:13, cursor:"pointer", ...SANS,
-                display:"flex", alignItems:"center", gap:8, fontWeight:600,
-                transition:"all .15s",
+                display:"flex", alignItems:"center", gap:7, fontWeight:600,
               }}>
-                <span>📂</span> Select Folder
-                <input type="file" accept=".tf,.hcl,.sentinel,.tfvars" webkitdirectory=""
-                  onChange={e=>{if(e.target.files?.length)readFiles(e.target.files);e.target.value="";}}
+                <span>📂</span> {files.length ? "Add Folder" : "Select Folder"}
+                <input type="file" webkitdirectory=""
+                  onChange={e=>{if(e.target.files?.length)readFiles(e.target.files, files.length>0);e.target.value="";}}
                   style={{display:"none"}}/>
               </label>
             </div>
@@ -3753,9 +4178,9 @@ export default function App() {
 
           {error && (
             <div style={{
-              padding:"14px 18px", background:"#200808",
+              padding:"12px 16px", background:"#200808",
               border:`1px solid ${C.red}44`, borderRadius:8,
-              color:"#FF8A80", fontSize:13, marginBottom:20,
+              color:"#FF8A80", fontSize:13, marginBottom:16,
               display:"flex", gap:10, alignItems:"flex-start"
             }}>
               <span style={{fontSize:16}}>⚠</span>
@@ -3763,25 +4188,74 @@ export default function App() {
             </div>
           )}
 
-          {files.length > 0 && (
-            <div style={{
-              ...card(C.green+"44"),
-              marginBottom:20,
-            }}>
-              <div style={{...sectionBar(C.green)}}>
-                <span>✓</span>
-                <span>{files.length} file{files.length !== 1 ? "s" : ""} loaded</span>
-              </div>
-              <div style={{padding:"12px 16px", maxHeight:180, overflowY:"auto", display:"flex", flexDirection:"column", gap:4}}>
-                {files.map((f,i) => (
-                  <div key={i} style={{display:"flex", gap:10, alignItems:"center"}}>
-                    <span style={{color:C.green, fontSize:12, flexShrink:0}}>▸</span>
-                    <span style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.6}}>{f.path}</span>
+          {files.length > 0 && (() => {
+            // Group by folder prefix
+            const grouped = {};
+            files.forEach(f => {
+              const parts = f.path.split("/");
+              const folder = parts.length > 1 ? parts.slice(0,-1).join("/") : "";
+              if (!grouped[folder]) grouped[folder] = [];
+              grouped[folder].push(f);
+            });
+            const ext = f => f.path.split(".").pop().toLowerCase();
+            const extColor = e => ({tf:"#FF6B35",hcl:"#FF9900",sentinel:"#E91E63",tfvars:"#9C27B0"}[e]||C.textMuted);
+            return (
+              <div style={{...card(C.green+"33"), marginBottom:16}}>
+                <div style={{...sectionBar(C.green), justifyContent:"space-between"}}>
+                  <div style={{display:"flex", alignItems:"center", gap:8}}>
+                    <span>✓</span>
+                    <span>{files.length} Terraform file{files.length!==1?"s":""} loaded</span>
+                    {parseResult && <span style={{fontSize:11, color:C.textMuted}}>· {parseResult.resources.length} resources · {parseResult.connections.length} connections</span>}
                   </div>
-                ))}
+                  <button onClick={clearFiles} style={{
+                    background:"transparent", border:`1px solid ${C.red}44`,
+                    borderRadius:6, padding:"3px 10px", color:C.red,
+                    fontSize:11, cursor:"pointer", ...SANS
+                  }}>Clear All</button>
+                </div>
+                <div style={{padding:"10px 14px", maxHeight:320, overflowY:"auto"}}>
+                  {Object.entries(grouped).map(([folder, fls]) => (
+                    <div key={folder} style={{marginBottom: folder ? 10 : 0}}>
+                      {folder && (
+                        <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:4, paddingLeft:2, textTransform:"uppercase", letterSpacing:".06em"}}>
+                          📁 {folder}
+                        </div>
+                      )}
+                      {fls.map(f => (
+                        <div key={f.path} style={{
+                          display:"flex", gap:8, alignItems:"center", padding:"4px 6px",
+                          borderRadius:5, marginBottom:2,
+                          background:"transparent",
+                        }}
+                          onMouseEnter={e=>e.currentTarget.style.background=C.surface2}
+                          onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+                        >
+                          <span style={{
+                            fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:3,
+                            background:`${extColor(ext(f))}20`, color:extColor(ext(f)),
+                            border:`1px solid ${extColor(ext(f))}44`, flexShrink:0, minWidth:28, textAlign:"center"
+                          }}>{ext(f).toUpperCase().slice(0,6)}</span>
+                          <span style={{...MONO, fontSize:12, color:C.textSub, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                            {folder ? f.path.split("/").pop() : f.path}
+                          </span>
+                          {f.size && <span style={{fontSize:11, color:C.textMuted, flexShrink:0}}>{f.size < 1024 ? f.size+"B" : Math.round(f.size/1024)+"K"}</span>}
+                          <button onClick={()=>removeFile(f.path)} style={{
+                            background:"transparent", border:"none", color:C.textMuted,
+                            cursor:"pointer", fontSize:14, padding:"0 4px", lineHeight:1,
+                            borderRadius:4, flexShrink:0,
+                          }}
+                            onMouseEnter={e=>{ e.currentTarget.style.color=C.red; e.currentTarget.style.background=C.red+"15"; }}
+                            onMouseLeave={e=>{ e.currentTarget.style.color=C.textMuted; e.currentTarget.style.background="transparent"; }}
+                            title="Remove file"
+                          >✕</button>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {parseResult && (
             <div style={{...card(), marginBottom:20}}>
@@ -4047,13 +4521,13 @@ export default function App() {
                       ]
                     },
                     {
-                      name:"Lucidchart", color:"#FF7043", badge:"Copy XML method",
+                      name:"Lucidchart", color:"#FF7043", badge:"File upload required",
                       steps:[
-                        "Click ⎘ Copy XML (Lucidchart) — this copies the bare <mxGraphModel> format that Lucidchart requires",
-                        "In Lucidchart: File → Import → Diagrams.net → paste the copied XML into the text box",
-                        "Alternatively: Click ⬇ Export .drawio → then File → Import → Diagrams.net (.drawio) → upload the file",
-                        "If you see 'not a valid draw.io XML file' — use Copy XML (not the .drawio file) and paste into the Lucidchart text import field",
-                        "Tier swim lanes and connection arrows are preserved; node icons may render as labeled boxes",
+                        "Click ⬇ Export .drawio to download the diagram file (the file uses compressed=\"false\" for Lucidchart compatibility)",
+                        "In Lucidchart: click File → Import → select Diagrams.net (.drawio) from the list",
+                        "Upload the downloaded .drawio file — do NOT attempt to paste XML, Lucidchart has no paste-XML dialog",
+                        "Alternatively: click ⎘ Copy Full XML, paste into a text editor, save as yourfile.drawio, then import that file",
+                        "Tier swim lanes and connection arrows are preserved; node icons may render as labeled rectangles",
                       ]
                     },
                     {
