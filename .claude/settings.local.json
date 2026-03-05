@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(file /c/Users/mjrma/Downloads/threataform/*)",
+      "Bash(wc -l /c/Users/mjrma/Downloads/threataform/*.jsx)",
+      "Bash(npm install)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(where npm)",
+      "Bash(where npx)",
+      "WebFetch(domain:attack.mitre.org)",
+      "Bash(node -e \":*)",
+      "Bash(node --input-type=module --eval \":*)"
+    ]
+  }
+}
