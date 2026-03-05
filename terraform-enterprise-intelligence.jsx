@@ -1336,83 +1336,102 @@ function parseTFMultiFile(files) {
 // DFD XML GENERATOR
 // ─────────────────────────────────────────────────────────────────────────────
 const xe = s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+// xeXml: XML-escape AND encode any non-ASCII chars as decimal character references.
+// Prevents strict parsers (e.g. Lucidchart's draw.io importer) from choking on
+// UTF-8 chars like the middle-dot · (U+00B7) that appear in tier labels.
+const xeXml = s => xe(s).replace(/[^\x00-\x7F]/g, c => `&#${c.charCodeAt(0)};`);
 const NW=84, NH=60, LH=32, VGAP=12, HGAP=18, TPAD=18, TVPAD=22, HDRH=40, TGAP=60, CPAD=28;
 const MAXCOLS=6;
 const LEGEND_W=252;
 
 function buildLegendCells(lx, ly) {
-  // All cells use parent="1" with ABSOLUTE coordinates (lx+rx, ly+ry).
-  // This is required for Lucidchart compatibility — Lucidchart does not support
-  // edges or cells whose parent is a non-root container (nested parent != "1").
+  // All cells use parent="1" with ABSOLUTE coordinates.
+  // Every <mxCell> is properly nested: opening tag → child <mxGeometry/> → </mxCell>
+  // with consistent 2-space relative indentation (matching draw.io export format).
+  // NO 'triangle' shape (draw.io-only). NO 'opacity'. html=1 + whiteSpace=wrap throughout.
   const LW=LEGEND_W, LR=24, TR=20, SH=18;
   const cells=[];
   let lid=9000;
   const nid=()=>`lg_${++lid}`;
-  let ry=0; // relative y; absolute = ly+ry
+  let ry=0;
 
-  // ── Background rectangle (replaces swimlane — Lucidchart-safe) ───────────
-  const TOTAL_H = 530;
+  // vcell: generates ONE properly-nested vertex mxCell.
+  // The outer allCells.map(c=>`    ${c}`) adds 4 spaces to line 1.
+  // Interior lines use absolute indentation: 6sp for <mxGeometry>, 4sp for </mxCell>.
+  const vcell=(id,value,style,gx,gy,gw,gh)=>
+    `<mxCell id="${id}" value="${value}" style="${style}" vertex="1" parent="1">\n      <mxGeometry x="${gx}" y="${gy}" width="${gw}" height="${gh}" as="geometry"/>\n    </mxCell>`;
+
+  // ── Background + header ──────────────────────────────────────────────────
+  const TOTAL_H = 540;
   cells.push(
-    // Dark background fill
-    `<mxCell id="legend_bg" value="" style="rounded=1;arcSize=3;fillColor=#0D1117;strokeColor=#283593;strokeWidth=2;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="${TOTAL_H}" as="geometry"/></mxCell>`,
-    // Header bar
-    `<mxCell id="legend_hdr_bar" value="" style="rounded=0;fillColor=#1A237E;strokeColor=none;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="28" as="geometry"/></mxCell>`,
-    // Header text
-    `<mxCell id="legend_hdr_txt" value="Legend" style="text;html=1;align=center;fontStyle=1;fontSize=12;fontColor=#90CAF9;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly}" width="${LW}" height="28" as="geometry"/></mxCell>`
+    vcell("legend_bg",      "", "rounded=1;fillColor=#F8F9FA;strokeColor=#283593;strokeWidth=2;html=1;",                                           lx,    ly,    LW, TOTAL_H),
+    vcell("legend_hdr_bar", "", "rounded=0;fillColor=#1A237E;strokeColor=none;html=1;",                                                            lx,    ly,    LW, 28),
+    vcell("legend_hdr_txt", "Legend", "text;whiteSpace=wrap;html=1;align=center;fontStyle=1;fontSize=12;fontColor=#FFFFFF;strokeColor=none;fillColor=none;", lx, ly, LW, 28)
   );
   ry = 36;
 
   // Helper: section heading
   const hdr=(t)=>{
-    cells.push(`<mxCell id="${nid()}" value="${xe(t)}" style="text;html=1;align=left;fontStyle=1;fontSize=9;fontColor=#64B5F6;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry}" width="${LW-20}" height="16" as="geometry"/></mxCell>`);
+    cells.push(vcell(nid(), xe(t),
+      "text;whiteSpace=wrap;html=1;align=left;fontStyle=1;fontSize=9;fontColor=#1A237E;strokeColor=none;fillColor=none;",
+      lx+10, ly+ry, LW-20, 16));
     ry+=SH;
   };
 
-  // Helper: horizontal divider (plain rect, no 'line' style which Lucidchart ignores)
+  // Helper: horizontal divider line
   const div=()=>{
-    cells.push(`<mxCell id="${nid()}" value="" style="rounded=0;fillColor=#283593;strokeColor=none;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+8}" y="${ly+ry+2}" width="${LW-16}" height="1" as="geometry"/></mxCell>`);
+    cells.push(vcell(nid(), "",
+      "rounded=0;fillColor=#BBDEFB;strokeColor=none;html=1;",
+      lx+8, ly+ry+2, LW-16, 1));
     ry+=10;
   };
 
-  // Helper: node-type row (colored swatch + label, all parent="1")
+  // Helper: node-type swatch + label row
   const nodeRow=(lbl,fill,stroke,extra="")=>{
     cells.push(
-      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=6;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;${extra}resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry+3}" width="28" height="17" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+46}" y="${ly+ry+3}" width="${LW-56}" height="17" as="geometry"/></mxCell>`
+      vcell(nid(), "",
+        `rounded=1;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;${extra}html=1;`,
+        lx+10, ly+ry+3, 28, 17),
+      vcell(nid(), xe(lbl),
+        "text;whiteSpace=wrap;html=1;align=left;fontSize=9;fontColor=#37474F;strokeColor=none;fillColor=none;",
+        lx+46, ly+ry+3, LW-56, 17)
     );
     ry+=LR;
   };
 
-  // Helper: edge-type row — replaces actual mxCell edges (which break in Lucidchart when parent!="1")
-  // Uses a solid colored line rectangle + arrow-tip triangle for visual representation
+  // Helper: edge-type row — colored bar + end-cap rect + label.
+  // 'triangle' shape is draw.io-only; replaced with small filled rectangle end-cap.
   const edgeRow=(lbl,color,dashed=false)=>{
-    const lineW=60, lineH=2, arrowW=6, arrowH=8;
-    const ex=lx+10, ey=ly+ry+11;
-    // Line body
-    const lineStyle=dashed
-      ? `rounded=0;fillColor=${color};strokeColor=none;resizable=0;html=1;opacity=80;`
-      : `rounded=0;fillColor=${color};strokeColor=none;resizable=0;html=1;`;
+    const lineW=62, lineH=3, capW=5, capH=9;
+    const ex=lx+10, ey=ly+ry+12;
+    const solidStyle=`rounded=0;fillColor=${color};strokeColor=none;html=1;`;
     if(dashed){
-      // Draw as 4 short dashes
       for(let d=0;d<4;d++){
-        cells.push(`<mxCell id="${nid()}" value="" style="${lineStyle}" vertex="1" parent="1"><mxGeometry x="${ex+d*15}" y="${ey}" width="10" height="${lineH}" as="geometry"/></mxCell>`);
+        cells.push(vcell(nid(), "", solidStyle, ex+d*16, ey, 11, lineH));
       }
     } else {
-      cells.push(`<mxCell id="${nid()}" value="" style="${lineStyle}" vertex="1" parent="1"><mxGeometry x="${ex}" y="${ey}" width="${lineW}" height="${lineH}" as="geometry"/></mxCell>`);
+      cells.push(vcell(nid(), "", solidStyle, ex, ey, lineW, lineH));
     }
-    // Arrowhead (right-pointing triangle)
+    // End-cap (arrow indicator — plain rectangle, Lucidchart-safe)
     cells.push(
-      `<mxCell id="${nid()}" value="" style="triangle;direction=east;fillColor=${color};strokeColor=${color};resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${ex+lineW}" y="${ey-3}" width="${arrowW}" height="${arrowH}" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+86}" y="${ly+ry+4}" width="${LW-96}" height="16" as="geometry"/></mxCell>`
+      vcell(nid(), "", `rounded=0;fillColor=${color};strokeColor=none;html=1;`,
+        ex+lineW, ey-3, capW, capH),
+      vcell(nid(), xe(lbl),
+        "text;whiteSpace=wrap;html=1;align=left;fontSize=9;fontColor=#37474F;strokeColor=none;fillColor=none;",
+        lx+88, ly+ry+5, LW-98, 16)
     );
     ry+=LR;
   };
 
-  // Helper: tier row
+  // Helper: tier boundary swatch + label row
   const tierRow=(lbl,fill,stroke)=>{
     cells.push(
-      `<mxCell id="${nid()}" value="" style="rounded=1;arcSize=3;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;resizable=0;html=1;" vertex="1" parent="1"><mxGeometry x="${lx+10}" y="${ly+ry+3}" width="28" height="13" as="geometry"/></mxCell>`,
-      `<mxCell id="${nid()}" value="${xe(lbl)}" style="text;html=1;align=left;fontSize=9;fontColor=#B0BEC5;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx+46}" y="${ly+ry+2}" width="${LW-56}" height="15" as="geometry"/></mxCell>`
+      vcell(nid(), "",
+        `rounded=1;fillColor=${fill};strokeColor=${stroke};strokeWidth=1.5;html=1;`,
+        lx+10, ly+ry+3, 28, 13),
+      vcell(nid(), xeXml(lbl),
+        "text;whiteSpace=wrap;html=1;align=left;fontSize=9;fontColor=#37474F;strokeColor=none;fillColor=none;",
+        lx+46, ly+ry+2, LW-56, 15)
     );
     ry+=TR;
   };
@@ -1439,14 +1458,16 @@ function buildLegendCells(lx, ly) {
   hdr("TIER BOUNDARIES");
   tierRow("xSphere Private Cloud",  "#E8EAF6","#3949AB");
   tierRow("Org / Account",          "#F3E5F5","#6A1B9A");
-  tierRow("Security · IAM · KMS",   "#FFEBEE","#C62828");
-  tierRow("CI/CD · Jenkins · IaC",  "#FFF3E0","#E65100");
-  tierRow("Network · VPC · TGW",    "#E8F5E9","#2E7D32");
-  tierRow("Compute · API · Events", "#E3F2FD","#1565C0");
-  tierRow("Storage · Database",     "#FFF8E1","#F57F17");
+  tierRow("Security / IAM / KMS",   "#FFEBEE","#C62828");
+  tierRow("CI/CD / Jenkins / IaC",  "#FFF3E0","#E65100");
+  tierRow("Network / VPC / TGW",    "#E8F5E9","#2E7D32");
+  tierRow("Compute / API / Events", "#E3F2FD","#1565C0");
+  tierRow("Storage / Database",     "#FFF8E1","#F57F17");
 
   // Footer
-  cells.push(`<mxCell id="${nid()}" value="threataform · enterprise terraform dfd" style="text;html=1;align=center;fontSize=7;fontColor=#37474F;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="${lx}" y="${ly+ry+6}" width="${LW}" height="12" as="geometry"/></mxCell>`);
+  cells.push(vcell(nid(), "threataform - enterprise terraform dfd",
+    "text;whiteSpace=wrap;html=1;align=center;fontSize=7;fontColor=#78909C;strokeColor=none;fillColor=none;",
+    lx, ly+ry+6, LW, 12));
   return cells;
 }
 
@@ -1489,7 +1510,7 @@ function generateDFDXml(resources, modules, connections) {
     // Single plain rectangle per tier — most compatible with Lucidchart's draw.io importer.
     // Label floats at top-left of the tier background box.
     containers.push(
-      `<mxCell id="${tcid}" value="${xe(tm.label)} (${nodes.length})" style="rounded=1;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=${tm.hdr};fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=5;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="${tcid}" value="${xeXml(tm.label)}&#xa;(${nodes.length} resources)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=${tm.hdr};fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=5;" vertex="1" parent="1">\n      <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n    </mxCell>`
     );
 
     nodes.forEach((n,i)=>{
@@ -1504,16 +1525,17 @@ function generateDFDXml(resources, modules, connections) {
         : (n.type||"").replace(/^aws_|^xsphere_/,"").replace(/_/g," ").substring(0,20);
       const rawMulti = n.multi ? ` [${n.multi}]` : "";
       const rawName = (n.label||n.name||"").substring(0,18) + rawMulti;
-      // Use plain ASCII separator — avoids ALL XML entity encoding issues.
-      // &#xa; was being double-escaped by xe() → &amp;#xa; → showing literally as "&#xa;" in Lucidchart.
-      const rawLbl = shortType ? `${rawName} / ${shortType}` : rawName;
+      // Use &#xa; for multi-line labels — value is pre-escaped so do NOT apply xe() again.
+      // xeXml() encodes user content (XML chars + non-ASCII); &#xa; is then appended literally.
+      const escapedName = xeXml(rawName);
+      const escapedType = shortType ? xeXml(shortType) : "";
+      const rawLbl = escapedType ? `${escapedName}&#xa;${escapedType}` : escapedName;
       const bdrDash = n._isModule||n.srcType==="remote_state" ? "dashed=1;" : "";
       const bgColor = n._isModule ? "#FAFFF5" : "#FFFFFF";
-      // Minimal style — only fillColor, strokeColor, fontColor, fontSize, align.
-      // Removed: arcSize, whiteSpace, verticalAlign, html — fewer properties = fewer Lucidchart parse failures.
-      const style=`rounded=1;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1;fontColor=#333333;fontSize=9;align=center;${bdrDash}`;
+      // Matches the working reference XML: html=1 + whiteSpace=wrap are required for Lucidchart.
+      const style=`rounded=1;whiteSpace=wrap;html=1;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1;fontColor=#333333;fontSize=9;align=center;${bdrDash}`;
       vertices.push(
-        `<mxCell id="${cid}" value="${xe(rawLbl)}" style="${style}" vertex="1" parent="1">\n          <mxGeometry x="${nx}" y="${ny}" width="${NW}" height="${NH+LH}" as="geometry"/>\n        </mxCell>`
+        `<mxCell id="${cid}" value="${rawLbl}" style="${style}" vertex="1" parent="1">\n      <mxGeometry x="${nx}" y="${ny}" width="${NW}" height="${NH+LH}" as="geometry"/>\n    </mxCell>`
       );
     });
 
@@ -1535,22 +1557,27 @@ function generateDFDXml(resources, modules, connections) {
     const color=c.kind==="explicit"?"#E53935":c.kind==="module-input"?"#2E7D32":"#78909C";
     const dash=c.kind==="explicit"?"dashed=1;" : "";
     const lbl=c.kind==="explicit"?"depends_on":c.kind==="module-input"?"input":"";
-    // Minimal edge style — no routing hints, no Lucidchart-incompatible properties.
-    // exitX/exitY/entryX/entryY are draw.io-specific routing anchors that Lucidchart ignores
-    // or mishandles; removing them lets Lucidchart auto-route cleanly.
+    // Edge style matching the working reference XML: orthogonalEdgeStyle + html=1 + blockThin arrow.
+    // This is the exact pattern Lucidchart's draw.io importer handles correctly.
     edges.push(
-      `<mxCell id="e_${++cellN}" value="${lbl}" style="endArrow=block;endFill=1;strokeColor=${color};strokeWidth=1.5;${dash}fontColor=${color};fontSize=8;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n          <mxGeometry relative="1" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="e_${++cellN}" value="${xe(lbl)}" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=${color};strokeWidth=2;${dash}fontColor=${color};fontSize=8;endArrow=blockThin;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n      <mxGeometry relative="1" as="geometry"/>\n    </mxCell>`
     );
   });
 
+  // Legend is included in XML export. It uses only Lucidchart-safe shapes:
+  // - html=1 + whiteSpace=wrap (matching the working reference XML)
+  // - No 'triangle' shape (replaced with small rect end-cap)
+  // - No 'opacity' property
+  // - xeXml() encodes non-ASCII tier label chars (· → &#183;)
   const legendCells=buildLegendCells(totalW+40, CPAD);
   const allCells=[...containers,...edges,...vertices,...legendCells];
   // Return bare <mxGraphModel> — wrapped in <mxfile compressed="false"> when downloading/copying.
   // Lucidchart requires the full <mxfile> wrapper with compressed="false"; file upload only (no paste-XML dialog).
+  const pageW = Math.max(5000, totalW+LEGEND_W+200);
+  const pageH = Math.max(3500, totalH+200);
   return [
-    // Minimal mxGraphModel — only pageWidth/pageHeight needed; all other attributes are draw.io UI hints
-    // that Lucidchart either ignores or may trip over.
-    `<mxGraphModel pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}">`,
+    // Full mxGraphModel attributes matching draw.io export format — required for correct Lucidchart import.
+    `<mxGraphModel dx="5000" dy="3500" grid="1" gridSize="20" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${pageW}" pageHeight="${pageH}" math="0" shadow="0" background="#FAFAFA">`,
     `  <root>`,
     `    <mxCell id="0"/>`,
     `    <mxCell id="1" parent="0"/>`,
@@ -4074,10 +4101,10 @@ export default function App() {
   }, []);
 
   const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files, true); }, [readFiles]);
-  // Minimal <mxfile> wrapper — only compressed="false" is required.
-  // Removing host/modified/type/version avoids Lucidchart importer version-check failures.
+  // Full <mxfile> wrapper matching draw.io's own export format.
+  // Lucidchart's draw.io importer requires host/version/type attributes for correct parsing.
   const drawioXml = xml
-    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile compressed="false">\n  <diagram name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
+    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="app.diagrams.net" modified="${new Date().toISOString()}" agent="Threataform" version="21.0.0" type="device">\n  <diagram name="Enterprise Terraform DFD" id="enterprise-tf-dfd">\n${xml}\n  </diagram>\n</mxfile>`
     : "";
   // Download as .xml — Lucidchart enterprise lists "Draw.io (.xml, .drawio)" and .xml
   // extension passes more corporate DLP/firewall policies than .drawio.
