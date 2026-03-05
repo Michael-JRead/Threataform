@@ -1468,19 +1468,16 @@ function generateDFDXml(resources, modules, connections) {
 
   const legendCells=buildLegendCells(totalW+40, CPAD);
   const allCells=[...containers,...edges,...vertices,...legendCells];
+  // Return bare <mxGraphModel> as root — compatible with BOTH draw.io (File→Import) AND Lucidchart (File→Import draw.io).
+  // The <mxfile> wrapper is added only when saving as .drawio (see download function).
   return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<mxfile host="enterprise-tf-dfd" version="21.0.0">`,
-    `  <diagram id="tf-dfd" name="Enterprise Terraform DFD">`,
-    `    <mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}" math="0" shadow="0">`,
-    `      <root>`,
-    `        <mxCell id="0"/>`,
-    `        <mxCell id="1" parent="0"/>`,
-    ...allCells.map(c=>`        ${c}`),
-    `      </root>`,
-    `    </mxGraphModel>`,
-    `  </diagram>`,
-    `</mxfile>`
+    `<mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}" math="0" shadow="0">`,
+    `  <root>`,
+    `    <mxCell id="0"/>`,
+    `    <mxCell id="1" parent="0"/>`,
+    ...allCells.map(c=>`    ${c}`),
+    `  </root>`,
+    `</mxGraphModel>`
   ].join("\n");
 }
 
@@ -3442,8 +3439,12 @@ export default function App() {
   }, []);
 
   const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files); }, [readFiles]);
+  // Wrap in <mxfile> for .drawio download (draw.io app double-click open)
+  const drawioXml = xml
+    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="Threataform" modified="${new Date().toISOString()}" type="device" version="21.0.0">\n  <diagram id="tf-dfd" name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
+    : "";
   const download = () => {
-    const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([xml],{type:"application/xml"}));
+    const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([drawioXml],{type:"application/xml"}));
     a.download="enterprise-tf-dfd.drawio"; a.click();
   };
   const copy = () => {
@@ -3552,7 +3553,7 @@ export default function App() {
               display:"flex", alignItems:"center", gap:6,
               transition:"all .15s",
             }}>
-              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML"}
+              {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML (Lucidchart)"}
             </button>
             <button onClick={download} style={{
               background:"linear-gradient(135deg,#FF6B3520,#FF990020)",
@@ -4013,11 +4014,13 @@ export default function App() {
                       ]
                     },
                     {
-                      name:"Lucidchart", color:"#FF7043", badge:null,
+                      name:"Lucidchart", color:"#FF7043", badge:"Copy XML method",
                       steps:[
-                        "Download the .drawio file using the ⬇ Download button",
-                        "In Lucidchart: File → Import → Diagrams.net (.drawio)",
-                        "Full layout and tier swim lanes are preserved; nodes render as labeled boxes",
+                        "Click ⎘ Copy XML (Lucidchart) — this copies the bare <mxGraphModel> format that Lucidchart requires",
+                        "In Lucidchart: File → Import → Diagrams.net → paste the copied XML into the text box",
+                        "Alternatively: Click ⬇ Export .drawio → then File → Import → Diagrams.net (.drawio) → upload the file",
+                        "If you see 'not a valid draw.io XML file' — use Copy XML (not the .drawio file) and paste into the Lucidchart text import field",
+                        "Tier swim lanes and connection arrows are preserved; node icons may render as labeled boxes",
                       ]
                     },
                     {
