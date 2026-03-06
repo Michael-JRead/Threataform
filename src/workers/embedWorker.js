@@ -1,111 +1,110 @@
 /**
- * Threataform Embed Worker
- * Generates dense vector embeddings using Transformers.js (Xenova/all-MiniLM-L6-v2)
- * Runs entirely in a Web Worker — zero UI blocking, 100% client-side.
+ * Threataform Embed Worker — Ollama backend
+ * Uses Ollama /api/embed for dense vector embeddings.
+ * Default model: nomic-embed-text (270MB, 768-dim, L2-normalized)
  *
- * Based on local-rag patterns (MIT license) adapted for Threataform threat modeling.
- * Model: Xenova/all-MiniLM-L6-v2 (~22MB, cached in browser after first load)
+ * Requires: ollama pull nomic-embed-text
+ * Ollama returns L2-normalized vectors — dot product == cosine similarity.
  */
 
-import { pipeline, env } from "@huggingface/transformers";
+const OLLAMA_BASE = 'http://localhost:11434';
+let embedModel = 'nomic-embed-text';
 
-// Cache model in browser (IndexedDB via transformers.js default)
-env.allowRemoteModels = true;
-env.useBrowserCache = true;
-
-let embedder = null;
-let modelId = "Xenova/all-MiniLM-L6-v2";
-
-async function getEmbedder() {
-  if (!embedder) {
-    embedder = await pipeline("feature-extraction", modelId, {
-      progress_callback: (progress) => {
-        self.postMessage({ type: "progress", progress });
-      },
-    });
-  }
-  return embedder;
-}
-
-// Cosine similarity between two vectors
-function cosineSimilarity(a, b) {
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (!normA || !normB) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-// L2-normalize a vector
-function l2normalize(vec) {
-  let norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
-  if (!norm) return vec;
-  return vec.map(v => v / norm);
+// Fast dot product (Ollama vectors are L2-normalized → dot = cosine similarity)
+function dotProduct(a, b) {
+  let d = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) d += a[i] * b[i];
+  return d;
 }
 
 self.onmessage = async ({ data }) => {
   const { type, id } = data;
 
-  if (type === "init") {
+  if (type === 'init') {
+    embedModel = data.embedModel || 'nomic-embed-text';
     try {
-      await getEmbedder();
-      self.postMessage({ type: "ready", modelId });
-    } catch (err) {
-      self.postMessage({ type: "error", error: err.message });
-    }
-  }
-
-  else if (type === "embed") {
-    // Embed a batch of texts: { texts: string[], batchId: string }
-    try {
-      const emb = await getEmbedder();
-      const results = [];
-      for (let i = 0; i < data.texts.length; i++) {
-        const text = data.texts[i];
-        if (!text?.trim()) { results.push(null); continue; }
-        const output = await emb(text, { pooling: "mean", normalize: true });
-        const vec = l2normalize(Array.from(output.data));
-        results.push(vec);
-        // Report per-item progress for large batches
-        if (data.texts.length > 5) {
-          self.postMessage({ type: "embed_progress", done: i + 1, total: data.texts.length, batchId: data.batchId });
-        }
+      // Warmup: verify the embed model is available
+      const res = await fetch(`${OLLAMA_BASE}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModel, input: 'warmup' }),
+      });
+      if (!res.ok) {
+        throw new Error(
+          `Embed model "${embedModel}" not available (HTTP ${res.status}). ` +
+          `Run: ollama pull ${embedModel}`
+        );
       }
-      self.postMessage({ type: "embeddings", id, batchId: data.batchId, vectors: results });
+      self.postMessage({ type: 'ready', modelId: embedModel });
     } catch (err) {
-      self.postMessage({ type: "error", id, error: err.message });
+      const msg = err.message.includes('fetch')
+        ? `Cannot reach Ollama. Run: ollama pull ${embedModel}`
+        : err.message;
+      self.postMessage({ type: 'error', error: msg });
     }
   }
 
-  else if (type === "embed_query") {
-    // Embed a single query string: { query: string }
+  else if (type === 'embed') {
+    // Batch embed: { texts: string[], batchId: string }
     try {
-      const emb = await getEmbedder();
-      const output = await emb(data.query, { pooling: "mean", normalize: true });
-      const vec = l2normalize(Array.from(output.data));
-      self.postMessage({ type: "query_embedding", id, vector: vec });
+      const texts = (data.texts || []).map(t => t?.trim() || '').filter(Boolean);
+      if (!texts.length) {
+        self.postMessage({ type: 'embeddings', id, batchId: data.batchId, vectors: [] });
+        return;
+      }
+      // Ollama /api/embed supports string arrays natively
+      const res = await fetch(`${OLLAMA_BASE}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModel, input: texts }),
+      });
+      if (!res.ok) throw new Error(`Embed batch error ${res.status}`);
+      const { embeddings = [] } = await res.json();
+      self.postMessage({ type: 'embeddings', id, batchId: data.batchId, vectors: embeddings });
     } catch (err) {
-      self.postMessage({ type: "error", id, error: err.message });
+      self.postMessage({ type: 'error', id, error: err.message });
     }
   }
 
-  else if (type === "similarity_search") {
-    // Dense-only search over provided store: { query: string, store: [{text, vector, ...meta}], topK: number, threshold: number }
+  else if (type === 'embed_query') {
     try {
-      const emb = await getEmbedder();
-      const output = await emb(data.query, { pooling: "mean", normalize: true });
-      const qVec = l2normalize(Array.from(output.data));
+      const res = await fetch(`${OLLAMA_BASE}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModel, input: data.query }),
+      });
+      const { embeddings = [] } = await res.json();
+      self.postMessage({ type: 'query_embedding', id, vector: embeddings[0] || [] });
+    } catch (err) {
+      self.postMessage({ type: 'error', id, error: err.message });
+    }
+  }
+
+  else if (type === 'similarity_search') {
+    try {
+      const res = await fetch(`${OLLAMA_BASE}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModel, input: data.query }),
+      });
+      const { embeddings = [] } = await res.json();
+      const qVec = embeddings[0];
+      if (!qVec?.length) {
+        self.postMessage({ type: 'search_results', id, results: [] });
+        return;
+      }
       const scored = (data.store || [])
-        .map((item, idx) => ({ idx, sim: item.vector ? cosineSimilarity(qVec, item.vector) : 0 }))
-        .filter(r => r.sim >= (data.threshold ?? 0.25))
+        .map((item, idx) => ({
+          idx,
+          sim: item.vector?.length === qVec.length ? dotProduct(qVec, item.vector) : 0,
+        }))
+        .filter(r => r.sim >= (data.threshold ?? 0.2))
         .sort((a, b) => b.sim - a.sim)
         .slice(0, data.topK || 8);
-      self.postMessage({ type: "search_results", id, results: scored });
+      self.postMessage({ type: 'search_results', id, results: scored });
     } catch (err) {
-      self.postMessage({ type: "error", id, error: err.message });
+      self.postMessage({ type: 'error', id, error: err.message });
     }
   }
 };

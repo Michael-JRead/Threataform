@@ -1,4 +1,9 @@
 import { useState, useCallback, useRef, useMemo, useEffect, Component } from "react";
+// ── Local AI inference — wllama (llama.cpp WASM) + custom RAG engine ──────────
+// Runs 100% offline. No internet. No API. No installation required.
+// User loads a GGUF model file from their local disk.
+import { wllamaManager } from './src/lib/WllamaManager.js';
+import { VectorStore, hybridSearch as ragHybridSearch, buildRAGPrompt, ContextPacker } from './src/lib/ThrataformRAG.js';
 import {
   BookOpen, Upload, Brain, Microscope, Map as MapIcon, Building2, Search, ShieldCheck,
   ListChecks, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers,
@@ -1981,34 +1986,35 @@ class ThreatModelIntelligence {
   }
 
   // ── Recursive character splitter (800-char target, 80-char overlap) ──────────
-  _splitText(text, maxChars=800, overlapChars=80) {
-    const seps = ['\n\n','\n','. ','! ','? ','; ',', ',' '];
-    const out = [];
-    const split = (txt, si) => {
-      if (txt.length <= maxChars) { if (txt.trim().length > 20) out.push(txt.trim()); return; }
-      if (si >= seps.length) {
-        for (let i=0; i<txt.length; i+=maxChars-overlapChars) out.push(txt.slice(i,i+maxChars).trim());
-        return;
+  _splitText(text, maxChars=350, overlapChars=60) {
+    // Sentence-aware chunker: preserves sentence boundaries, overlaps chunks for retrieval context
+    const normalized = text.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+    const rawSents = normalized
+      .replace(/([.!?])\s+(?=[A-Z"'\u2018\u201C\d])/g, '$1\n')
+      .replace(/\n{2,}/g, '\n')
+      .split('\n').map(s => s.trim()).filter(s => s.length > 0);
+    const chunks = [];
+    let cur = '';
+    for (const sent of rawSents) {
+      const candidate = cur ? cur + ' ' + sent : sent;
+      if (candidate.length <= maxChars) { cur = candidate; }
+      else {
+        if (cur.length > 20) chunks.push(cur);
+        if (sent.length > maxChars) {
+          for (let i = 0; i < sent.length; i += maxChars - overlapChars) {
+            const sl = sent.slice(i, i + maxChars).trim();
+            if (sl.length > 20) chunks.push(sl);
+          }
+          cur = '';
+        } else { cur = sent; }
       }
-      const parts = txt.split(seps[si]);
-      let cur = '';
-      for (const p of parts) {
-        const cand = cur ? cur+seps[si]+p : p;
-        if (cand.length <= maxChars) { cur = cand; }
-        else {
-          if (cur.trim().length > 20) cur.length > maxChars ? split(cur,si+1) : out.push(cur.trim());
-          cur = p;
-        }
-      }
-      if (cur.trim().length > 20) cur.length > maxChars ? split(cur,si+1) : out.push(cur.trim());
-    };
-    split(text, 0);
-    // Apply sliding overlap between consecutive chunks
-    const result = [];
-    for (let i=0; i<out.length; i++) {
-      if (i===0) { result.push(out[i]); continue; }
-      const prev = out[i-1];
-      result.push(prev.slice(Math.max(0,prev.length-overlapChars)) + ' ' + out[i]);
+    }
+    if (cur.length > 20) chunks.push(cur);
+    if (!chunks.length) return text.length > 20 ? [text.substring(0, maxChars)] : [];
+    const result = [chunks[0]];
+    for (let i = 1; i < chunks.length; i++) {
+      const tail = chunks[i-1].slice(Math.max(0, chunks[i-1].length - overlapChars));
+      result.push(tail + ' ' + chunks[i]);
     }
     return result;
   }
@@ -2223,7 +2229,87 @@ class ThreatModelIntelligence {
         stillAbsent.push(ctrl);
       }
     });
+    // Extract controls directly from uploaded SCM / SCB files
+    const docControls = this.extractDocControls();
+    const presentIds = new Set(present.map(c => c.id?.toLowerCase()));
+    docControls.forEach(dc => {
+      // Only add if not already covered by CONTROL_DETECTION_MAP
+      if (!presentIds.has(dc.id?.toLowerCase())) {
+        present.push(dc);
+        presentIds.add(dc.id?.toLowerCase());
+      }
+    });
     return { present, absent: stillAbsent };
+  }
+
+  // ── Extract controls from uploaded SCM / SCB / compliance doc chunks ─────────
+  extractDocControls() {
+    if (!this._built) return [];
+    // Focus on security-controls category (Enterprise Security Controls upload slot)
+    // but also scan compliance-guide and cspm for any controls
+    const controlChunks = this.chunks.filter(c =>
+      ['security-controls','compliance-guide','cspm'].includes(c.category)
+    );
+    if (!controlChunks.length) return [];
+
+    const controls = [];
+    const seenIds = new Set();
+
+    // Regex patterns for common control ID formats:
+    // NIST SP 800-53: AC-1, AU-2.1, CM-6(1)
+    // CIS: 1.1, 2.3.4
+    // ISO 27001: A.9.1.1
+    // SOC 2: CC6.1, CC7.2
+    // Custom: CTRL-001, SEC-123, REQ-4.2
+    // PCI DSS / CMMC: numeric or alphanumeric
+    const ID_PATTERN = /\b([A-Z]{1,6}[-.]?\d{1,3}(?:[.(]\d{1,3}[)]?)*(?:\.\d{1,3})*)\b/g;
+
+    controlChunks.forEach(chunk => {
+      const lines = chunk.text.split(/[\n\r|]+/).map(l => l.trim()).filter(l => l.length > 2);
+      lines.forEach(line => {
+        // Reset regex
+        ID_PATTERN.lastIndex = 0;
+        let match;
+        while ((match = ID_PATTERN.exec(line)) !== null) {
+          const rawId = match[1];
+          // Skip IDs that are clearly not controls (pure numbers, too short, version numbers like "v1.2")
+          if (/^\d+$/.test(rawId)) continue;
+          if (rawId.length < 3) continue;
+
+          const idKey = rawId.toUpperCase();
+          if (seenIds.has(idKey)) continue;
+          seenIds.add(idKey);
+
+          // Extract control name: text after the ID on the same line
+          const afterId = line.slice(match.index + rawId.length).replace(/^[\s:|\-,]+/, '').trim();
+          // Take up to 80 chars of the description, stop at another ID or pipe
+          const name = afterId.replace(/\s*[|]\s*.*$/, '').substring(0, 80).trim();
+          if (!name || name.length < 3) continue;
+
+          // Try to determine layer from keywords in the line
+          const lc = line.toLowerCase();
+          let layer = 'doc';
+          if (/\b(access|identity|auth|iam|role|permission|account|user|credential|sso|mfa|password)\b/.test(lc)) layer = 'identity';
+          else if (/\b(network|vpc|firewall|waf|subnet|egress|ingress|traffic|route|dns)\b/.test(lc)) layer = 'network';
+          else if (/\b(encrypt|tls|ssl|kms|key|cipher|hash|pki|certificate|secret)\b/.test(lc)) layer = 'data';
+          else if (/\b(monitor|log|audit|alert|siem|cloudtrail|event|detect|incident)\b/.test(lc)) layer = 'monitoring';
+          else if (/\b(compute|host|os|patch|container|vm|instance|imds)\b/.test(lc)) layer = 'compute';
+          else if (/\b(app|api|code|input|output|csrf|xss|injection|session)\b/.test(lc)) layer = 'application';
+
+          controls.push({
+            id: `DOC-${idKey}`,
+            name: `${rawId}: ${name.charAt(0).toUpperCase() + name.slice(1)}`,
+            layer,
+            ztPillar: layer === 'identity' ? 'identity' : layer === 'network' ? 'network' : layer === 'data' ? 'data' : 'application',
+            source: 'scm',
+            evidence: line.substring(0, 140),
+            detect: () => false, // doc-sourced, always present
+          });
+        }
+      });
+    });
+
+    return controls.slice(0, 200); // cap at 200 doc-extracted controls
   }
 
   // ── Doc-based control detection ───────────────────────────────────────────────
@@ -2606,6 +2692,32 @@ class ThreatModelIntelligence {
   // ── Extract key features from enterprise context docs ─────────────────────────
   extractKeyFeatures() {
     if (!this._built) return [];
+    // Score how "informative" a sentence is — prefer specific, concise, factual statements
+    const scoreSentence = (s) => {
+      if (s.length < 15 || s.length > 180) return 0;
+      let score = 0;
+      // Reward: technical nouns, product names, protocols, AWS services
+      if (/\b(AWS|Amazon|S3|RDS|EC2|EKS|Lambda|DynamoDB|Kinesis|SQS|SNS|IAM|VPC|API|REST|GraphQL|OAuth|SAML|TLS|SSL|AES|RSA|RBAC|ABAC|JWT|SSO|MFA|Kubernetes|Docker|Terraform|CI\/CD|SIEM|WAF|CDN|DNS|HTTPS|gRPC|Kafka|Redis|Postgres|MySQL|MongoDB)\b/i.test(s)) score += 3;
+      // Reward: action verbs describing what the system does
+      if (/\b(processes|handles|manages|stores|encrypts|authenticates|authorizes|monitors|logs|audits|validates|ingests|transforms|routes|exposes|integrates|supports|enforces|detects|alerts|replicates|scales|deploys)\b/i.test(s)) score += 2;
+      // Reward: data/security/compliance terms
+      if (/\b(data|security|compliance|access|control|policy|token|key|certificate|credential|secret|audit|log|event|alert|threshold|SLA|RPO|RTO|tier|layer|boundary|zone|tenant)\b/i.test(s)) score += 1;
+      // Penalise: very long sentences (hard to read as a bullet)
+      if (s.length > 120) score -= 2;
+      // Penalise: mostly filler
+      const words = s.match(/\b\w+\b/g) || [];
+      const filler = (s.match(/\b(the|this|that|these|those|is|are|was|were|will|would|could|should|a|an|in|on|at|to|for|of|with|by|and|or|but|be|been|being|have|has|had|do|does|did)\b/gi) || []).length;
+      if (words.length > 0 && filler / words.length > 0.65) score -= 3;
+      return score;
+    };
+
+    const cleanSentence = (s) => {
+      // Trim to max 120 chars at word boundary
+      let out = s.trim();
+      if (out.length > 120) out = out.substring(0, 117).replace(/\s+\S*$/, '') + '…';
+      return out.charAt(0).toUpperCase() + out.slice(1);
+    };
+
     const QUERIES = [
       "data processing pipeline ingestion transformation",
       "authentication authorization access control identity",
@@ -2614,59 +2726,77 @@ class ThreatModelIntelligence {
       "storage database persistence caching",
       "monitoring logging observability alerting",
       "multi-tenancy tenant isolation namespace",
-      "compliance regulatory framework control",
+      "compliance regulatory HIPAA PCI FedRAMP SOC",
       "third party integrations external service vendor",
       "fault tolerance redundancy high availability failover",
       "data classification sensitive PII PHI PCI",
       "user access role permission privilege",
-      "availability SLA uptime RTO RPO",
       "compute serverless container kubernetes microservice",
-      "network boundary VPC subnet DMZ trust zone",
+      "network VPC subnet boundary trust zone",
     ];
     const seen = new Set();
-    const bullets = [];
-    // BM25 query pass
+    const candidates = []; // [{text, score, source}]
+
     QUERIES.forEach(q => {
-      const results = this.query(q, 3);
-      results.forEach(chunk => {
-        // Extract first meaningful sentence from chunk text
-        const sentences = chunk.text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
-        sentences.slice(0, 2).forEach(sent => {
-          const key = sent.substring(0, 40);
-          if (!seen.has(key)) {
-            seen.add(key);
-            bullets.push(`- ${sent.charAt(0).toUpperCase() + sent.slice(1)}`);
+      this.query(q, 3).forEach(chunk => {
+        chunk.text.split(/[.!?\n]+/).map(s => s.trim()).forEach(sent => {
+          const score = scoreSentence(sent);
+          if (score > 0) {
+            const key = sent.substring(0, 45).toLowerCase();
+            if (!seen.has(key)) { seen.add(key); candidates.push({ text: cleanSentence(sent), score }); }
           }
         });
       });
     });
-    // Direct exhaustive chunk scan for enterprise-arch + app-details categories
-    const enterpriseChunks = this.chunks.filter(c =>
-      c.category === 'enterprise-arch' || c.category === 'app-details'
-    );
-    enterpriseChunks.forEach(chunk => {
-      const sentences = chunk.text.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s.length > 20 && s.length < 200);
-      sentences.slice(0, 3).forEach(sent => {
-        const key = sent.substring(0, 40);
-        if (!seen.has(key)) {
-          seen.add(key);
-          bullets.push(`- ${sent.charAt(0).toUpperCase() + sent.slice(1)}`);
-        }
+
+    // Enterprise-arch and app-details: scan all chunks directly
+    this.chunks
+      .filter(c => ['enterprise-arch','app-details'].includes(c.category))
+      .forEach(chunk => {
+        chunk.text.split(/[.!?\n]+/).map(s => s.trim()).forEach(sent => {
+          const score = scoreSentence(sent);
+          if (score >= 0) { // lower bar for authoritative categories
+            const key = sent.substring(0, 45).toLowerCase();
+            if (!seen.has(key)) { seen.add(key); candidates.push({ text: cleanSentence(sent), score: score + 1 }); }
+          }
+        });
       });
-    });
-    return bullets.slice(0, 40);
+
+    // Sort by score, return top 30 as bullets
+    return candidates
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 30)
+      .map(c => `- ${c.text}`);
   }
 
   // ── Auto-populate architecture description ─────────────────────────────────────
   getArchSummaryText(resources) {
-    if (!this._built) return "";
-    const types = [...new Set((resources||[]).map(r => r.type.replace(/^aws_/, '').replace(/_/g,' ')))].slice(0, 8);
-    const archChunks = this.query("architecture components services infrastructure deployment", 4);
-    const docSummary = archChunks.map(c => (c.compressed || c.text).substring(0, 120)).join(' ');
-    return [
-      types.length ? `Infrastructure includes: ${types.join(', ')}.` : '',
-      docSummary,
-    ].filter(Boolean).join(' ').substring(0, 600);
+    // Build a clean structured description from TF resources + doc context
+    const parts = [];
+
+    // 1. Resource counts by category
+    const res = resources || [];
+    if (res.length) {
+      const typeCounts = {};
+      res.forEach(r => {
+        const label = r.type.replace(/^aws_/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        typeCounts[label] = (typeCounts[label] || 0) + 1;
+      });
+      const topTypes = Object.entries(typeCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([t, n]) => n > 1 ? `${n}x ${t}` : t);
+      parts.push(`Infrastructure: ${topTypes.join(', ')}.`);
+    }
+
+    // 2. Pull ONE clear sentence from each of the top architecture/context doc chunks
+    const archChunks = this.query("architecture overview deployment environment", 3);
+    archChunks.forEach(c => {
+      const sents = c.text.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s.length > 20 && s.length <= 150);
+      if (sents[0]) parts.push(sents[0] + '.');
+    });
+
+    return parts.filter(Boolean).join(' ').substring(0, 500) || "";
   }
 
   // ── Full rebuild ─────────────────────────────────────────────────────────────
@@ -6080,14 +6210,28 @@ function ArchitectureImageViewer({ image, onUpload }) {
 // INTELLIGENCE PANEL
 // Enterprise Threat Model Intelligence — zero hallucination, verbatim retrieval
 // ─────────────────────────────────────────────────────────────────────────────
-function IntelligencePanel({ intelligence, userDocs, parseResult, llmStatus, llmProgress, llmStatusText, embedStatus, onInitLLM, onHybridSearch, onGenerateLLM, vectorStore }) {
+function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseResult,
+  modelDetails, archAnalysis, archOverrides, currentModelId,
+  llmStatus, llmProgress, llmStatusText, embedStatus, embedProgress,
+  selectedLlmModel, wllamaModelName, wllamaModelSize,
+  onLoadModel, onHybridSearch, onGenerateLLM, vectorStore }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null); // null = not searched yet
-  const [iTab, setITab] = useState("assistant"); // assistant | query | ...
-  const [chatMessages, setChatMessages] = useState([]); // [{role:'user'|'assistant', content:'', streaming?:true}]
+  const [iTab, setITab] = useState("assistant");
+  const chatKey = currentModelId ? `tf-model-${currentModelId}-chat` : null;
+  const [chatMessages, setChatMessages] = useState(() => {
+    if (!chatKey) return [];
+    try { return JSON.parse(localStorage.getItem(chatKey) || "[]"); } catch { return []; }
+  });
   const [chatInput, setChatInput] = useState("");
   const [chatGenerating, setChatGenerating] = useState(false);
   const chatBottomRef = useRef(null);
+
+  // Persist chat history per model
+  useEffect(() => {
+    if (!chatKey) return;
+    try { localStorage.setItem(chatKey, JSON.stringify(chatMessages.filter(m => !m.streaming).slice(-60))); } catch {}
+  }, [chatMessages, chatKey]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -6224,51 +6368,63 @@ function IntelligencePanel({ intelligence, userDocs, parseResult, llmStatus, llm
 
   const SEV_COLOR = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
 
-  const ITABS = [
-    {id:"assistant", label:"AI Assistant",          Icon: Bot,           accent:"#7C3AED"},
-    {id:"query",     label:"Query",                 Icon: Search},
-    {id:"posture",   label:"Security Posture",      Icon: ShieldCheck},
-    {id:"controls",  label:"Control Inventory",     Icon: ListChecks},
-    {id:"crossdoc",  label:"Cross-Doc Correlation", Icon: GitCompare},
-    {id:"misconfigs",label:"Misconfig Checks",      Icon: ShieldAlert},
-    {id:"attacks",   label:"ATT&CK Mapping",        Icon: Zap},
-    {id:"threats",   label:"Doc Threat Findings",   Icon: TriangleAlert},
-    {id:"scope",     label:"Scope Analysis",        Icon: ScanLine},
-    {id:"resources", label:"Resource Intelligence", Icon: Layers},
+  const ITAB_GROUPS = [
+    { label: "Assistant", tabs: [
+      {id:"assistant", label:"AI Assistant", Icon: Bot, accent:"#7C3AED"},
+      {id:"query",     label:"Query Docs",   Icon: Search},
+    ]},
+    { label: "Analysis", tabs: [
+      {id:"posture",   label:"Security Posture",   Icon: ShieldCheck},
+      {id:"controls",  label:"Control Inventory",  Icon: ListChecks},
+      {id:"misconfigs",label:"Misconfig Checks",   Icon: ShieldAlert},
+    ]},
+    { label: "Threat Intel", tabs: [
+      {id:"attacks",   label:"ATT&CK Mapping",     Icon: Zap},
+      {id:"threats",   label:"Threat Findings",    Icon: TriangleAlert},
+      {id:"crossdoc",  label:"Cross-Doc Links",    Icon: GitCompare},
+    ]},
+    { label: "Architecture", tabs: [
+      {id:"scope",     label:"Scope Analysis",     Icon: ScanLine},
+      {id:"resources", label:"Resource Intel",     Icon: Layers},
+    ]},
   ];
+  const ITABS = ITAB_GROUPS.flatMap(g => g.tabs);
+
+  const llmStatusDot = llmStatus === "ready" ? "#43A047"
+    : llmStatus === "loading" ? "#F57C00"
+    : llmStatus === "error" ? "#E53935" : "#555";
 
   return (
     <div style={{display:"flex", height:"calc(100vh - 58px)"}}>
-      {/* Sub-nav */}
-      <div style={{width:210, background:C.surface, borderRight:`1px solid ${C.border}`,
-        padding:"14px 8px", display:"flex", flexDirection:"column", gap:2, flexShrink:0}}>
-        <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
-          letterSpacing:".1em", padding:"0 8px 8px"}}>Intelligence</div>
-        {ITABS.map(tab=>{
-          const isAssistant = tab.id === "assistant";
-          const accentColor = tab.accent || C.accent;
-          const isActive = iTab === tab.id;
-          const llmDot = isAssistant
-            ? llmStatus === "ready" ? "#43A047"
-            : llmStatus === "loading" ? "#F57C00"
-            : llmStatus === "error" ? "#E53935" : "#666"
-            : null;
-          return (
-            <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
-              display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
-              padding:"8px 12px",
-              background: isActive ? `${accentColor}20` : isAssistant ? `${accentColor}08` : "transparent",
-              border: isAssistant ? `1px solid ${accentColor}${isActive?"55":"22"}` : "none",
-              borderRadius:8, color: isActive ? accentColor : isAssistant ? accentColor+"99" : C.textSub,
-              fontSize:12, cursor:"pointer", ...SANS, fontWeight: isActive ? 600 : isAssistant ? 500 : 400,
-              marginBottom: isAssistant ? 6 : 0,
-            }}>
-              <tab.Icon size={14} />
-              <span style={{flex:1}}>{tab.label}</span>
-              {llmDot && <span style={{width:6, height:6, borderRadius:"50%", background:llmDot, flexShrink:0}} />}
-            </button>
-          );
-        })}
+      {/* Sub-nav — grouped */}
+      <div style={{width:214, background:C.surface, borderRight:`1px solid ${C.border}`,
+        padding:"10px 6px", display:"flex", flexDirection:"column", gap:0, flexShrink:0, overflowY:"auto"}}>
+        {ITAB_GROUPS.map(group => (
+          <div key={group.label} style={{marginBottom:8}}>
+            <div style={{fontSize:9, color:C.textMuted, fontWeight:700, textTransform:"uppercase",
+              letterSpacing:".12em", padding:"4px 10px 4px", opacity:0.7}}>{group.label}</div>
+            {group.tabs.map(tab => {
+              const isAssistant = tab.id === "assistant";
+              const accentColor = tab.accent || C.accent;
+              const isActive = iTab === tab.id;
+              return (
+                <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
+                  display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
+                  padding:"7px 10px",
+                  background: isActive ? `${accentColor}20` : isAssistant ? `${accentColor}06` : "transparent",
+                  border: isAssistant ? `1px solid ${accentColor}${isActive?"55":"22"}` : "none",
+                  borderRadius:7, color: isActive ? accentColor : C.textSub,
+                  fontSize:12, cursor:"pointer", ...SANS, fontWeight: isActive ? 600 : 400,
+                  marginBottom:1,
+                }}>
+                  <tab.Icon size={13} />
+                  <span style={{flex:1}}>{tab.label}</span>
+                  {isAssistant && <span style={{width:6, height:6, borderRadius:"50%", background:llmStatusDot, flexShrink:0}} />}
+                </button>
+              );
+            })}
+          </div>
+        ))}
 
         {/* Stats */}
         {summary && (
@@ -6327,59 +6483,261 @@ function IntelligencePanel({ intelligence, userDocs, parseResult, llmStatus, llm
             "What data flows cross trust boundaries?",
           ];
 
+          // ── Build full intelligence context for LLM (PrivateGPT approach) ──────
+          const buildFullContext = async (userText) => {
+            // 1. Hybrid semantic + keyword search
+            const contextChunks = onHybridSearch ? await onHybridSearch(userText, 10) : [];
+            const retrievedCtx = contextChunks.length
+              ? contextChunks.map((c,i) =>
+                  `[DOC-${i+1}] File: ${c.source||c.docId||'doc'} | Category: ${c.category||'general'}\n${c.text}`
+                ).join("\n\n")
+              : "No indexed documents available yet.";
+
+            // 2. Model metadata
+            const md = modelDetails || {};
+            const metaLines = [
+              md.productName || summary?.productName ? `Product: ${md.productName || summary?.productName}` : null,
+              md.environment || summary?.environment   ? `Environment: ${md.environment || summary?.environment}` : null,
+              md.dataClassification?.length ? `Data Classification: ${md.dataClassification.join(', ')}` : null,
+              md.frameworks?.length         ? `Compliance Frameworks: ${md.frameworks.join(', ')}` : null,
+              md.owner                      ? `Owner: ${md.owner}` : null,
+              md.description                ? `Architecture: ${md.description.substring(0, 300)}` : null,
+            ].filter(Boolean);
+
+            // 3. Security posture
+            const posture = summary?.posture;
+            const postureCtx = posture
+              ? `Security Posture: ${posture.grade} (${posture.score}/100) — ${posture.maturity}\nTop risks: ${(posture.topRisks||[]).slice(0,3).join('; ')}`
+              : null;
+
+            // 4. Control inventory gaps
+            const inv = summary?.controlInventory;
+            const invCtx = inv ? [
+              inv.present?.length ? `Present controls (${inv.present.length}): ${inv.present.slice(0,8).map(c=>c.name||c).join(', ')}` : null,
+              inv.absent?.length  ? `Control GAPS (${inv.absent.length}): ${inv.absent.slice(0,8).map(c=>c.name||c).join(', ')}` : null,
+            ].filter(Boolean).join('\n') : null;
+
+            // 5. Misconfigurations
+            const misconfigCtx = summary?.misconfigCount
+              ? `Misconfigurations detected: ${summary.misconfigCount} (check Misconfig Checks tab for details)`
+              : null;
+
+            // 6. ATT&CK techniques
+            const attackCtx = summary?.attackTechniqueCount
+              ? `MITRE ATT&CK techniques detected: ${summary.attackTechniqueCount}`
+              : null;
+
+            // 7. Scope
+            const scopeChunks = summary?.scopeChunks || [];
+            const scopeCtx = scopeChunks.length
+              ? `Scope references found:\n${scopeChunks.slice(0,4).map(c=>c.text?.substring(0,120)).join('\n')}`
+              : null;
+
+            // 8. Architecture analysis overrides
+            const archCtx = archAnalysis?.summary || archOverrides?.narrative?.description
+              ? `Architecture analysis: ${(archAnalysis?.summary || archOverrides?.narrative?.description||'').substring(0,400)}`
+              : null;
+
+            // 9. Terraform resources summary
+            const resources = parseResult?.resources || [];
+            const resCtx = resources.length
+              ? `Terraform resources (${resources.length}): ${[...new Set(resources.map(r=>r.type))].slice(0,12).join(', ')}`
+              : null;
+
+            const sections = [
+              metaLines.length ? `=== MODEL CONTEXT ===\n${metaLines.join('\n')}` : null,
+              postureCtx ? `=== SECURITY POSTURE ===\n${postureCtx}` : null,
+              invCtx     ? `=== CONTROL INVENTORY ===\n${invCtx}` : null,
+              misconfigCtx ? `=== MISCONFIGURATIONS ===\n${misconfigCtx}` : null,
+              attackCtx  ? `=== ATT&CK COVERAGE ===\n${attackCtx}` : null,
+              scopeCtx   ? `=== SCOPE ===\n${scopeCtx}` : null,
+              archCtx    ? `=== ARCHITECTURE ===\n${archCtx}` : null,
+              resCtx     ? `=== TERRAFORM RESOURCES ===\n${resCtx}` : null,
+              `=== RETRIEVED DOCUMENT CONTEXT (semantic+keyword) ===\n${retrievedCtx}`,
+            ].filter(Boolean).join('\n\n');
+
+            return { sections, contextChunks };
+          };
+
+          // ── Pure offline intelligence response (no LLM, no internet) ─────────────
+          const generateSmartResponse = (userText) => {
+            const intel = intelligence;
+            const resources = parseResult?.resources || [];
+            const q = userText.toLowerCase();
+            const out = [];
+
+            const isThreats    = /\b(threat|attack|stride|risk|vulnerabilit|exploit|mitre|att.?ck|adversar|malware|breach)\b/.test(q);
+            const isControls   = /\b(control|compliance|policy|framework|nist|pci|hipaa|soc|fedramp|gdpr|cmmc|requirement|standard|audit)\b/.test(q);
+            const isMisconfig  = /\b(misconfig|finding|issue|problem|fix|remediat|harden|insecure|weak|misconfigur)\b/.test(q);
+            const isPosture    = /\b(posture|score|grade|maturity|gap|weakness|overall|summary|overview|status)\b/.test(q);
+            const isArch       = /\b(architect|infrastructure|component|service|resource|terraform|vpc|network|topology|deploy)\b/.test(q);
+            const isScope      = /\b(scope|boundar|in.scope|out.of.scope|asset|perimeter)\b/.test(q);
+            const isCompliance = /\b(complian|regulator|certif|audit|soc2|hipaa|pci|fedramp|gdpr)\b/.test(q);
+
+            // Always run BM25 retrieval
+            const retrieved = intel._built ? intel.query(userText, 6) : [];
+
+            // Security Posture
+            if (isPosture || (!isThreats && !isControls && !isMisconfig && !isScope && !isArch)) {
+              try {
+                const sum = intel.getSummary(resources);
+                if (sum?.posture) {
+                  const p = sum.posture;
+                  out.push(`**Security Posture: ${p.grade} — ${p.score}/100 (${p.maturity})**`);
+                  if (p.topRisks?.length) out.push(`Top risks:\n${p.topRisks.slice(0,5).map(r=>`• ${r}`).join('\n')}`);
+                  if (sum.misconfigCount) out.push(`⚠ ${sum.misconfigCount} Terraform misconfiguration${sum.misconfigCount>1?'s':''} detected.`);
+                  if (sum.controlInventory) {
+                    out.push(`Controls: ${sum.controlInventory.present?.length||0} present, ${sum.controlInventory.absent?.length||0} gaps identified.`);
+                  }
+                }
+              } catch(_) {}
+            }
+
+            // Threats & STRIDE
+            if (isThreats) {
+              try {
+                const sum = intel.getSummary(resources);
+                if (sum?.threatChunks?.length) {
+                  out.push(`**Threat findings from uploaded documents (${sum.threatChunks.length} total):**`);
+                  sum.threatChunks.slice(0,5).forEach((c,i) => {
+                    const snippet = c.text.substring(0,130).trim();
+                    out.push(`**[${i+1}]** ${snippet}…\n_Source: ${c.source||c.category||'doc'}_`);
+                  });
+                }
+                if (sum?.attackTechniqueCount) {
+                  out.push(`**MITRE ATT&CK:** ${sum.attackTechniqueCount} technique(s) detected across uploaded documents.`);
+                }
+              } catch(_) {}
+              // STRIDE from retrieved chunks
+              const strideChunks = retrieved.filter(c => Object.keys(c.entities?.stride||{}).length > 0);
+              if (strideChunks.length) {
+                const techniqueSet = new Set();
+                strideChunks.forEach(c => Object.keys(c.entities.stride||{}).forEach(k => techniqueSet.add(k)));
+                out.push(`**STRIDE categories present:** ${[...techniqueSet].map(k=>({ S:'Spoofing', T:'Tampering', R:'Repudiation', I:'Info Disclosure', D:'Denial of Service', E:'Elevation of Privilege' }[k]||k)).join(', ')}`);
+              }
+            }
+
+            // Controls & Compliance
+            if (isControls || isCompliance) {
+              try {
+                const inv = intel.getControlInventory(resources);
+                if (inv) {
+                  out.push(`**Control Inventory: ${inv.present.length} present / ${inv.absent.length} gaps**`);
+                  if (inv.absent.length) {
+                    out.push(`**Critical control gaps:**\n${inv.absent.slice(0,8).map(c=>`• ${c.name}`).join('\n')}`);
+                  }
+                  const docControls = inv.present.filter(c=>c.source==='doc'||c.source==='scm');
+                  if (docControls.length) {
+                    out.push(`**From uploaded security docs (${docControls.length}):**\n${docControls.slice(0,6).map(c=>`• ${c.name}`).join('\n')}`);
+                  }
+                }
+              } catch(_) {}
+            }
+
+            // Misconfigurations
+            if (isMisconfig) {
+              try {
+                const misconfigs = intel.getMisconfigurations?.(resources) || [];
+                if (misconfigs.length) {
+                  out.push(`**${misconfigs.length} Terraform misconfigurations:**`);
+                  misconfigs.slice(0,8).forEach(m => out.push(`• **${m.resource||m.type}** — ${m.issue||m.description}`));
+                } else {
+                  out.push('No Terraform misconfigurations detected. Upload .tf files for analysis.');
+                }
+              } catch(_) {}
+            }
+
+            // Architecture & Resources
+            if (isArch) {
+              if (resources.length) {
+                const typeCounts = {};
+                resources.forEach(r => { const t = r.type; typeCounts[t]=(typeCounts[t]||0)+1; });
+                const topTypes = Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]).slice(0,10);
+                out.push(`**Terraform resources (${resources.length} total):**\n${topTypes.map(([t,n])=>`• ${t}${n>1?` ×${n}`:''}`).join('\n')}`);
+              }
+            }
+
+            // Scope
+            if (isScope) {
+              try {
+                const sum = intel.getSummary(resources);
+                if (sum?.scopeChunks?.length) {
+                  out.push(`**Scope references (${sum.scopeChunks.length}):**`);
+                  sum.scopeChunks.slice(0,5).forEach(c => out.push(`• ${c.text.substring(0,120).trim()}\n  _${c.source||c.category||'doc'}_`));
+                }
+              } catch(_) {}
+            }
+
+            // Always append BM25 retrieved context
+            if (retrieved.length) {
+              out.push(`**Relevant content from your documents:**`);
+              retrieved.slice(0,5).forEach((c,i) => {
+                const src = c.source || c.category || 'doc';
+                out.push(`**[${i+1}] ${src}**\n${c.text.substring(0,180).trim()}…`);
+              });
+            }
+
+            if (!out.length) {
+              if (!intel._built) {
+                return 'Upload Terraform files or documents in the Upload & Analyze tab to enable the Intelligence Assistant.';
+              }
+              return 'No relevant content found for this query. Try rephrasing or upload more context documents.';
+            }
+
+            return out.join('\n\n');
+          };
+
           const sendChat = async (userText) => {
             if (!userText?.trim() || chatGenerating) return;
             setChatInput("");
             setChatGenerating(true);
 
-            // Build RAG context from BM25 search
-            const contextChunks = onHybridSearch ? onHybridSearch(userText, 8) : [];
-            const contextText = contextChunks.length
-              ? contextChunks.map((c,i) => `[${i+1}] (${c.source||'doc'}) ${c.text}`).join("\n\n")
-              : "No indexed documents yet.";
-
-            const modelCtx = [
-              summary?.productName ? `Product: ${summary.productName}` : null,
-              summary?.environment ? `Environment: ${summary.environment}` : null,
-              summary?.frameworks?.length ? `Compliance: ${summary.frameworks.join(', ')}` : null,
-            ].filter(Boolean).join(" | ");
-
-            const systemPrompt = `You are Threataform Assistant, an expert threat modeler and cloud security architect.
-Use ONLY the context below from the user's architecture documents and Terraform analysis. Be specific and cite resource types or document sections.
-Never hallucinate. If context doesn't contain the answer, say so clearly.
-${modelCtx ? `\nModel Context: ${modelCtx}` : ""}
-
---- RETRIEVED CONTEXT ---
-${contextText}
---- END CONTEXT ---`;
-
-            const messages = [
-              { role: "system", content: systemPrompt },
-              ...chatMessages.filter(m => !m.streaming).map(m => ({ role: m.role, content: m.content })),
-              { role: "user", content: userText },
-            ];
-
-            // Add user message
+            // Add user message immediately
             setChatMessages(prev => [...prev, { role:"user", content: userText }]);
-            // Add empty streaming assistant message
-            setChatMessages(prev => [...prev, { role:"assistant", content:"", streaming: true }]);
+            setChatMessages(prev => [...prev, { role:"assistant", content:"", streaming: true, sources:[] }]);
 
             try {
-              await onGenerateLLM(messages, (token) => {
+              if (onGenerateLLM && llmStatus === "ready") {
+                // ── Ollama LLM path (optional, if available) ──
+                const { sections, contextChunks } = await buildFullContext(userText);
+                const systemPrompt = `You are Threataform Assistant, an expert threat modeler and cloud security architect.
+You have FULL access to the user's architecture: uploaded documents, Terraform resources, security posture, control inventory, misconfigurations, ATT&CK coverage, scope, and architecture analysis.
+Answer using ONLY the context provided. Cite document sources as [DOC-N]. Be specific, technical, and actionable.
+If the context doesn't contain the answer, say so clearly — do NOT hallucinate.\n\n${sections}`;
+
+                const messages = [
+                  { role: "system", content: systemPrompt },
+                  ...chatMessages.filter(m => !m.streaming).slice(-10).map(m => ({ role: m.role, content: m.content })),
+                  { role: "user", content: userText },
+                ];
+                // Update sources on the streaming bubble
                 setChatMessages(prev => {
-                  const last = prev[prev.length - 1];
-                  if (last?.streaming) {
-                    return [...prev.slice(0,-1), { ...last, content: last.content + token }];
-                  }
+                  const last = prev[prev.length-1];
+                  if (last?.streaming) return [...prev.slice(0,-1), { ...last,
+                    sources: contextChunks.slice(0,5).map(c=>({ file:c.source||c.docId||'doc', cat:c.category||'', type:c.searchType||'bm25' }))
+                  }];
                   return prev;
                 });
-              });
+                await onGenerateLLM(messages, (token) => {
+                  setChatMessages(prev => {
+                    const last = prev[prev.length - 1];
+                    if (last?.streaming) return [...prev.slice(0,-1), { ...last, content: last.content + token }];
+                    return prev;
+                  });
+                });
+              } else {
+                // ── Offline intelligence path (always available, no internet needed) ──
+                const response = generateSmartResponse(userText);
+                setChatMessages(prev => {
+                  const last = prev[prev.length-1];
+                  if (last?.streaming) return [...prev.slice(0,-1), { ...last, content: response }];
+                  return prev;
+                });
+              }
             } catch (err) {
               setChatMessages(prev => {
                 const last = prev[prev.length - 1];
-                if (last?.streaming) {
-                  return [...prev.slice(0,-1), { ...last, content: `Error: ${err.message}`, streaming: false }];
-                }
+                if (last?.streaming) return [...prev.slice(0,-1), { ...last, content: `Error: ${err.message}`, streaming: false }];
                 return prev;
               });
             }
@@ -6394,68 +6752,88 @@ ${contextText}
                 <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
                   <Bot size={20} style={{ color:"#7C3AED" }} />
                   <span style={{ fontSize:18, fontWeight:700, color:C.text }}>Threataform Assistant</span>
-                  <span style={{ fontSize:10, color:"#7C3AED", background:"#7C3AED15", border:"1px solid #7C3AED33",
-                    borderRadius:9, padding:"2px 8px", fontWeight:600 }}>
-                    {llmStatus === "ready" ? "Ready" : llmStatus === "loading" ? "Loading..." : llmStatus === "error" ? "Error" : "Offline"}
+                  <span style={{ fontSize:10, background:"#43A04718", border:"1px solid #43A04744",
+                    borderRadius:9, padding:"2px 8px", fontWeight:600, color:"#43A047" }}>
+                    {intelligence?._built ? "Ready" : "Upload files to start"}
                   </span>
+                  {llmStatus === "ready" && (
+                    <span style={{ fontSize:10, color:"#7C3AED", background:"#7C3AED15", border:"1px solid #7C3AED33",
+                      borderRadius:9, padding:"2px 8px", fontWeight:600, marginLeft:4 }}>
+                      + Local AI
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontSize:11, color:C.textMuted }}>
-                  Powered by Threataform-LLM · 100% Client-Side · Phi-3.5-mini
-                  {embedStatus === "ready" && <span style={{ color:"#43A047", marginLeft:8 }}>· Embeddings ready</span>}
+                  Powered by Threataform Intelligence · Fully Offline · No internet required
+                  {llmStatus === "ready" && wllamaModelName && (
+                    <span style={{ color:"#7C3AED", marginLeft:6 }}>· {wllamaModelName}</span>
+                  )}
                 </div>
               </div>
 
-              {/* Load LLM button */}
-              {llmStatus === "idle" && (
-                <div style={{ background:C.surface, border:`1px solid #7C3AED44`, borderRadius:12, padding:"24px",
-                  textAlign:"center", marginBottom:16 }}>
-                  <Bot size={32} style={{ color:"#7C3AED", marginBottom:12 }} />
-                  <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Load Threataform-LLM</div>
-                  <div style={{ fontSize:12, color:C.textMuted, marginBottom:16, lineHeight:1.6 }}>
-                    Phi-3.5-mini · ~2.4GB · Downloads once, then cached locally.<br/>
-                    Runs 100% in your browser — no data leaves your machine.
-                  </div>
-                  <button onClick={onInitLLM} style={{
-                    background:"linear-gradient(135deg,#7C3AED,#6D28D9)", border:"none", borderRadius:8,
-                    padding:"10px 28px", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer", ...SANS,
-                  }}>
-                    Load Threataform-LLM
-                  </button>
-                </div>
-              )}
 
-              {/* Loading progress */}
+              {/* ── Loading model ── */}
               {llmStatus === "loading" && (
                 <div style={{ background:C.surface, border:`1px solid #7C3AED33`, borderRadius:12,
-                  padding:"20px 24px", marginBottom:16 }}>
-                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
-                    <span style={{ fontSize:13, color:C.text, fontWeight:600 }}>Downloading Phi-3.5-mini...</span>
-                    <span style={{ fontSize:13, color:"#7C3AED", fontWeight:700 }}>{llmProgress}%</span>
+                  padding:"16px 20px", marginBottom:16 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+                    <div style={{ width:10, height:10, borderRadius:"50%", background:"#7C3AED",
+                      animation:"pulse 1.2s ease-in-out infinite" }} />
+                    <span style={{ fontSize:13, color:C.text, fontWeight:600 }}>
+                      Loading model into browser…
+                    </span>
                   </div>
-                  <div style={{ height:6, background:C.border, borderRadius:3, overflow:"hidden", marginBottom:8 }}>
-                    <div style={{ height:"100%", width:`${llmProgress}%`, borderRadius:3,
-                      background:"linear-gradient(90deg,#7C3AED,#A78BFA)", transition:"width .3s ease" }} />
+                  <div style={{ height:5, background:C.border, borderRadius:3, overflow:"hidden", marginBottom:6 }}>
+                    <div style={{ height:"100%", borderRadius:3, width:`${llmProgress}%`,
+                      background:"linear-gradient(90deg,#7C3AED,#9F67FA)", transition:"width .3s ease" }} />
                   </div>
-                  {llmStatusText && (
-                    <div style={{ fontSize:11, color:C.textMuted, fontFamily:"monospace" }}>{llmStatusText}</div>
-                  )}
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.textMuted }}>
+                    <span>{selectedLlmModel || "model.gguf"}</span>
+                    <span>{llmProgress}%{llmStatusText ? ` · ${llmStatusText}` : ""}</span>
+                  </div>
+                  <div style={{ fontSize:10, color:C.textMuted, marginTop:6 }}>
+                    Loading via WebAssembly — runs entirely in your browser, no internet needed
+                  </div>
                 </div>
               )}
 
-              {/* Error state */}
-              {llmStatus === "error" && (
-                <div style={{ background:"#E5393508", border:"1px solid #E5393544", borderRadius:8,
-                  padding:"12px 16px", marginBottom:16, fontSize:12, color:"#E53935" }}>
-                  Failed to load model. Check browser console for details. WebGPU may not be available on this browser.
-                  <button onClick={onInitLLM} style={{ marginLeft:12, background:"transparent", border:"1px solid #E53935",
-                    borderRadius:6, padding:"3px 10px", color:"#E53935", fontSize:11, cursor:"pointer", ...SANS }}>
-                    Retry
-                  </button>
+              {/* ── Model loaded indicator ── */}
+              {llmStatus === "ready" && wllamaModelName && (
+                <div style={{ background:"#7C3AED08", border:"1px solid #7C3AED22", borderRadius:8,
+                  padding:"10px 14px", marginBottom:12, display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ width:8, height:8, borderRadius:"50%", background:"#7C3AED", flexShrink:0 }} />
+                  <div>
+                    <span style={{ fontSize:12, fontWeight:600, color:"#7C3AED" }}>{wllamaModelName}</span>
+                    {wllamaModelSize > 0 && <span style={{ fontSize:11, color:C.textMuted, marginLeft:6 }}>· {wllamaModelSize}MB</span>}
+                    <span style={{ fontSize:10, color:C.textMuted, marginLeft:8 }}>· In-browser WASM · Zero internet</span>
+                  </div>
+                  <button onClick={() => onLoadModel(null)} style={{ marginLeft:"auto", background:"transparent",
+                    border:`1px solid ${C.border}`, borderRadius:5, padding:"3px 10px", fontSize:10,
+                    color:C.textMuted, cursor:"pointer", ...SANS }}>Change</button>
                 </div>
               )}
 
-              {/* Quick prompts — show when ready and no chat yet */}
-              {llmStatus === "ready" && chatMessages.length === 0 && (
+              {/* ── Dense embedding progress ── */}
+              {embedProgress && (
+                <div style={{ background:C.surface, border:`1px solid #FB8C0033`, borderRadius:8,
+                  padding:"10px 14px", marginBottom:12 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:5 }}>
+                    <span style={{ fontSize:11, color:"#FB8C00", fontWeight:600 }}>Building Vector Index</span>
+                    <span style={{ fontSize:11, color:C.textMuted }}>{embedProgress.done} / {embedProgress.total} chunks</span>
+                  </div>
+                  <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+                    <div style={{ height:"100%", borderRadius:2,
+                      width:`${Math.round((embedProgress.done/embedProgress.total)*100)}%`,
+                      background:"linear-gradient(90deg,#FB8C00,#FFB74D)", transition:"width .25s ease" }} />
+                  </div>
+                  <div style={{ fontSize:10, color:C.textMuted, marginTop:4 }}>
+                    Semantic search improves as index builds · {embedProgress.total - embedProgress.done} remaining
+                  </div>
+                </div>
+              )}
+
+              {/* Quick prompts — always show when intelligence is ready and no chat */}
+              {chatMessages.length === 0 && intelligence?._built && (
                 <div style={{ marginBottom:16 }}>
                   <div style={{ fontSize:11, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
                     letterSpacing:".08em", marginBottom:8 }}>Quick Prompts</div>
@@ -6497,14 +6875,35 @@ ${contextText}
                           background:C.accent, marginLeft:2, animation:"pulse 1s ease-in-out infinite",
                           verticalAlign:"text-bottom", borderRadius:2 }} />}
                       </div>
+                      {/* Source citation chips */}
+                      {msg.role === "assistant" && msg.sources?.length > 0 && !msg.streaming && (
+                        <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginTop:8, paddingTop:8,
+                          borderTop:`1px solid ${C.border}` }}>
+                          {msg.sources.map((s, si) => (
+                            <span key={si} title={s.file} style={{
+                              display:"inline-flex", alignItems:"center", gap:4,
+                              background: s.type === "dense" ? "#7C3AED12" : s.type === "hybrid" ? "#1565C012" : C.bg,
+                              border:`1px solid ${s.type === "dense" ? "#7C3AED33" : s.type === "hybrid" ? "#1565C033" : C.border}`,
+                              borderRadius:10, padding:"2px 8px", fontSize:10, color:C.textSub,
+                            }}>
+                              <FileText size={9} style={{ flexShrink:0, opacity:.7 }} />
+                              <span style={{ maxWidth:120, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                                {s.file.split('/').pop().split('\\').pop()}
+                              </span>
+                              {s.cat && <span style={{ opacity:.6 }}>· {s.cat}</span>}
+                              <span style={{ opacity:.5, fontSize:9 }}>{s.type === "dense" ? "⚡" : s.type === "hybrid" ? "◈" : "∷"}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
                 <div ref={chatBottomRef} />
               </div>
 
-              {/* Input area */}
-              {(llmStatus === "ready") && (
+              {/* Input area — always shown (offline BM25 mode always available) */}
+              {intelligence?._built && (
                 <div style={{ display:"flex", gap:8, marginTop:"auto" }}>
                   {chatMessages.length > 0 && (
                     <button onClick={() => { setChatMessages([]); setChatInput(""); }} style={{
@@ -7401,6 +7800,66 @@ ${contextText}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// VECTOR DB — IndexedDB persistence for embeddings (no re-embed on reload)
+// ─────────────────────────────────────────────────────────────────────────────
+let _vdbConn = null;
+function _getVectorDB() {
+  if (!_vdbConn) {
+    _vdbConn = new Promise((resolve) => {
+      const req = indexedDB.open('threataform-vectors', 2);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
+      };
+      req.onsuccess = (e) => resolve(e.target.result);
+      req.onerror = () => { _vdbConn = null; resolve(null); };
+    });
+  }
+  return _vdbConn;
+}
+async function vdbGet(key) {
+  const db = await _getVectorDB();
+  if (!db) return null;
+  return new Promise((res) => {
+    try {
+      const r = db.transaction('vectors').objectStore('vectors').get(key);
+      r.onsuccess = () => res(r.result ?? null);
+      r.onerror = () => res(null);
+    } catch { res(null); }
+  });
+}
+async function vdbPut(key, value) {
+  const db = await _getVectorDB();
+  if (!db) return;
+  return new Promise((res) => {
+    try {
+      const tx = db.transaction('vectors', 'readwrite');
+      tx.objectStore('vectors').put(value, key);
+      tx.oncomplete = () => res();
+      tx.onerror = () => res();
+    } catch { res(); }
+  });
+}
+async function vdbGetMany(keys) {
+  const db = await _getVectorDB();
+  if (!db) return {};
+  return new Promise((res) => {
+    const results = {};
+    const tx = db.transaction('vectors');
+    const store = tx.objectStore('vectors');
+    let pending = keys.length;
+    if (!pending) { res(results); return; }
+    keys.forEach(k => {
+      const r = store.get(k);
+      r.onsuccess = () => { results[k] = r.result ?? null; if (--pending === 0) res(results); };
+      r.onerror   = () => { results[k] = null;             if (--pending === 0) res(results); };
+    });
+  });
+}
+// Stable chunk hash: first 50 chars + length (no crypto needed)
+function chunkHash(text) { return (text.substring(0, 50) + '|' + text.length).replace(/[^\w|]/g, '_'); }
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -7531,15 +7990,19 @@ export default function App() {
   const intelligenceRef = useRef(new ThreatModelIntelligence());
   const [intelligenceVersion, setIntelligenceVersion] = useState(0); // triggers re-render after rebuild
 
-  // ── Threataform Assistant — Client-Side LLM + Dense Vector RAG ───────────────
-  const [llmStatus, setLlmStatus]     = useState("idle");   // idle|loading|ready|error
-  const [llmProgress, setLlmProgress] = useState(0);        // 0-100
+  // ── Threataform Assistant — wllama (local GGUF) + Custom RAG Engine ──────────
+  // Runs 100% offline. User loads a GGUF model from local disk.
+  const [llmStatus, setLlmStatus]       = useState("idle");   // idle|loading|ready|error
+  const [llmProgress, setLlmProgress]   = useState(0);        // 0-100
   const [llmStatusText, setLlmStatusText] = useState("");
-  const [embedStatus, setEmbedStatus] = useState("idle");   // idle|loading|ready|error
-  const llmWorkerRef   = useRef(null);
-  const embedWorkerRef = useRef(null);
-  const vectorStoreRef = useRef([]);  // [{id, docId, chunkIdx, text, vector, source, category}]
-  const pendingLlmRef  = useRef({});  // {[id]: {resolve, reject, onToken}}
+  const [embedStatus, setEmbedStatus]   = useState("idle");   // idle|ready (tracks vector index)
+  const [selectedLlmModel, setSelectedLlmModel] = useState(""); // loaded GGUF filename
+  const [wllamaModelName, setWllamaModelName]   = useState(""); // display name
+  const [wllamaModelSize, setWllamaModelSize]   = useState(0);  // size in MB
+  const [embedProgress, setEmbedProgress] = useState(null); // null | {done, total}
+  // VectorStore (custom pure-JS implementation from ThrataformRAG.js)
+  const vectorStoreRef = useRef(new VectorStore());
+  const pendingLlmRef  = useRef({});  // retained for compatibility
 
   // User documents — per-model, backed by localStorage[tf-model-{id}-docs]
   const [userDocs, setUserDocsState] = useState(() => {
@@ -7666,121 +8129,141 @@ export default function App() {
     }
   }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── initLLM: lazy-load embed + LLM workers ───────────────────────────────────
-  const initLLM = useCallback(() => {
-    if (llmStatus !== "idle" && llmStatus !== "error") return;
-    setLlmStatus("loading");
-    setLlmProgress(0);
-
-    // Init embed worker first (smaller, loads faster)
-    if (!embedWorkerRef.current) {
-      const ew = new Worker(new URL("./src/workers/embedWorker.js", import.meta.url), { type: "module" });
-      ew.onmessage = ({ data }) => {
-        if (data.type === "ready") { setEmbedStatus("ready"); }
-        if (data.type === "error") { setEmbedStatus("error"); }
-        if (data.type === "embeddings") {
-          // Resolve pending embed call
-          const cb = pendingLlmRef.current[data.id || data.batchId];
-          if (cb) { cb.resolve(data.vectors); delete pendingLlmRef.current[data.id || data.batchId]; }
-        }
-        if (data.type === "search_results") {
-          const cb = pendingLlmRef.current[data.id];
-          if (cb) { cb.resolve(data.results); delete pendingLlmRef.current[data.id]; }
-        }
-      };
-      embedWorkerRef.current = ew;
-      setEmbedStatus("loading");
-      ew.postMessage({ type: "init" });
+  // ── loadWllama: load a GGUF model from a File object OR a URL string ─────────
+  // File object → user file picker
+  // URL string  → Electron bundled model (served from /models via local HTTP)
+  // null        → unload current model
+  const loadWllama = useCallback(async (fileOrUrl) => {
+    if (!fileOrUrl) {
+      // Unload current model
+      await wllamaManager.unload();
+      setLlmStatus("idle"); setLlmProgress(0); setLlmStatusText("");
+      setSelectedLlmModel(""); setWllamaModelName(""); setWllamaModelSize(0);
+      setEmbedStatus("idle"); vectorStoreRef.current.clear(); setEmbedProgress(null);
+      return;
     }
-
-    // Init LLM worker
-    if (!llmWorkerRef.current) {
-      const lw = new Worker(new URL("./src/workers/llmWorker.js", import.meta.url), { type: "module" });
-      lw.onmessage = ({ data }) => {
-        if (data.type === "progress") {
-          setLlmProgress(data.progress || 0);
-          setLlmStatusText(data.text || "");
-        }
-        if (data.type === "ready") { setLlmStatus("ready"); setLlmProgress(100); }
-        if (data.type === "error") { setLlmStatus("error"); setLlmStatusText(data.error || ""); }
-        if (data.type === "token") {
-          const cb = pendingLlmRef.current[data.id];
-          if (cb?.onToken) cb.onToken(data.token);
-        }
-        if (data.type === "done") {
-          const cb = pendingLlmRef.current[data.id];
-          if (cb) { cb.resolve(data.fullText); delete pendingLlmRef.current[data.id]; }
-        }
+    setLlmStatus("loading"); setLlmProgress(0); setLlmStatusText("");
+    try {
+      const opts = {
+        contextSize: 4096,
+        onProgress: ({ pct, loaded, total }) => {
+          setLlmProgress(pct);
+          const mb = Math.round(loaded / 1024 / 1024);
+          const totalMb = Math.round(total / 1024 / 1024);
+          setLlmStatusText(totalMb > 0 ? `${mb}MB / ${totalMb}MB` : `${mb}MB`);
+        },
       };
-      llmWorkerRef.current = lw;
+      // URL string → Electron local model server; File object → user file picker
+      const result = typeof fileOrUrl === 'string'
+        ? await wllamaManager.loadFromUrl(fileOrUrl, { ...opts, useCache: true })
+        : await wllamaManager.loadFromFile(fileOrUrl, opts);
+      setLlmStatus("ready"); setLlmProgress(100); setLlmStatusText("");
+      setSelectedLlmModel(result.modelName);
+      setWllamaModelName(result.modelName);
+      setWllamaModelSize(result.sizeMB);
+      // Trigger vector index rebuild now that embeddings are available
+      rebuildVectorStore();
+    } catch (err) {
+      setLlmStatus("error");
+      setLlmStatusText(err.message || "Failed to load model. Is the file a valid GGUF?");
     }
-    llmWorkerRef.current.postMessage({ type: "init", modelId: "Phi-3.5-mini-instruct-q4f32_1-MLC" });
-  }, [llmStatus]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── rebuildVectorStore: embed all doc chunks for dense search ─────────────────
-  const rebuildVectorStore = useCallback(() => {
-    if (!embedWorkerRef.current || embedStatus !== "ready") return;
+  // ── Electron: auto-load bundled model from /models on startup ────────────────
+  // Runs once on mount. If running inside Electron and /models has a .gguf file,
+  // the model server URL is fetched from the main process and wllama loads it
+  // automatically — no file picker needed, no internet required.
+  useEffect(() => {
+    if (!window?.electronAPI?.isElectron) return;
+    window.electronAPI.getModelInfo().then(({ port, models }) => {
+      if (models.length > 0 && !wllamaManager.isLoaded) {
+        const modelUrl = `http://127.0.0.1:${port}/${encodeURIComponent(models[0])}`;
+        console.log('[Threataform] Electron: auto-loading bundled model →', modelUrl);
+        loadWllama(modelUrl);
+      }
+    }).catch(() => {}); // Silently ignore if IPC fails
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── rebuildVectorStore: embed all doc chunks using wllama ────────────────────
+  const rebuildVectorStore = useCallback(async () => {
+    if (!wllamaManager.isLoaded) return;
     const chunks = intelligenceRef.current.chunks;
     if (!chunks?.length) return;
-    const texts = chunks.map(c => c.text);
-    const batchId = `vs_${Date.now()}`;
-    // Fire and forget — results applied via onmessage
-    embedWorkerRef.current.onmessage = (ev) => {
-      if (ev.data.type === "embeddings" && ev.data.batchId === batchId) {
-        const vectors = ev.data.vectors;
-        vectorStoreRef.current = chunks.map((c, i) => ({
-          ...c,
-          vector: vectors[i] || null,
-        })).filter(c => c.vector);
-        // Reset message handler
-        embedWorkerRef.current.onmessage = null;
-      }
-    };
-    embedWorkerRef.current.postMessage({ type: "embed", texts, batchId });
-  }, [embedStatus]);
 
-  // Rebuild vector store whenever intelligence rebuilds and embed is ready
+    const modelId = currentModelRef.current?.id || "global";
+    const keys = chunks.map(c => `vec_${modelId}_${chunkHash(c.text)}`);
+    const cached = await vdbGetMany(keys);
+
+    const needEmbed = [];
+    const result = chunks.map((c, i) => {
+      if (cached[keys[i]]) return { ...c, vector: cached[keys[i]] };
+      needEmbed.push({ chunkIdx: i, chunk: c, key: keys[i] });
+      return { ...c, vector: null };
+    });
+
+    // Populate vector store with cached vectors immediately
+    vectorStoreRef.current.clear();
+    result.forEach((c, i) => {
+      if (c.vector) vectorStoreRef.current.add(`chunk_${i}`, c.vector, c);
+    });
+
+    if (!needEmbed.length) { setEmbedProgress(null); return; }
+
+    // Embed uncached chunks in small batches (wllama is sequential, so keep batches small)
+    const BATCH = 8;
+    setEmbedProgress({ done: 0, total: needEmbed.length });
+    for (let i = 0; i < needEmbed.length; i += BATCH) {
+      if (!wllamaManager.isLoaded) break; // user unloaded model mid-run
+      const batch = needEmbed.slice(i, i + BATCH);
+      try {
+        const vectors = await wllamaManager.embed(batch.map(b => b.chunk.text));
+        batch.forEach((b, j) => {
+          const vec = vectors[j];
+          if (!vec?.length) return;
+          result[b.chunkIdx] = { ...b.chunk, vector: vec };
+          vectorStoreRef.current.add(`chunk_${b.chunkIdx}`, vec, b.chunk);
+          vdbPut(b.key, vec);
+        });
+      } catch { /* skip failed batch */ }
+      setEmbedProgress({ done: Math.min(i + BATCH, needEmbed.length), total: needEmbed.length });
+    }
+    setEmbedProgress(null);
+    setEmbedStatus("ready");
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Rebuild vector store whenever intelligence rebuilds and wllama is loaded
   useEffect(() => {
-    if (embedStatus === "ready") rebuildVectorStore();
-  }, [intelligenceVersion, embedStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (wllamaManager.isLoaded) rebuildVectorStore();
+  }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── hybridSearch: BM25 + dense cosine similarity via RRF ─────────────────────
-  const hybridSearch = useCallback((query, topK = 8) => {
-    const bm25Results = intelligenceRef.current._built
-      ? intelligenceRef.current.query(query, topK * 2)
-      : [];
+  // ── hybridSearch: BM25 + dense (wllama embeddings) via RRF ───────────────────
+  const hybridSearch = useCallback(async (query, topK = 8) => {
+    const intel = intelligenceRef.current;
+    const bm25Results = intel?._built ? intel.query(query, topK * 2) : [];
 
     const store = vectorStoreRef.current;
-    if (!store.length) return bm25Results.slice(0, topK);
+    if (!wllamaManager.isLoaded || store.size === 0) {
+      return bm25Results.slice(0, topK).map(r => ({ ...r, searchType: 'bm25' }));
+    }
 
-    // Synchronous cosine similarity (vectors already in memory)
-    const qTokens = query.toLowerCase().split(/\s+/);
-    // Use BM25 query vector as proxy (true dense search happens async in worker)
-    // For now: combine BM25 rank with simple keyword overlap on vectors
-    const bm25Ranked = new Map(bm25Results.map((r, i) => [r.text?.substring(0,40), topK * 2 - i]));
+    // Dense retrieval using wllama embeddings + RRF fusion
+    try {
+      const queryVec = await wllamaManager.embedQuery(query);
+      return ragHybridSearch({ bm25Chunks: bm25Results, vectorStore: store, queryVec, topK });
+    } catch {
+      return bm25Results.slice(0, topK).map(r => ({ ...r, searchType: 'bm25' }));
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // RRF fusion: merge BM25 rank + store ordering
-    const fused = new Map();
-    bm25Results.forEach((r, i) => {
-      const key = r.text?.substring(0, 40) || i;
-      fused.set(key, (fused.get(key) || 0) + 1 / (60 + i + 1));
-    });
-
-    return bm25Results.slice(0, topK);
-  }, []);
-
-  // ── generateLLMResponse: stream tokens from worker ───────────────────────────
+  // ── generateLLMResponse: stream tokens via wllama (local WASM inference) ─────
   const generateLLMResponse = useCallback((messages, onToken) => {
-    return new Promise((resolve, reject) => {
-      if (!llmWorkerRef.current || llmStatus !== "ready") {
-        reject(new Error("LLM not ready"));
-        return;
-      }
-      const id = `gen_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      pendingLlmRef.current[id] = { resolve, reject, onToken };
-      llmWorkerRef.current.postMessage({ type: "generate", id, messages });
+    if (!wllamaManager.isLoaded) return Promise.reject(new Error("Model not loaded"));
+    return wllamaManager.generate(messages, {
+      onToken,
+      maxTokens: 2048,
+      temperature: 0.2,
     });
-  }, [llmStatus]);
+  }, []);
 
   // Auto-populate Architecture Analysis after each intelligence rebuild
   useEffect(() => {
@@ -8820,14 +9303,22 @@ export default function App() {
       {mainTab==="intelligence" && (
         <IntelligencePanel
           intelligence={intelligenceRef.current}
+          intelligenceVersion={intelligenceVersion}
           userDocs={userDocs}
           parseResult={parseResult}
-          key={intelligenceVersion}
+          modelDetails={modelDetails}
+          archAnalysis={archAnalysis}
+          archOverrides={archOverrides}
+          currentModelId={currentModel?.id}
           llmStatus={llmStatus}
           llmProgress={llmProgress}
           llmStatusText={llmStatusText}
           embedStatus={embedStatus}
-          onInitLLM={initLLM}
+          embedProgress={embedProgress}
+          selectedLlmModel={selectedLlmModel}
+          wllamaModelName={wllamaModelName}
+          wllamaModelSize={wllamaModelSize}
+          onLoadModel={loadWllama}
           onHybridSearch={hybridSearch}
           onGenerateLLM={generateLLMResponse}
           vectorStore={vectorStoreRef.current}

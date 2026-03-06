@@ -10,12 +10,7 @@ export default defineConfig({
   worker: {
     format: "es",
   },
-  optimizeDeps: {
-    exclude: ["@mlc-ai/web-llm", "@huggingface/transformers"],
-  },
   build: {
-    rollupOptions: {
-      external: [],
-    },
+    target: "esnext",
   },
 });
