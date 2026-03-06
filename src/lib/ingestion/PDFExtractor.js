@@ -1,32 +1,20 @@
 /**
  * src/lib/ingestion/PDFExtractor.js
- * Extracts text from PDF files using pdfjs-dist.
- * Load order: (1) npm pdfjs-dist, (2) esm.sh CDN fallback.
+ * Extracts text from PDF files using pdfjs-dist (lazy-loaded).
  */
-
-const PDF_CDN = 'https://esm.sh/pdfjs-dist@3.11.174';
-const PDF_WORKER_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{ver}/pdf.worker.min.js';
 
 let pdfjsLib = null;
 
 async function getPDFJS() {
   if (!pdfjsLib) {
-    // 1. Try installed npm package
     try {
-      pdfjsLib = await import(/* @vite-ignore */ 'pdfjs-dist');
-    } catch {
-      // 2. CDN ESM fallback (no npm required)
-      try {
-        pdfjsLib = await import(/* @vite-ignore */ PDF_CDN);
-      } catch {
-        throw new Error('PDF extraction unavailable. Install pdfjs-dist or check internet access.');
+      pdfjsLib = await import('pdfjs-dist');
+      // Required worker setup for pdfjs in browser
+      if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions?.workerSrc) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
       }
-    }
-    // Set worker (always use CDN worker matching version)
-    if (typeof window !== 'undefined') {
-      const ver = pdfjsLib.version ?? '3.11.174';
-      pdfjsLib.GlobalWorkerOptions.workerSrc =
-        PDF_WORKER_CDN.replace('{ver}', ver);
+    } catch {
+      throw new Error('pdfjs-dist not installed. Run: npm install pdfjs-dist');
     }
   }
   return pdfjsLib;
@@ -49,22 +37,24 @@ export async function extractPDF(input, { maxPages = 200 } = {}) {
   const tables    = [];
 
   for (let p = 1; p <= numPages; p++) {
-    const page    = await pdf.getPage(p);
+    const page = await pdf.getPage(p);
     const content = await page.getTextContent();
 
     // Group items by approximate Y position (rows)
     const byY = new Map();
     for (const item of content.items) {
-      const y   = Math.round(item.transform[5] / 10) * 10;
+      const y   = Math.round(item.transform[5] / 10) * 10; // bucket to 10px rows
       const row = byY.get(y) ?? [];
       row.push({ x: item.transform[4], text: item.str });
       byY.set(y, row);
     }
 
+    // Sort rows top-to-bottom, items left-to-right
     const rows = Array.from(byY.entries())
       .sort(([ya], [yb]) => yb - ya)
       .map(([, items]) => items.sort((a, b) => a.x - b.x).map(i => i.text).join(' '));
 
+    // Detect table-like rows (multiple tab-separated columns)
     let tableBuffer = [];
     for (const row of rows) {
       if (_isTableRow(row)) {

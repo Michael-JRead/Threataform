@@ -1,26 +1,16 @@
 /**
  * src/lib/ingestion/SpreadsheetExtractor.js
- * Extracts text from XLSX/XLS/CSV files using SheetJS.
- * Load order: (1) npm xlsx, (2) esm.sh CDN fallback.
- * CSV is handled with pure JS — no library needed.
+ * Extracts text from XLSX/XLS/CSV files using SheetJS (lazy-loaded).
  */
-
-const XLSX_CDN = 'https://esm.sh/xlsx@0.18.5';
 
 let XLSX = null;
 
 async function getXLSX() {
   if (!XLSX) {
-    // 1. Try installed npm package
     try {
-      XLSX = await import(/* @vite-ignore */ 'xlsx');
+      XLSX = await import('xlsx');
     } catch {
-      // 2. CDN ESM fallback
-      try {
-        XLSX = await import(/* @vite-ignore */ XLSX_CDN);
-      } catch {
-        throw new Error('XLSX extraction unavailable. Install xlsx or check internet access.');
-      }
+      throw new Error('SheetJS not installed. Run: npm install xlsx');
     }
   }
   return XLSX;

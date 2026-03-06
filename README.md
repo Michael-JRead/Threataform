@@ -48,6 +48,32 @@ python scripts/create_dummy_model.py
 # Replace with real trained weights after running the training pipeline
 ```
 
+### Enterprise / Restricted npm Registry
+
+If your environment blocks the public npm registry (401 on all packages):
+
+```bash
+npm install --omit=optional   # skip native binary optionals
+npm run dev:web
+```
+
+All document extractors (PDF, DOCX, XLSX, PPTX, images) automatically fall back to
+**esm.sh CDN** if their npm packages are unavailable — as long as the machine has internet
+access. CSV and plain-text formats need no library at all.
+
+| Format | npm package | CDN fallback |
+|---|---|---|
+| PDF | pdfjs-dist | esm.sh/pdfjs-dist@3.11.174 |
+| DOCX | mammoth | esm.sh/mammoth@1.6.0 |
+| XLSX/XLS | xlsx (SheetJS) | esm.sh/xlsx@0.18.5 |
+| PPTX | jszip | esm.sh/jszip@3.10.1 |
+| PNG/JPG | tesseract.js | esm.sh/tesseract.js@5.0.4 |
+| CSV | pure JS | — |
+
+> **Python alternative (future):** `pdfplumber`, `python-docx`, `openpyxl`, `python-pptx`
+> can serve extractions from a local sidecar (`python scripts/extract_server.py`) for
+> fully air-gapped environments. Not yet implemented.
+
 ---
 
 ## Workflow Overview
@@ -447,21 +473,24 @@ Handles file processing off the main thread:
 
 All extractors lazy-loaded via `src/lib/ingestion/FileRouter.js` (routes by MIME type + extension).
 
-| Format | Library | Output |
-|---|---|---|
-| PDF | pdfjs-dist | Text + table detection (column analysis) + figure alt-text |
-| DOCX/DOC | mammoth | Heading hierarchy, tables, metadata preserved |
-| XLSX/XLS | SheetJS | "ColHeader: CellValue" row format per cell |
-| CSV | built-in | First row as headers, each subsequent row as labelled sentences |
-| PPTX | custom XML parser | Slide titles + body + speaker notes |
-| PNG/JPG/TIFF | Tesseract.js | OCR + layout analysis (lazy-loaded) |
-| MP3/WAV/MP4 | Whisper.js | Audio transcription (lazy-loaded) |
-| JSON/YAML | built-in | Flattened `key.subkey.leaf: value` |
-| HCL/Terraform | custom parser | Resource blocks with all attributes annotated |
-| HTML | DOMParser | Text nodes + tag context |
-| Markdown | built-in | Stripped syntax + code blocks extracted separately |
-| XML | DOMParser | Text nodes |
-| TOML | built-in | Parsed + flattened like JSON |
+Each extractor attempts **npm package first**, then **esm.sh CDN fallback** automatically.
+No configuration required — works on restricted enterprise networks as long as internet access exists.
+
+| Format | Primary Library | CDN Fallback | Output |
+|---|---|---|---|
+| PDF | pdfjs-dist | esm.sh/pdfjs-dist@3.11.174 | Text + table detection (column analysis) |
+| DOCX/DOC | mammoth | esm.sh/mammoth@1.6.0 | Heading hierarchy, tables, metadata |
+| XLSX/XLS | SheetJS (xlsx) | esm.sh/xlsx@0.18.5 | "ColHeader: CellValue" row format |
+| CSV | pure JS | — | First row as headers, labelled sentences |
+| PPTX | jszip | esm.sh/jszip@3.10.1 | Slide titles + body + speaker notes |
+| PNG/JPG/TIFF | Tesseract.js | esm.sh/tesseract.js@5.0.4 | OCR text + layout analysis |
+| MP3/WAV/MP4 | Whisper.js | — | Audio transcription (lazy-loaded) |
+| JSON/YAML | built-in | — | Flattened `key.subkey.leaf: value` |
+| HCL/Terraform | custom parser | — | Resource blocks with all attributes annotated |
+| HTML | DOMParser | — | Text nodes + tag context |
+| Markdown | built-in | — | Stripped syntax + code blocks extracted separately |
+| XML | DOMParser | — | Text nodes |
+| TOML | built-in | — | Parsed + flattened like JSON |
 
 All extractors return:
 ```js
