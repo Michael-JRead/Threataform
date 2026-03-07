@@ -1372,7 +1372,13 @@ function parseTFMultiFile(files) {
         if (lm) { label = lm[1]; break; }
       }
       const multi = /\bfor_each\s*=/.test(body) ? "for_each" : /\bcount\s*=/.test(body) ? "count" : null;
-      resources.push({id, type:rtype, name:rname, label, body, multi, file:path, paveLayer});
+      // Parse structured attrs and collect HCL-derived input references
+      const attrs = parseHCLBody(body);
+      const inputRefs = [];
+      { const irRe = /\b(aws_[\w]+)\.([\w-]+)\.(\w+)\b/g; let ir;
+        while ((ir = irRe.exec(body)) !== null)
+          inputRefs.push({resourceId:`${ir[1]}.${ir[2]}`, attr:ir[3]}); }
+      resources.push({id, type:rtype, name:rname, label, body, attrs, inputRefs, multi, file:path, paveLayer});
 
       // Implicit deps: resource type references (aws_*, xsphere_*)
       const depRe = /\b(aws_[\w]+|xsphere_[\w]+)\.([\w-]+)\b/g; let rm;
@@ -1442,6 +1448,38 @@ function parseTFMultiFile(files) {
     }
   });
 
+  // ── Pass 4: Attachment resource connections ────────────────────────────
+  // These "glue" resources describe associations between two other resources.
+  // Walk each one and emit connections for every aws_*.name reference found.
+  const ATTACHMENT_TYPES = new Set([
+    'aws_lb_target_group_attachment',
+    'aws_lambda_event_source_mapping',
+    'aws_wafv2_web_acl_association',
+    'aws_cloudwatch_event_target',
+    'aws_sns_topic_subscription',
+    'aws_iam_role_policy_attachment',
+    'aws_iam_instance_profile',
+  ]);
+  resources.forEach(r => {
+    if (!ATTACHMENT_TYPES.has(r.type)) return;
+    const refRe = /\b(aws_[\w]+)\.([\w-]+)\b/g; let am;
+    while ((am = refRe.exec(r.body || '')) !== null) {
+      const to = `${am[1]}.${am[2]}`;
+      if (to !== r.id) connections.push({from:r.id, to, kind:'attachment', file:r.file, attachType:r.type});
+    }
+  });
+  // S3 bucket notification → Lambda: emit direct bucket→lambda edge
+  resources.filter(r => r.type === 'aws_s3_bucket_notification').forEach(r => {
+    [...(r.body || '').matchAll(/lambda_function_arn\s*=\s*([^\s\n]+)/g)].forEach(lr => {
+      const lm = (lr[1] || '').match(/\b(aws_lambda_function)\.([\w-]+)\b/);
+      if (lm) {
+        const bM = (r.body || '').match(/bucket\s*=\s*aws_s3_bucket\.([\w-]+)/);
+        const from = bM ? `aws_s3_bucket.${bM[1]}` : r.id;
+        connections.push({from, to:`aws_lambda_function.${lm[2]}`, kind:'notification', file:r.file});
+      }
+    });
+  });
+
   // ── Dedup ─────────────────────────────────────────────────────────────
   const seenR=new Set(), seenM=new Set(), seenC=new Set();
   const uResources = resources.filter(r=>{if(seenR.has(r.id))return false;seenR.add(r.id);return true;});
@@ -1449,7 +1487,8 @@ function parseTFMultiFile(files) {
   const valid = new Set([...uResources.map(r=>r.id),...uModules.map(m=>m.id)]);
   const uConns = connections.filter(c=>{
     const k=`${c.from}||${c.to}`;
-    if(seenC.has(k)||c.from===c.to||!valid.has(c.from))return false;
+    const isAttach = c.kind==='attachment'||c.kind==='notification';
+    if(seenC.has(k)||c.from===c.to||(!valid.has(c.from)&&!isAttach))return false;
     seenC.add(k);return true;
   });
 
@@ -1711,40 +1750,40 @@ function _getElementType(resourceType) {
 // Terraform misconfiguration checks (checkov-style, pure attribute inspection)
 const TF_MISCONFIG_CHECKS = {
   'aws_s3_bucket': [
-    { id:'S3-001', title:'S3 Bucket Public Access Not Blocked',   severity:'Critical', cwe:['CWE-284','CWE-732'], attack:['T1530'], check:(a)=>!a.block_public_acls&&!a.block_public_policy,              remediation:'Enable aws_s3_bucket_public_access_block with all four settings = true.' },
-    { id:'S3-002', title:'S3 Bucket Versioning Disabled',         severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'], check:(a)=>!a.versioning,                                              remediation:'Enable versioning { enabled = true } for data protection and DR.' },
-    { id:'S3-003', title:'S3 Bucket Access Logging Disabled',     severity:'Medium',   cwe:['CWE-778'],           attack:['T1562.008'], check:(a)=>!a.logging,                                            remediation:'Enable server access logging via logging { target_bucket = ... }' },
-    { id:'S3-004', title:'S3 Bucket Encryption Not Configured',   severity:'High',     cwe:['CWE-311'],           attack:['T1530'], check:(a)=>!a.server_side_encryption_configuration,                   remediation:'Configure server_side_encryption_configuration with AES256 or aws:kms.' },
+    { id:'S3-001', attrKey:'block_public_acls',                  title:'S3 Bucket Public Access Not Blocked',   severity:'Critical', cwe:['CWE-284','CWE-732'], attack:['T1530'], check:(a)=>!a.block_public_acls&&!a.block_public_policy,              remediation:'Enable aws_s3_bucket_public_access_block with all four settings = true.' },
+    { id:'S3-002', attrKey:'versioning',                         title:'S3 Bucket Versioning Disabled',         severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'], check:(a)=>{ const v=a.versioning; return !v||(typeof v==='object'&&!v.enabled); },  remediation:'Enable versioning { enabled = true } for data protection and DR.' },
+    { id:'S3-003', attrKey:'logging',                            title:'S3 Bucket Access Logging Disabled',     severity:'Medium',   cwe:['CWE-778'],           attack:['T1562.008'], check:(a)=>!a.logging,                                            remediation:'Enable server access logging via logging { target_bucket = ... }' },
+    { id:'S3-004', attrKey:'server_side_encryption_configuration',title:'S3 Bucket Encryption Not Configured',   severity:'High',     cwe:['CWE-311'],           attack:['T1530'], check:(a)=>!a.server_side_encryption_configuration,                   remediation:'Configure server_side_encryption_configuration with AES256 or aws:kms.' },
   ],
   'aws_security_group': [
-    { id:'SG-001', title:'Unrestricted SSH Access (0.0.0.0/0:22)',   severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=22&&r.to_port>=22&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),   remediation:'Restrict SSH to known IP ranges. Use bastion host or SSM Session Manager.' },
-    { id:'SG-002', title:'Unrestricted RDP Access (0.0.0.0/0:3389)', severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=3389&&r.to_port>=3389&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),remediation:'Restrict RDP to specific IP ranges. Use VPN or Direct Connect.' },
-    { id:'SG-003', title:'All Inbound Traffic Allowed (0.0.0.0/0)', severity:'Critical', cwe:['CWE-732'],           attack:['T1190'],         check:(a)=>(a.ingress||[]).some(r=>r.from_port===0&&r.to_port===0&&(r.cidr_blocks||[]).includes('0.0.0.0/0')),        remediation:'Apply least privilege. Only allow necessary ports from known CIDRs.' },
+    { id:'SG-001', attrKey:'ingress', title:'Unrestricted SSH Access (0.0.0.0/0:22)',   severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=22&&r.to_port>=22&&((r.cidr_blocks||[]).includes('0.0.0.0/0')||(r.ipv6_cidr_blocks||[]).includes('::/0'))),   remediation:'Restrict SSH to known IP ranges. Use bastion host or SSM Session Manager.' },
+    { id:'SG-002', attrKey:'ingress', title:'Unrestricted RDP Access (0.0.0.0/0:3389)', severity:'Critical', cwe:['CWE-732','CWE-284'], attack:['T1190','T1133'], check:(a)=>(a.ingress||[]).some(r=>r.from_port<=3389&&r.to_port>=3389&&((r.cidr_blocks||[]).includes('0.0.0.0/0')||(r.ipv6_cidr_blocks||[]).includes('::/0'))),remediation:'Restrict RDP to specific IP ranges. Use VPN or Direct Connect.' },
+    { id:'SG-003', attrKey:'ingress', title:'All Inbound Traffic Allowed (0.0.0.0/0)', severity:'Critical', cwe:['CWE-732'],           attack:['T1190'],         check:(a)=>(a.ingress||[]).some(r=>r.from_port===0&&r.to_port===0&&((r.cidr_blocks||[]).includes('0.0.0.0/0')||(r.ipv6_cidr_blocks||[]).includes('::/0'))),        remediation:'Apply least privilege. Only allow necessary ports from known CIDRs.' },
   ],
   'aws_rds_instance': [
-    { id:'RDS-001', title:'RDS Not Encrypted at Rest',          severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],        check:(a)=>!a.storage_encrypted,                   remediation:'Set storage_encrypted = true and specify a kms_key_id.' },
-    { id:'RDS-002', title:'RDS Instance Publicly Accessible',   severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],        check:(a)=>a.publicly_accessible===true,            remediation:'Set publicly_accessible = false. Place RDS in private subnets only.' },
-    { id:'RDS-003', title:'RDS Deletion Protection Disabled',   severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.deletion_protection,                 remediation:'Set deletion_protection = true in all production environments.' },
-    { id:'RDS-004', title:'RDS Automated Backups Disabled',     severity:'High',     cwe:['CWE-400'],           attack:['T1485','T1490'], check:(a)=>a.backup_retention_period===0,           remediation:'Set backup_retention_period >= 7 days for production databases.' },
-    { id:'RDS-005', title:'RDS Multi-AZ Not Enabled',           severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.multi_az,                            remediation:'Set multi_az = true for high availability in production.' },
+    { id:'RDS-001', attrKey:'storage_encrypted',     title:'RDS Not Encrypted at Rest',          severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],        check:(a)=>a.storage_encrypted===false||a.storage_encrypted===undefined,   remediation:'Set storage_encrypted = true and specify a kms_key_id.' },
+    { id:'RDS-002', attrKey:'publicly_accessible',   title:'RDS Instance Publicly Accessible',   severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],        check:(a)=>a.publicly_accessible===true,            remediation:'Set publicly_accessible = false. Place RDS in private subnets only.' },
+    { id:'RDS-003', attrKey:'deletion_protection',   title:'RDS Deletion Protection Disabled',   severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.deletion_protection,                 remediation:'Set deletion_protection = true in all production environments.' },
+    { id:'RDS-004', attrKey:'backup_retention_period',title:'RDS Automated Backups Disabled',    severity:'High',     cwe:['CWE-400'],           attack:['T1485','T1490'], check:(a)=>a.backup_retention_period===0,           remediation:'Set backup_retention_period >= 7 days for production databases.' },
+    { id:'RDS-005', attrKey:'multi_az',              title:'RDS Multi-AZ Not Enabled',           severity:'Medium',   cwe:['CWE-400'],           attack:['T1485'],        check:(a)=>!a.multi_az,                            remediation:'Set multi_az = true for high availability in production.' },
   ],
   'aws_db_instance': [
-    { id:'RDS-001', title:'DB Not Encrypted at Rest',           severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],  check:(a)=>!a.storage_encrypted,     remediation:'Set storage_encrypted = true and specify kms_key_id.' },
-    { id:'RDS-002', title:'DB Instance Publicly Accessible',    severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],  check:(a)=>a.publicly_accessible===true, remediation:'Set publicly_accessible = false.' },
+    { id:'RDS-001', attrKey:'storage_encrypted',   title:'DB Not Encrypted at Rest',           severity:'High',     cwe:['CWE-311','CWE-326'], attack:['T1530'],  check:(a)=>a.storage_encrypted===false||a.storage_encrypted===undefined, remediation:'Set storage_encrypted = true and specify kms_key_id.' },
+    { id:'RDS-002', attrKey:'publicly_accessible', title:'DB Instance Publicly Accessible',    severity:'Critical', cwe:['CWE-284'],           attack:['T1190'],  check:(a)=>a.publicly_accessible===true, remediation:'Set publicly_accessible = false.' },
   ],
   'aws_instance': [
-    { id:'EC2-001', title:'IMDSv1 Enabled (Metadata API Vulnerable)', severity:'High',   cwe:['CWE-284'],    attack:['T1552.005'], check:(a)=>{ const m=a.metadata_options; return !m||m.http_tokens!=='required'; }, remediation:'Set metadata_options { http_tokens = "required" } to enforce IMDSv2.' },
-    { id:'EC2-002', title:'No IAM Instance Profile Assigned',         severity:'Low',    cwe:['CWE-250'],    attack:['T1552.005'], check:(a)=>!a.iam_instance_profile,                                              remediation:'Assign a least-privilege IAM instance profile; avoid embedded credentials.' },
-    { id:'EC2-003', title:'Root EBS Volume Not Encrypted',            severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const r=a.root_block_device; return !r||!r.encrypted; },            remediation:'Set root_block_device { encrypted = true, kms_key_id = ... }' },
-    { id:'EC2-004', title:'EBS Volumes Not Encrypted',                severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const b=a.ebs_block_device||[]; return b.some&&b.some(v=>!v.encrypted); }, remediation:'Set encrypted = true on all ebs_block_device blocks.' },
+    { id:'EC2-001', attrKey:'metadata_options', title:'IMDSv1 Enabled (Metadata API Vulnerable)', severity:'High',   cwe:['CWE-284'],    attack:['T1552.005'], check:(a)=>{ const m=a.metadata_options; return !m||(typeof m==='object'?m.http_tokens!=='required':true); }, remediation:'Set metadata_options { http_tokens = "required" } to enforce IMDSv2.' },
+    { id:'EC2-002', attrKey:'iam_instance_profile', title:'No IAM Instance Profile Assigned',     severity:'Low',    cwe:['CWE-250'],    attack:['T1552.005'], check:(a)=>!a.iam_instance_profile,                                              remediation:'Assign a least-privilege IAM instance profile; avoid embedded credentials.' },
+    { id:'EC2-003', attrKey:'root_block_device',    title:'Root EBS Volume Not Encrypted',        severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const r=a.root_block_device; return !r||(typeof r==='object'&&!r.encrypted); }, remediation:'Set root_block_device { encrypted = true, kms_key_id = ... }' },
+    { id:'EC2-004', attrKey:'ebs_block_device',     title:'EBS Volumes Not Encrypted',            severity:'High',   cwe:['CWE-311'],    attack:['T1530'],     check:(a)=>{ const b=Array.isArray(a.ebs_block_device)?a.ebs_block_device:(a.ebs_block_device?[a.ebs_block_device]:[]); return b.some(v=>!v.encrypted); }, remediation:'Set encrypted = true on all ebs_block_device blocks.' },
   ],
   'aws_cloudtrail': [
-    { id:'CT-001', title:'CloudTrail Log File Validation Disabled', severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.enable_log_file_validation, remediation:'Set enable_log_file_validation = true to detect log tampering.' },
-    { id:'CT-002', title:'CloudTrail Logs Not Encrypted with KMS',  severity:'Medium', cwe:['CWE-311'], attack:['T1530'],     check:(a)=>!a.kms_key_id,                remediation:'Set kms_key_id to a KMS CMK ARN to encrypt CloudTrail logs at rest.' },
-    { id:'CT-003', title:'CloudTrail Not Multi-Region',             severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.is_multi_region_trail,      remediation:'Set is_multi_region_trail = true to capture all regional API activity.' },
+    { id:'CT-001', attrKey:'enable_log_file_validation', title:'CloudTrail Log File Validation Disabled', severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.enable_log_file_validation, remediation:'Set enable_log_file_validation = true to detect log tampering.' },
+    { id:'CT-002', attrKey:'kms_key_id',                 title:'CloudTrail Logs Not Encrypted with KMS',  severity:'Medium', cwe:['CWE-311'], attack:['T1530'],     check:(a)=>!a.kms_key_id,                remediation:'Set kms_key_id to a KMS CMK ARN to encrypt CloudTrail logs at rest.' },
+    { id:'CT-003', attrKey:'is_multi_region_trail',      title:'CloudTrail Not Multi-Region',             severity:'High',   cwe:['CWE-778'], attack:['T1562.008'], check:(a)=>!a.is_multi_region_trail,      remediation:'Set is_multi_region_trail = true to capture all regional API activity.' },
   ],
   'aws_kms_key': [
-    { id:'KMS-001', title:'KMS Key Rotation Disabled', severity:'Medium', cwe:['CWE-326'], attack:['T1600'], check:(a)=>!a.enable_key_rotation, remediation:'Set enable_key_rotation = true for automatic annual key rotation.' },
+    { id:'KMS-001', attrKey:'enable_key_rotation', title:'KMS Key Rotation Disabled', severity:'Medium', cwe:['CWE-326'], attack:['T1600'], check:(a)=>!a.enable_key_rotation, remediation:'Set enable_key_rotation = true for automatic annual key rotation.' },
   ],
   'aws_lambda_function': [
     { id:'LMB-001', title:'Lambda Not Inside VPC',                    severity:'Medium', cwe:['CWE-284'],           attack:['T1648'],     check:(a)=>!a.vpc_config,                                                           remediation:'Configure vpc_config with subnet_ids and security_group_ids.' },
@@ -1752,7 +1791,7 @@ const TF_MISCONFIG_CHECKS = {
     { id:'LMB-003', title:'Lambda Env Vars May Contain Secrets',      severity:'High',   cwe:['CWE-256','CWE-798'], attack:['T1555.006'], check:(a)=>{ const e=JSON.stringify(a.environment||'').toLowerCase(); return /password|secret|key|token|credential/.test(e); }, remediation:'Use AWS Secrets Manager or SSM SecureString instead of env var secrets.' },
   ],
   'aws_ssm_parameter': [
-    { id:'SSM-001', title:'SSM Parameter Not SecureString Type', severity:'High', cwe:['CWE-256','CWE-312'], attack:['T1555.006'], check:(a)=>a.type!=='SecureString', remediation:'Use type = "SecureString" with a KMS key for sensitive parameter values.' },
+    { id:'SSM-001', attrKey:'type', title:'SSM Parameter Not SecureString Type', severity:'High', cwe:['CWE-256','CWE-312'], attack:['T1555.006'], check:(a)=>a.type!=='SecureString', remediation:'Use type = "SecureString" with a KMS key for sensitive parameter values.' },
   ],
   'aws_eks_cluster': [
     { id:'EKS-001', title:'EKS API Endpoint Publicly Accessible',  severity:'High',   cwe:['CWE-284'], attack:['T1190','T1613'], check:(a)=>{ const v=a.vpc_config; return !v||v.endpoint_public_access!==false; },  remediation:'Set endpoint_public_access = false; access cluster via private endpoint + VPN.' },
@@ -1766,9 +1805,9 @@ const TF_MISCONFIG_CHECKS = {
   ],
   // ── DynamoDB ──────────────────────────────────────────────────────────────
   'aws_dynamodb_table': [
-    { id:'DDB-001', title:'DynamoDB Table No Explicit KMS Encryption',  severity:'Medium', cwe:['CWE-311'],       attack:['T1530'],     check:(a)=>!a.server_side_encryption, remediation:'Add server_side_encryption { enabled = true } with a CMK kms_key_arn for compliance.' },
-    { id:'DDB-002', title:'DynamoDB PITR (Point-in-Time Recovery) Off',  severity:'High',   cwe:['CWE-400'],       attack:['T1485','T1490'], check:(a)=>!a.point_in_time_recovery, remediation:'Enable point_in_time_recovery { enabled = true } for ransomware / deletion recovery.' },
-    { id:'DDB-003', title:'DynamoDB Table Has No Deletion Protection',   severity:'Medium', cwe:['CWE-400'],       attack:['T1485'],     check:(a)=>!a.deletion_protection_enabled, remediation:'Set deletion_protection_enabled = true to prevent accidental or malicious deletion.' },
+    { id:'DDB-001', attrKey:'server_side_encryption',    title:'DynamoDB Table No Explicit KMS Encryption',  severity:'Medium', cwe:['CWE-311'],       attack:['T1530'],     check:(a)=>{ const s=a.server_side_encryption; return !s||(typeof s==='object'&&!s.enabled); }, remediation:'Add server_side_encryption { enabled = true } with a CMK kms_key_arn for compliance.' },
+    { id:'DDB-002', attrKey:'point_in_time_recovery',    title:'DynamoDB PITR (Point-in-Time Recovery) Off',  severity:'High',   cwe:['CWE-400'],       attack:['T1485','T1490'], check:(a)=>{ const p=a.point_in_time_recovery; return !p||(typeof p==='object'&&!p.enabled); }, remediation:'Enable point_in_time_recovery { enabled = true } for ransomware / deletion recovery.' },
+    { id:'DDB-003', attrKey:'deletion_protection_enabled',title:'DynamoDB Table Has No Deletion Protection',  severity:'Medium', cwe:['CWE-400'],       attack:['T1485'],     check:(a)=>!a.deletion_protection_enabled, remediation:'Set deletion_protection_enabled = true to prevent accidental or malicious deletion.' },
   ],
   // ── ElastiCache ───────────────────────────────────────────────────────────
   'aws_elasticache_cluster': [
@@ -1898,53 +1937,199 @@ const TF_MISCONFIG_CHECKS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EVIDENCE FRAMEWORK — confidence scores + source metadata for every finding
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CONFIDENCE_BY_METHOD = {
+  attr_parse:     92, // parseHCLBody extracted a concrete value
+  flat_string:    90, // flat key = "value" regex match
+  flat_bool:      90, // flat key = true/false regex match
+  policy_parse:   95, // JSON policy document parsed and evaluated
+  type_presence:  50, // resource type found, config not verified
+  type_assoc:     75, // resource type + association resource verified
+  substring_match:35, // r.body.includes(x) only
+  bm25_token:     55, // doc match with BM25 + negation check passed
+  bm25_low:       30, // doc match at 60% token threshold only
+  var_ref:        20, // attribute present but value is var.x (unresolved)
+  attr_absence:   85, // attribute confirmed absent by parseHCLBody
+};
+
+function mkEvidence(method, snippet, location='', extra={}) {
+  return {
+    source: ['attr_parse','flat_string','flat_bool','policy_parse','var_ref','attr_absence'].includes(method)
+      ? 'hcl' : ['bm25_token','bm25_low'].includes(method) ? 'doc' : 'inferred',
+    confidence: CONFIDENCE_BY_METHOD[method] ?? 40,
+    snippet: (snippet||'').slice(0, 160),
+    location,
+    method,
+    ...extra,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ENTERPRISE SECURITY KNOWLEDGE GRAPH v2
 // Control Detection · Defense-in-Depth Layers · Zero-Trust Pillars
 // NIST CSF 2.0 · Cross-Doc Correlation · Blast Radius · Posture Scoring
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Control detect helpers ─────────────────────────────────────────────────────
+const _ctrlPresent = (snippet, loc='') => ({ state:'present', evidence:mkEvidence('type_presence', snippet, loc) });
+const _ctrlPartial = (snippet, loc='') => ({ state:'partial',  evidence:mkEvidence('type_presence', snippet, loc) });
+const _ctrlAbsent  = (snippet, loc='') => ({ state:'absent',   evidence:mkEvidence('type_presence', snippet, loc) });
+const _ctrlAssoc   = (snippet, loc='') => ({ state:'present',  evidence:mkEvidence('type_assoc', snippet, loc) });
+const _ctrlAttr    = (snippet, loc='') => ({ state:'present',  evidence:mkEvidence('attr_parse', snippet, loc) });
+
 // Control detection map: TF resource presence → named security control
 const CONTROL_DETECTION_MAP = [
   // ── Perimeter
-  { id:'CTRL-WAF',    layer:'perimeter',   ztPillar:'network',     name:'Web Application Firewall (WAF)',       detect:(rs)=>rs.some(r=>['aws_wafv2_web_acl','aws_waf_web_acl'].includes(r.type)) },
-  { id:'CTRL-SHIELD', layer:'perimeter',   ztPillar:'network',     name:'DDoS Protection (Shield Advanced)',    detect:(rs)=>rs.some(r=>r.type==='aws_shield_protection') },
-  { id:'CTRL-CF',     layer:'perimeter',   ztPillar:'network',     name:'CloudFront CDN / Edge Security',       detect:(rs)=>rs.some(r=>r.type==='aws_cloudfront_distribution') },
+  { id:'CTRL-WAF', layer:'perimeter', ztPillar:'network', name:'Web Application Firewall (WAF)',
+    detect:(rs)=>{
+      const waf=rs.find(r=>['aws_wafv2_web_acl','aws_waf_web_acl'].includes(r.type));
+      if(!waf) return _ctrlAbsent('No aws_wafv2_web_acl resource found');
+      const assoc=rs.find(r=>r.type==='aws_wafv2_web_acl_association');
+      if(!assoc) return _ctrlPartial(`aws_wafv2_web_acl.${waf.name} exists but no aws_wafv2_web_acl_association`,waf.id);
+      return _ctrlAssoc(`WAF ACL + association verified: ${waf.id}`,waf.id);
+    }},
+  { id:'CTRL-SHIELD', layer:'perimeter', ztPillar:'network', name:'DDoS Protection (Shield Advanced)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_shield_protection');return r?_ctrlPresent(`aws_shield_protection.${r.name}`,r.id):_ctrlAbsent('No aws_shield_protection resource');} },
+  { id:'CTRL-CF', layer:'perimeter', ztPillar:'network', name:'CloudFront CDN / Edge Security',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_cloudfront_distribution');return r?_ctrlPresent(`aws_cloudfront_distribution.${r.name}`,r.id):_ctrlAbsent('No aws_cloudfront_distribution resource');} },
   // ── Network
-  { id:'CTRL-VPC',    layer:'network',     ztPillar:'network',     name:'VPC Network Isolation',                detect:(rs)=>rs.some(r=>r.type==='aws_vpc') },
-  { id:'CTRL-NACL',   layer:'network',     ztPillar:'network',     name:'Network ACLs (Layer 4 filter)',        detect:(rs)=>rs.some(r=>r.type==='aws_network_acl') },
-  { id:'CTRL-VPCE',   layer:'network',     ztPillar:'network',     name:'VPC Endpoints (PrivateLink)',          detect:(rs)=>rs.some(r=>r.type==='aws_vpc_endpoint') },
-  { id:'CTRL-FLOGS',  layer:'network',     ztPillar:'monitoring',  name:'VPC Flow Logs',                        detect:(rs)=>rs.some(r=>r.type==='aws_flow_log') },
-  { id:'CTRL-TGW',    layer:'network',     ztPillar:'network',     name:'Transit Gateway (Microsegmentation)',  detect:(rs)=>rs.some(r=>r.type==='aws_ec2_transit_gateway') },
-  { id:'CTRL-DX',     layer:'network',     ztPillar:'network',     name:'Direct Connect / VPN',                 detect:(rs)=>rs.some(r=>['aws_dx_connection','aws_vpn_connection','aws_customer_gateway'].includes(r.type)) },
+  { id:'CTRL-VPC', layer:'network', ztPillar:'network', name:'VPC Network Isolation',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_vpc');return r?_ctrlPresent(`aws_vpc.${r.name}`,r.id):_ctrlAbsent('No aws_vpc resource');} },
+  { id:'CTRL-NACL', layer:'network', ztPillar:'network', name:'Network ACLs (Layer 4 filter)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_network_acl');return r?_ctrlPresent(`aws_network_acl.${r.name}`,r.id):_ctrlAbsent('No aws_network_acl resource');} },
+  { id:'CTRL-VPCE', layer:'network', ztPillar:'network', name:'VPC Endpoints (PrivateLink)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_vpc_endpoint');return r?_ctrlPresent(`aws_vpc_endpoint.${r.name}`,r.id):_ctrlAbsent('No aws_vpc_endpoint resource');} },
+  { id:'CTRL-FLOGS', layer:'network', ztPillar:'monitoring', name:'VPC Flow Logs',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_flow_log');return r?_ctrlPresent(`aws_flow_log.${r.name}`,r.id):_ctrlAbsent('No aws_flow_log resource');} },
+  { id:'CTRL-TGW', layer:'network', ztPillar:'network', name:'Transit Gateway (Microsegmentation)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_ec2_transit_gateway');return r?_ctrlPresent(`aws_ec2_transit_gateway.${r.name}`,r.id):_ctrlAbsent('No aws_ec2_transit_gateway resource');} },
+  { id:'CTRL-DX', layer:'network', ztPillar:'network', name:'Direct Connect / VPN',
+    detect:(rs)=>{const r=rs.find(x=>['aws_dx_connection','aws_vpn_connection','aws_customer_gateway'].includes(x.type));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No Direct Connect or VPN resource');} },
   // ── Identity
-  { id:'CTRL-SCP',    layer:'identity',    ztPillar:'identity',    name:'Service Control Policies (SCPs)',      detect:(rs)=>rs.some(r=>r.type==='aws_organizations_policy'||r.type==='AWS::Organizations::Policy') },
-  { id:'CTRL-SSO',    layer:'identity',    ztPillar:'identity',    name:'AWS SSO / Identity Center',            detect:(rs)=>rs.some(r=>r.type.startsWith('aws_ssoadmin')||r.type.startsWith('aws_identitystore')) },
-  { id:'CTRL-OIDC',   layer:'identity',    ztPillar:'identity',    name:'OIDC Federation (GitHub/TFE)',         detect:(rs)=>rs.some(r=>r.type==='aws_iam_openid_connect_provider') },
-  { id:'CTRL-PB',     layer:'identity',    ztPillar:'identity',    name:'IAM Permission Boundaries',           detect:(rs)=>rs.some(r=>(r.type==='aws_iam_role'&&r.body&&r.body.includes('permissions_boundary'))||(r.type==='AWS::IAM::Role'&&r.cfnProps?.PermissionsBoundary)) },
-  { id:'CTRL-SAML',   layer:'identity',    ztPillar:'identity',    name:'SAML Federation',                      detect:(rs)=>rs.some(r=>r.type==='aws_iam_saml_provider') },
-  { id:'CTRL-AA',     layer:'identity',    ztPillar:'identity',    name:'IAM Access Analyzer',                  detect:(rs)=>rs.some(r=>r.type==='aws_accessanalyzer_analyzer') },
+  { id:'CTRL-SCP', layer:'identity', ztPillar:'identity', name:'Service Control Policies (SCPs)',
+    detect:(rs)=>{
+      const pol=rs.find(r=>r.type==='aws_organizations_policy'||r.type==='AWS::Organizations::Policy');
+      if(!pol) return _ctrlAbsent('No aws_organizations_policy resource');
+      const attach=rs.find(r=>r.type==='aws_organizations_policy_attachment');
+      if(!attach) return _ctrlPartial(`aws_organizations_policy exists but no aws_organizations_policy_attachment`,pol.id);
+      return _ctrlAssoc(`SCP + attachment verified: ${pol.id}`,pol.id);
+    }},
+  { id:'CTRL-SSO', layer:'identity', ztPillar:'identity', name:'AWS SSO / Identity Center',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_ssoadmin')||x.type.startsWith('aws_identitystore'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No SSO/Identity Center resource');} },
+  { id:'CTRL-OIDC', layer:'identity', ztPillar:'identity', name:'OIDC Federation (GitHub/TFE)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_iam_openid_connect_provider');return r?_ctrlPresent(`aws_iam_openid_connect_provider.${r.name}`,r.id):_ctrlAbsent('No aws_iam_openid_connect_provider resource');} },
+  { id:'CTRL-PB', layer:'identity', ztPillar:'identity', name:'IAM Permission Boundaries',
+    detect:(rs)=>{
+      const roles=rs.filter(r=>r.type==='aws_iam_role'||r.type==='AWS::IAM::Role');
+      if(!roles.length) return _ctrlAbsent('No IAM role resources');
+      const results=roles.map(role=>{
+        const attrs=role.isCFN?role.cfnProps||{}:(role.attrs||parseHCLBody(role.body||''));
+        const hasPB=role.isCFN?!!attrs.PermissionsBoundary:(attrs.permissions_boundary!==undefined&&attrs.permissions_boundary!==null);
+        return {id:role.id,hasPB,msg:hasPB?`permissions_boundary set`:`permissions_boundary absent`};
+      });
+      const allHave=results.every(r=>r.hasPB), anyHave=results.some(r=>r.hasPB);
+      const snippet=results.map(r=>`${r.id}: ${r.msg}`).join('; ').slice(0,160);
+      return {state:allHave?'present':anyHave?'partial':'absent', evidence:mkEvidence('attr_parse',snippet)};
+    }},
+  { id:'CTRL-SAML', layer:'identity', ztPillar:'identity', name:'SAML Federation',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_iam_saml_provider');return r?_ctrlPresent(`aws_iam_saml_provider.${r.name}`,r.id):_ctrlAbsent('No aws_iam_saml_provider resource');} },
+  { id:'CTRL-AA', layer:'identity', ztPillar:'identity', name:'IAM Access Analyzer',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_accessanalyzer_analyzer');return r?_ctrlPresent(`aws_accessanalyzer_analyzer.${r.name}`,r.id):_ctrlAbsent('No aws_accessanalyzer_analyzer resource');} },
   // ── Compute
-  { id:'CTRL-IMDSv2', layer:'compute',     ztPillar:'application', name:'EC2 IMDSv2 Enforced',                  detect:(rs)=>rs.filter(r=>r.type==='aws_instance').length>0&&rs.filter(r=>r.type==='aws_instance').every(r=>r.body&&r.body.includes('http_tokens')&&r.body.includes('required')) },
-  { id:'CTRL-SSMSM',  layer:'compute',     ztPillar:'application', name:'SSM Session Manager',                  detect:(rs)=>rs.some(r=>r.type==='aws_ssm_document'||r.type==='aws_ssm_association') },
-  { id:'CTRL-EKSP',   layer:'compute',     ztPillar:'application', name:'EKS Private API Endpoint',             detect:(rs)=>rs.some(r=>r.type==='aws_eks_cluster'&&r.body&&r.body.includes('endpoint_public_access')&&r.body.includes('false')) },
+  { id:'CTRL-IMDSv2', layer:'compute', ztPillar:'application', name:'EC2 IMDSv2 Enforced',
+    detect:(rs)=>{
+      const instances=rs.filter(r=>r.type==='aws_instance');
+      if(!instances.length) return _ctrlAbsent('No aws_instance resources');
+      const results=instances.map(r=>{
+        const a=r.attrs||parseHCLBody(r.body||'');
+        const mo=a.metadata_options;
+        if(!mo) return {id:r.id,state:'absent',msg:'metadata_options block missing'};
+        if(typeof mo==='object'&&mo.http_tokens===null) return {id:r.id,state:'partial',msg:'http_tokens = var (unresolved)'};
+        return {id:r.id,state:(typeof mo==='object'&&mo.http_tokens==='required')?'present':'absent',msg:`http_tokens = "${typeof mo==='object'?mo.http_tokens:mo}"`};
+      });
+      const all=results.every(r=>r.state==='present'), any=results.some(r=>r.state!=='absent');
+      return {state:all?'present':any?'partial':'absent', evidence:mkEvidence('attr_parse',results.map(r=>`${r.id}: ${r.msg}`).join('; ').slice(0,160))};
+    }},
+  { id:'CTRL-SSMSM', layer:'compute', ztPillar:'application', name:'SSM Session Manager',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_ssm_document'||x.type==='aws_ssm_association');return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_ssm_document or aws_ssm_association resource');} },
+  { id:'CTRL-EKSP', layer:'compute', ztPillar:'application', name:'EKS Private API Endpoint',
+    detect:(rs)=>{
+      const cls=rs.find(r=>r.type==='aws_eks_cluster');
+      if(!cls) return _ctrlAbsent('No aws_eks_cluster resource');
+      const a=cls.attrs||parseHCLBody(cls.body||'');
+      const vc=a.vpc_config;
+      const pub=typeof vc==='object'?vc.endpoint_public_access:undefined;
+      if(pub===false) return _ctrlAttr(`endpoint_public_access = false`,cls.id);
+      if(pub===null)  return _ctrlPartial(`endpoint_public_access = var (unresolved)`,cls.id);
+      return _ctrlAbsent(`endpoint_public_access not set to false`,cls.id);
+    }},
   // ── Application
-  { id:'CTRL-APIGW',  layer:'application', ztPillar:'application', name:'API Gateway Auth / Throttling',        detect:(rs)=>rs.some(r=>r.type.startsWith('aws_api_gateway')||r.type.startsWith('aws_apigatewayv2')) },
-  { id:'CTRL-COGNITO',layer:'application', ztPillar:'application', name:'Cognito User Authentication',          detect:(rs)=>rs.some(r=>r.type.startsWith('aws_cognito')) },
-  { id:'CTRL-WAFASSOC',layer:'application',ztPillar:'application', name:'WAF Associated to ALB/API GW',         detect:(rs)=>rs.some(r=>r.type==='aws_wafv2_web_acl_association') },
+  { id:'CTRL-APIGW', layer:'application', ztPillar:'application', name:'API Gateway Auth / Throttling',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_api_gateway')||x.type.startsWith('aws_apigatewayv2'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No API Gateway resource');} },
+  { id:'CTRL-COGNITO', layer:'application', ztPillar:'application', name:'Cognito User Authentication',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_cognito'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_cognito resource');} },
+  { id:'CTRL-WAFASSOC', layer:'application', ztPillar:'application', name:'WAF Associated to ALB/API GW',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_wafv2_web_acl_association');return r?_ctrlAssoc(`aws_wafv2_web_acl_association.${r.name}`,r.id):_ctrlAbsent('No aws_wafv2_web_acl_association resource');} },
   // ── Data
-  { id:'CTRL-KMS',    layer:'data',        ztPillar:'data',        name:'KMS Customer-Managed Keys',            detect:(rs)=>rs.some(r=>r.type==='aws_kms_key') },
-  { id:'CTRL-SM',     layer:'data',        ztPillar:'data',        name:'Secrets Manager',                      detect:(rs)=>rs.some(r=>r.type==='aws_secretsmanager_secret') },
-  { id:'CTRL-SSMPS',  layer:'data',        ztPillar:'data',        name:'SSM Parameter Store (SecureString)',   detect:(rs)=>rs.some(r=>r.type==='aws_ssm_parameter'&&r.body&&r.body.includes('SecureString')) },
-  { id:'CTRL-MACIE',  layer:'data',        ztPillar:'data',        name:'Macie (Sensitive Data Discovery)',     detect:(rs)=>rs.some(r=>r.type.startsWith('aws_macie')) },
-  { id:'CTRL-BACKUP', layer:'data',        ztPillar:'data',        name:'AWS Backup (Recovery Plans)',          detect:(rs)=>rs.some(r=>r.type.startsWith('aws_backup')) },
-  { id:'CTRL-S3VER',  layer:'data',        ztPillar:'data',        name:'S3 Versioning (Data Protection)',      detect:(rs)=>rs.some(r=>r.type==='aws_s3_bucket'&&r.body&&/versioning[\s\S]{0,80}enabled\s*=\s*true/.test(r.body)) },
+  { id:'CTRL-KMS', layer:'data', ztPillar:'data', name:'KMS Customer-Managed Keys',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_kms_key');return r?_ctrlPresent(`aws_kms_key.${r.name}`,r.id):_ctrlAbsent('No aws_kms_key resource');} },
+  { id:'CTRL-SM', layer:'data', ztPillar:'data', name:'Secrets Manager',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_secretsmanager_secret');return r?_ctrlPresent(`aws_secretsmanager_secret.${r.name}`,r.id):_ctrlAbsent('No aws_secretsmanager_secret resource');} },
+  { id:'CTRL-SSMPS', layer:'data', ztPillar:'data', name:'SSM Parameter Store (SecureString)',
+    detect:(rs)=>{
+      const params=rs.filter(r=>r.type==='aws_ssm_parameter');
+      if(!params.length) return _ctrlAbsent('No aws_ssm_parameter resources');
+      const secures=params.filter(r=>{const a=r.attrs||parseHCLBody(r.body||'');return a.type==='SecureString';});
+      if(!secures.length) return _ctrlAbsent(`${params.length} SSM parameter(s) found, none SecureString`);
+      if(secures.length<params.length) return _ctrlPartial(`${secures.length}/${params.length} SSM parameters are SecureString`);
+      return _ctrlAttr(`All ${params.length} SSM parameter(s) use SecureString`);
+    }},
+  { id:'CTRL-MACIE', layer:'data', ztPillar:'data', name:'Macie (Sensitive Data Discovery)',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_macie'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_macie resource');} },
+  { id:'CTRL-BACKUP', layer:'data', ztPillar:'data', name:'AWS Backup (Recovery Plans)',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_backup'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_backup resource');} },
+  { id:'CTRL-S3VER', layer:'data', ztPillar:'data', name:'S3 Versioning (Data Protection)',
+    detect:(rs)=>{
+      const buckets=rs.filter(r=>r.type==='aws_s3_bucket');
+      if(!buckets.length) return _ctrlAbsent('No aws_s3_bucket resources');
+      const results=buckets.map(r=>{
+        const a=r.attrs||parseHCLBody(r.body||'');
+        const v=a.versioning;
+        const enabled=typeof v==='object'?v?.enabled===true:false;
+        return {id:r.id,state:enabled?'present':'absent',msg:enabled?'versioning.enabled = true':'versioning not enabled'};
+      });
+      const all=results.every(r=>r.state==='present'), any=results.some(r=>r.state!=='absent');
+      return {state:all?'present':any?'partial':'absent', evidence:mkEvidence('attr_parse',results.map(r=>`${r.id}: ${r.msg}`).join('; ').slice(0,160))};
+    }},
   // ── Monitoring
-  { id:'CTRL-CT',     layer:'monitoring',  ztPillar:'monitoring',  name:'CloudTrail API Audit Logging',         detect:(rs)=>rs.some(r=>r.type==='aws_cloudtrail') },
-  { id:'CTRL-CTMR',   layer:'monitoring',  ztPillar:'monitoring',  name:'CloudTrail Multi-Region',              detect:(rs)=>rs.some(r=>r.type==='aws_cloudtrail'&&r.body&&r.body.includes('is_multi_region_trail')&&r.body.includes('true')) },
-  { id:'CTRL-GD',     layer:'monitoring',  ztPillar:'monitoring',  name:'GuardDuty Threat Detection',           detect:(rs)=>rs.some(r=>r.type==='aws_guardduty_detector') },
-  { id:'CTRL-CONFIG', layer:'monitoring',  ztPillar:'monitoring',  name:'AWS Config (Compliance Rules)',        detect:(rs)=>rs.some(r=>r.type==='aws_config_configuration_recorder'||r.type==='aws_config_rule') },
-  { id:'CTRL-SH',     layer:'monitoring',  ztPillar:'monitoring',  name:'Security Hub (Findings Aggregation)', detect:(rs)=>rs.some(r=>r.type.startsWith('aws_securityhub')) },
-  { id:'CTRL-CW',     layer:'monitoring',  ztPillar:'monitoring',  name:'CloudWatch Metric Alarms',             detect:(rs)=>rs.some(r=>r.type==='aws_cloudwatch_metric_alarm') },
+  { id:'CTRL-CT', layer:'monitoring', ztPillar:'monitoring', name:'CloudTrail API Audit Logging',
+    detect:(rs)=>{
+      const ct=rs.find(r=>r.type==='aws_cloudtrail');
+      if(!ct) return _ctrlAbsent('No aws_cloudtrail resource');
+      const a=ct.attrs||parseHCLBody(ct.body||'');
+      if(a.enable_log_file_validation===true) return _ctrlAttr(`enable_log_file_validation = true`,ct.id);
+      if(a.enable_log_file_validation===false) return _ctrlPartial(`enable_log_file_validation = false`,ct.id);
+      return _ctrlPartial(`aws_cloudtrail.${ct.name} present; enable_log_file_validation not set`,ct.id);
+    }},
+  { id:'CTRL-CTMR', layer:'monitoring', ztPillar:'monitoring', name:'CloudTrail Multi-Region',
+    detect:(rs)=>{
+      const ct=rs.find(r=>r.type==='aws_cloudtrail');
+      if(!ct) return _ctrlAbsent('No aws_cloudtrail resource');
+      const a=ct.attrs||parseHCLBody(ct.body||'');
+      if(a.is_multi_region_trail===true) return _ctrlAttr(`is_multi_region_trail = true`,ct.id);
+      if(a.is_multi_region_trail===null) return _ctrlPartial(`is_multi_region_trail = var (unresolved)`,ct.id);
+      return _ctrlAbsent(`is_multi_region_trail not set to true`,ct.id);
+    }},
+  { id:'CTRL-GD', layer:'monitoring', ztPillar:'monitoring', name:'GuardDuty Threat Detection',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_guardduty_detector');return r?_ctrlPresent(`aws_guardduty_detector.${r.name}`,r.id):_ctrlAbsent('No aws_guardduty_detector resource');} },
+  { id:'CTRL-CONFIG', layer:'monitoring', ztPillar:'monitoring', name:'AWS Config (Compliance Rules)',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_config_configuration_recorder'||x.type==='aws_config_rule');return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_config_configuration_recorder or aws_config_rule resource');} },
+  { id:'CTRL-SH', layer:'monitoring', ztPillar:'monitoring', name:'Security Hub (Findings Aggregation)',
+    detect:(rs)=>{const r=rs.find(x=>x.type.startsWith('aws_securityhub'));return r?_ctrlPresent(`${r.type}.${r.name}`,r.id):_ctrlAbsent('No aws_securityhub resource');} },
+  { id:'CTRL-CW', layer:'monitoring', ztPillar:'monitoring', name:'CloudWatch Metric Alarms',
+    detect:(rs)=>{const r=rs.find(x=>x.type==='aws_cloudwatch_metric_alarm');return r?_ctrlPresent(`aws_cloudwatch_metric_alarm.${r.name}`,r.id):_ctrlAbsent('No aws_cloudwatch_metric_alarm resource');} },
 ];
 
 // Defense-in-Depth layer metadata
@@ -2033,6 +2218,134 @@ function inferArchitectureHierarchy(resources, modules, files) {
   // Pave layers
   resources.forEach(r=>{ if(r.paveLayer){h.paveLayers[r.paveLayer]=(h.paveLayers[r.paveLayer]||0)+1; }});
   return h;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HCL PARSER — recursive brace-depth block extraction
+// Replaces _parseAttrMap flat-regex approach. Handles nested blocks correctly:
+//   metadata_options { http_tokens = "required" }  →  attrs.metadata_options.http_tokens = "required"
+//   versioning { enabled = true }                  →  attrs.versioning.enabled = true
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _findMatchingBrace(text, openPos) {
+  let depth = 0;
+  for (let i = openPos; i < text.length; i++) {
+    // Skip string literals so braces inside strings are ignored
+    if (text[i] === '"') {
+      i++;
+      while (i < text.length && text[i] !== '"') { if (text[i] === '\\') i++; i++; }
+      continue;
+    }
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+function _extractBlocks(text, attrs) {
+  // Block names that are top-level HCL constructs, not nested attribute blocks
+  const SKIP = new Set(['resource','data','module','variable','output','provider','locals',
+                        'terraform','lifecycle','for_each','count','dynamic']);
+  const re = /\b(\w+)(?:\s+"[^"]*")?\s*\{/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (SKIP.has(m[1])) continue;
+    const open = m.index + m[0].length - 1;
+    const close = _findMatchingBrace(text, open);
+    if (close === -1) continue;
+    const sub = parseHCLBody(text.slice(open + 1, close));
+    const k = m[1];
+    // Support repeated blocks → array
+    if (Array.isArray(attrs[k])) attrs[k].push(sub);
+    else if (attrs[k] && typeof attrs[k] === 'object' && !Array.isArray(attrs[k])) attrs[k] = [attrs[k], sub];
+    else attrs[k] = sub;
+    re.lastIndex = close + 1;
+  }
+}
+
+function parseHCLBody(body) {
+  if (!body) return {};
+  const attrs = {};
+  // Strip comments before parsing
+  const clean = body.replace(/\/\/[^\n]*/g, '').replace(/#[^\n]*/g, '');
+  // Flat string: key = "value"
+  for (const [, k, v] of clean.matchAll(/^\s*(\w+)\s*=\s*"([^"\\]*)"/gm)) {
+    attrs[k] = v;
+    attrs[`__src_${k}`] = { method: 'flat_string', snippet: `${k} = "${v}"` };
+  }
+  // Flat bool: key = true|false
+  for (const [, k, v] of clean.matchAll(/^\s*(\w+)\s*=\s*(true|false)\b/gm)) {
+    if (attrs[k] === undefined) {
+      attrs[k] = (v === 'true');
+      attrs[`__src_${k}`] = { method: 'flat_bool', snippet: `${k} = ${v}` };
+    }
+  }
+  // Flat number: key = 42
+  for (const [, k, v] of clean.matchAll(/^\s*(\w+)\s*=\s*(\d+)\b/gm)) {
+    if (attrs[k] === undefined) {
+      attrs[k] = parseInt(v, 10);
+      attrs[`__src_${k}`] = { method: 'flat_number', snippet: `${k} = ${v}` };
+    }
+  }
+  // String list: key = ["a","b"]
+  for (const [, k, v] of clean.matchAll(/^\s*(\w+)\s*=\s*\[([^\]]*)\]/gm)) {
+    const items = [...(v || '').matchAll(/"([^"]+)"/g)].map(m2 => m2[1]);
+    if (items.length) {
+      attrs[k] = items;
+      attrs[`__src_${k}`] = { method: 'list', snippet: `${k} = [${v.trim().slice(0, 60)}]` };
+    }
+  }
+  // Variable/local ref → null (unresolved, cannot be checked)
+  for (const [, k, ref] of clean.matchAll(/^\s*(\w+)\s*=\s*(var\.\w+|local\.\w+)/gm)) {
+    if (attrs[k] === undefined) {
+      attrs[k] = null;
+      attrs[`__src_${k}`] = { method: 'var_ref', snippet: `${k} = ${ref}`, unresolved: true, ref };
+    }
+  }
+  // Nested blocks (recursive)
+  _extractBlocks(clean, attrs);
+  return attrs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IAM POLICY ANALYSIS — factual JSON policy document inspection
+// Never uses substring matching; parses actual Statement arrays
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _analyzeIAMDocument(doc, resourceId, findings, policyKind) {
+  if (!doc?.Statement) return;
+  const stmts = Array.isArray(doc.Statement) ? doc.Statement : [doc.Statement];
+  stmts.forEach(stmt => {
+    if (stmt.Effect !== 'Allow') return;
+    const actions = (Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action]).filter(Boolean);
+    const rsrcs   = (Array.isArray(stmt.Resource) ? stmt.Resource : [stmt.Resource]).filter(Boolean);
+    if (actions.includes('*') && rsrcs.includes('*'))
+      findings.push({
+        id:'IAM-ADMIN', severity:'Critical', policyKind, resourceId,
+        title:'Policy grants AdministratorAccess (Action:* Resource:*)',
+        evidence: mkEvidence('policy_parse','Action:* Resource:*', resourceId),
+        remediation:'Replace wildcard with specific actions following least-privilege principle.',
+        cwe:['CWE-269'], attack:['T1078.004'],
+      });
+    if (actions.some(a => a === 'iam:*' || /^iam:.*\*$/.test(a)))
+      findings.push({
+        id:'IAM-PRIV-ESC', severity:'Critical', policyKind, resourceId,
+        title:'Policy allows IAM privilege escalation (iam:*)',
+        evidence: mkEvidence('policy_parse','iam:* allows creating roles/policies with any permissions', resourceId),
+        remediation:'Restrict to specific IAM read actions; never grant iam:PassRole without conditions.',
+        cwe:['CWE-269'], attack:['T1078.004','T1548'],
+      });
+    // Broad service wildcards (s3:*, ec2:*, etc.)
+    const broadSvc = actions.filter(a => /^\w+:\*$/.test(a) && a !== 'iam:*');
+    if (broadSvc.length > 0 && rsrcs.includes('*'))
+      findings.push({
+        id:'IAM-SVC-WILD', severity:'High', policyKind, resourceId,
+        title:`Policy uses broad service wildcard: ${broadSvc.slice(0,3).join(', ')}`,
+        evidence: mkEvidence('policy_parse', broadSvc.join(', ') + ' on Resource:*', resourceId),
+        remediation:'Scope actions to specific resource ARNs; avoid service-level wildcards on Resource:*.',
+        cwe:['CWE-269'], attack:['T1078.004'],
+      });
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2304,19 +2617,101 @@ class ThreatModelIntelligence {
     // Branch on isCFN: use structured cfnProps for CFN resources, HCL body for TF resources
     const attrs = resource?.isCFN
       ? this._parseCFNAttrs(resource.cfnProps||{})
-      : this._parseAttrMap(resource?.body||'');
+      : (resource?.attrs ?? parseHCLBody(resource?.body||''));
+    const isHCL = !resource?.isCFN;
+    const rLabel = `${resource?.type||type}.${resource?.name||resource?.id||''}`;
     return (TF_MISCONFIG_CHECKS[type]||[]).reduce((out,chk) => {
       let triggered=false;
       try { triggered=chk.check(attrs); } catch(_){}
-      if (triggered) out.push({
-        id:chk.id, title:chk.title, severity:chk.severity,
-        cwe:chk.cwe, attack:chk.attack, remediation:chk.remediation,
+      if (!triggered) return out;
+      // ── Build evidence ────────────────────────────────────────────────────
+      let ev;
+      const ak = chk.attrKey;
+      if (isHCL && ak) {
+        const src = attrs[`__src_${ak}`];
+        if (src) {
+          ev = mkEvidence(src.method, src.snippet, rLabel, src.unresolved ? {unresolved:true} : {});
+        } else {
+          // attrKey defined but attr absent → absence evidence
+          ev = mkEvidence('attr_absence', `${ak} not present`, rLabel);
+        }
+      } else if (resource?.isCFN) {
+        ev = mkEvidence('policy_parse', `CFN property check: ${chk.id}`, rLabel);
+      } else {
+        ev = mkEvidence('type_presence', `${chk.id}: ${chk.title}`, rLabel);
+      }
+      // ── Downgrade if triggering attr is an unresolved variable reference ──
+      let severity = chk.severity;
+      let title    = chk.title;
+      if (isHCL && ak && attrs[`__src_${ak}`]?.unresolved) {
+        severity = 'Info';
+        title    = `${title} [VAR UNRESOLVED]`;
+      }
+      out.push({
+        id:chk.id, title, severity,
+        cwe:chk.cwe, attack:chk.attack, remediation:chk.remediation, evidence:ev,
         resourceType:type, resourceName:resource?.name||resource?.id||'',
         paveLayer:resource?.paveLayer||null,
-        mitigatedBy:null,  // Phase 2 fills this from SCP analysis
+        mitigatedBy:null,  // Phase 4 fills from SCP analysis
       });
       return out;
     },[]);
+  }
+
+  // ── IAM factual policy analysis ───────────────────────────────────────────────
+  analyzeIAMResources(resources) {
+    const findings = [];
+    // Analyze IAM roles: permission boundaries + trust policies
+    resources.filter(r => ['aws_iam_role','AWS::IAM::Role'].includes(r.type)).forEach(role => {
+      const attrs = role.isCFN ? (role.cfnProps||{}) : (role.attrs || parseHCLBody(role.body||''));
+      const hasPB = role.isCFN
+        ? !!attrs.PermissionsBoundary
+        : (attrs.permissions_boundary !== undefined && attrs.permissions_boundary !== null);
+      if (!hasPB)
+        findings.push({
+          id:'IAM-NO-PB', severity:'High', resourceId:role.id, policyKind:'role',
+          title:`IAM role ${role.name||role.id} has no permissions_boundary`,
+          evidence: mkEvidence('attr_absence','permissions_boundary attribute absent', role.id),
+          remediation:'Attach a PermissionsBoundary to prevent privilege escalation.',
+          resourceType:role.type, resourceName:role.name||role.id,
+          cwe:['CWE-269'], attack:['T1548'],
+        });
+      // Trust policy analysis
+      const rawTrust = role.isCFN ? attrs.AssumeRolePolicyDocument : (attrs.assume_role_policy || null);
+      let trustDoc = null;
+      try { trustDoc = typeof rawTrust === 'string' ? JSON.parse(rawTrust) : rawTrust; } catch {}
+      if (trustDoc?.Statement) {
+        const stmts = Array.isArray(trustDoc.Statement) ? trustDoc.Statement : [trustDoc.Statement];
+        stmts.forEach(s => {
+          if (s.Effect === 'Allow' && (
+            s.Principal === '*' ||
+            (typeof s.Principal === 'object' && (s.Principal?.AWS === '*' || s.Principal?.Service === '*'))
+          ))
+            findings.push({
+              id:'IAM-TRUST-WILD', severity:'Critical', resourceId:role.id, policyKind:'trust',
+              title:`IAM role ${role.name||role.id} trusts all principals (Principal:*)`,
+              evidence: mkEvidence('policy_parse', `Principal: ${JSON.stringify(s.Principal)}`, role.id),
+              remediation:'Restrict AssumeRolePolicyDocument Principal to specific services or account ARNs.',
+              resourceType:role.type, resourceName:role.name||role.id,
+              cwe:['CWE-269'], attack:['T1078.004'],
+            });
+        });
+      }
+      // CFN inline policies
+      if (role.isCFN)
+        (attrs.Policies||[]).forEach(p => _analyzeIAMDocument(p.PolicyDocument, role.id, findings, 'inline'));
+    });
+    // Standalone IAM policy resources
+    resources.filter(r => ['aws_iam_policy','aws_iam_role_policy','aws_iam_user_policy','AWS::IAM::ManagedPolicy'].includes(r.type)).forEach(pol => {
+      const attrs = pol.isCFN ? (pol.cfnProps||{}) : (pol.attrs || parseHCLBody(pol.body||''));
+      let doc = null;
+      try {
+        const raw = pol.isCFN ? attrs.PolicyDocument : (attrs.policy || '');
+        doc = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch {}
+      if (doc) _analyzeIAMDocument(doc, pol.id, findings, 'standalone');
+    });
+    return findings;
   }
 
   // ── Parse CFN Properties object into unified attribute map ─────────────────
@@ -2369,33 +2764,41 @@ class ThreatModelIntelligence {
     return attrs;
   }
 
-  // ── Control inventory: detect which security controls are present ─────────────
+  // ── Control inventory: three-state (present / partial / absent) ──────────────
   getControlInventory(resources) {
-    const present=[], absent=[];
+    const present=[], partial=[], absent=[];
     CONTROL_DETECTION_MAP.forEach(ctrl => {
-      try { (ctrl.detect(resources) ? present : absent).push({...ctrl}); } catch(e) { absent.push({...ctrl}); }
+      let res = { state:'absent', evidence:null };
+      try { res = ctrl.detect(resources); } catch(e) {}
+      // Support legacy boolean detects (old entries not yet migrated)
+      if (typeof res === 'boolean') res = { state: res ? 'present' : 'absent', evidence: null };
+      const item = { ...ctrl, evidence: res.evidence };
+      if      (res.state === 'present') present.push(item);
+      else if (res.state === 'partial') partial.push({ ...item, partialNote: res.evidence?.snippet });
+      else                              absent.push(item);
     });
-    // Cross-reference absent controls against uploaded doc chunks
+    // Doc-based rescue with negation-aware confidence scoring
     const stillAbsent = [];
     absent.forEach(ctrl => {
-      const check = this._docHasControl(ctrl.name);
-      if (check.found) {
-        present.push({ ...ctrl, source: 'doc', evidence: check.evidence });
+      const chk = this._docHasControl(ctrl.name);
+      if (chk.confidence >= 60) {
+        present.push({ ...ctrl, source:'doc', evidence:mkEvidence('bm25_token',chk.evidence,chk.source), confidence:chk.confidence });
+      } else if (chk.confidence >= 35) {
+        partial.push({ ...ctrl, source:'doc', evidence:mkEvidence('bm25_low',chk.evidence,chk.source), confidence:chk.confidence, partialNote:'Low-confidence document reference' });
       } else {
         stillAbsent.push(ctrl);
       }
     });
-    // Extract controls directly from uploaded SCM / SCB files
+    // Absorb doc-extracted controls (SCM/SCB uploads)
     const docControls = this.extractDocControls();
     const presentIds = new Set(present.map(c => c.id?.toLowerCase()));
     docControls.forEach(dc => {
-      // Only add if not already covered by CONTROL_DETECTION_MAP
       if (!presentIds.has(dc.id?.toLowerCase())) {
         present.push(dc);
         presentIds.add(dc.id?.toLowerCase());
       }
     });
-    return { present, absent: stillAbsent };
+    return { present, partial, absent: stillAbsent };
   }
 
   // ── Extract controls from uploaded SCM / SCB / compliance doc chunks ─────────
@@ -2468,45 +2871,71 @@ class ThreatModelIntelligence {
     return controls.slice(0, 200); // cap at 200 doc-extracted controls
   }
 
-  // ── Doc-based control detection ───────────────────────────────────────────────
+  // ── Doc-based control detection (negation-aware) ─────────────────────────────
   _docHasControl(ctrlName) {
+    const NEGATION = new Set(['not','no','broken','disabled','removed','absent','missing',
+      'lacking','without','failed','violation','gap','deficiency','cannot','never']);
     const tokens = ctrlName.toLowerCase().split(/\W+/).filter(t => t.length > 3);
-    if (!tokens.length) return { found: false };
-    const nonTfChunks = this.chunks.filter(c => c.category !== 'terraform');
-    for (const c of nonTfChunks) {
+    if (!tokens.length) return { found: false, confidence: 0 };
+    let best = 0, bestEv = null, bestSrc = null;
+    for (const c of this.chunks.filter(x => x.category !== 'terraform')) {
       const lc = c.text.toLowerCase();
-      const matches = tokens.filter(t => lc.includes(t));
-      if (matches.length >= Math.ceil(tokens.length * 0.6)) {
-        return { found: true, evidence: c.text.substring(0, 120), source: c.source || c.category || 'doc' };
+      const words = lc.split(/\W+/);
+      const matchCount = tokens.filter(t => lc.includes(t)).length;
+      if (matchCount / tokens.length < 0.6) continue;
+      // Apply negation penalty: -0.25 per negation word found within 5-token window
+      let penalty = 0;
+      for (const t of tokens) {
+        const idx = words.indexOf(t);
+        if (idx >= 0) {
+          const win = words.slice(Math.max(0, idx - 5), idx + 6);
+          if (win.some(w => NEGATION.has(w))) penalty += 0.25;
+        }
+      }
+      const score = Math.max(0, (matchCount / tokens.length) - penalty) * 100;
+      if (score > best) {
+        best = Math.round(score);
+        bestEv = c.text.slice(0, 130);
+        bestSrc = c.source || c.category || 'doc';
       }
     }
-    return { found: false };
+    return best >= 30
+      ? { found: true, confidence: best, evidence: bestEv, source: bestSrc }
+      : { found: false, confidence: 0 };
   }
 
   // ── Defense-in-Depth layer assessment ────────────────────────────────────────
   getDefenseInDepthAssessment(resources) {
-    const {present, absent} = this.getControlInventory(resources);
+    const {present, partial, absent} = this.getControlInventory(resources);
     const layers={};
     Object.entries(DID_LAYERS).forEach(([lid,ldef])=>{
-      const p=present.filter(c=>c.layer===lid), a=absent.filter(c=>c.layer===lid);
-      const total=p.length+a.length;
-      layers[lid]={...ldef, present:p, absent:a, score:total>0?Math.round((p.length/total)*100):0, total};
+      const p  = present.filter(c=>c.layer===lid);
+      const pa = partial.filter(c=>c.layer===lid);
+      const a  = absent.filter(c=>c.layer===lid);
+      const total = p.length + pa.length + a.length;
+      // Weighted: present=1.0, partial=0.5, absent=0.0
+      const score = total > 0 ? Math.round(((p.length + pa.length * 0.5) / total) * 100) : 0;
+      layers[lid] = {...ldef, present:p, partial:pa, absent:a, score, total};
     });
-    const overallPresent=present.length, overallTotal=present.length+absent.length;
-    return { layers, overallScore:overallTotal>0?Math.round((overallPresent/overallTotal)*100):0, presentCount:overallPresent, absentCount:absent.length };
+    const total = present.length + partial.length + absent.length;
+    const weightedScore = total > 0 ? Math.round(((present.length + partial.length * 0.5) / total) * 100) : 0;
+    return { layers, overallScore:weightedScore, presentCount:present.length, partialCount:partial.length, absentCount:absent.length };
   }
 
   // ── Zero-Trust pillar assessment ─────────────────────────────────────────────
   getZeroTrustAssessment(resources) {
-    const {present,absent}=this.getControlInventory(resources);
+    const {present, partial, absent} = this.getControlInventory(resources);
     const pillars={};
     Object.entries(ZT_PILLARS).forEach(([pid,pdef])=>{
-      const p=present.filter(c=>c.ztPillar===pid), a=absent.filter(c=>c.ztPillar===pid);
-      const total=p.length+a.length;
-      pillars[pid]={...pdef, present:p, absent:a, score:total>0?Math.round((p.length/total)*100):0, total};
+      const p  = present.filter(c=>c.ztPillar===pid);
+      const pa = partial.filter(c=>c.ztPillar===pid);
+      const a  = absent.filter(c=>c.ztPillar===pid);
+      const total = p.length + pa.length + a.length;
+      const score = total > 0 ? Math.round(((p.length + pa.length * 0.5) / total) * 100) : 0;
+      pillars[pid] = {...pdef, present:p, partial:pa, absent:a, score, total};
     });
-    const scores=Object.values(pillars).map(p=>p.score);
-    return { pillars, overallScore:scores.length?Math.round(scores.reduce((a,b)=>a+b,0)/scores.length):0 };
+    const scores = Object.values(pillars).map(p => p.score);
+    return { pillars, overallScore:scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 0 };
   }
 
   // ── NIST CSF 2.0 compliance assessment ──────────────────────────────────────
@@ -2555,7 +2984,7 @@ class ThreatModelIntelligence {
     resources.slice(0,60).forEach(r=>{
       const hits=this.analyzeResource(r.type,r.name);
       if(!hits.length) return;
-      const attrs=this._parseAttrMap(r.body||'');
+      const attrs=r.attrs??parseHCLBody(r.body||'');
       const contradictions=[];
       hits.forEach(chunk=>{
         const t=chunk.text.toLowerCase();
@@ -2631,6 +3060,24 @@ class ThreatModelIntelligence {
       const findings=this.getMisconfigurations(r);
       if(findings.length) allMisconfigs.push({resource:r,findings});
     });
+    // IAM factual analysis — merge into misconfigs
+    try {
+      const iamFindings = this.analyzeIAMResources(resources||[]);
+      if (iamFindings.length) {
+        // Group by resourceId so they appear alongside the resource
+        const byRes = {};
+        iamFindings.forEach(f => {
+          const key = f.resourceId || f.resourceName || 'iam';
+          if (!byRes[key]) byRes[key] = { resource:{id:key,type:f.resourceType||'aws_iam_role',name:f.resourceName||key}, findings:[] };
+          byRes[key].findings.push(f);
+        });
+        Object.values(byRes).forEach(group => {
+          const existing = allMisconfigs.find(m => m.resource.id === group.resource.id);
+          if (existing) existing.findings.push(...group.findings);
+          else allMisconfigs.push(group);
+        });
+      }
+    } catch(e) {}
     const SEV=['Critical','High','Medium','Low'];
     const topMisconfigs=allMisconfigs.flatMap(m=>m.findings.map(f=>({...f,resourceType:m.resource.type,resourceName:m.resource.name||m.resource.id})))
       .sort((a,b)=>SEV.indexOf(a.severity)-SEV.indexOf(b.severity)).slice(0,50);
@@ -6521,7 +6968,7 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   const summary = useMemo(() => {
     if (!intelligence?._built) return null;
     return intelligence.getArchitectureSummary(parseResult?.resources || [], userDocs || []);
-  }, [intelligence, parseResult, userDocs]);
+  }, [intelligence, intelligenceVersion, parseResult, userDocs]);
 
   const handleQuery = async () => {
     if (!query.trim() || !intelligence) return;
@@ -6748,6 +7195,50 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
       return <p key={bi} style={{ fontSize: 12, color: C.textSub, lineHeight: 1.7, margin: '4px 0' }}>{inlineFormat(trim, bi)}</p>;
     });
   };
+
+  // ── Evidence UI helpers ──────────────────────────────────────────────────
+  const ConfidenceBadge = ({ ev }) => {
+    if (!ev) return null;
+    const c = ev.confidence ?? 50;
+    const color = c>=80?'#2E7D32':c>=55?'#F57C00':'#B71C1C';
+    const label = ev.source==='hcl'?'HCL':ev.source==='doc'?'DOC':'INFER';
+    const tip = `Method: ${ev.method}\nConfidence: ${c}%\n${ev.snippet?'Evidence: '+ev.snippet.slice(0,100):''}`;
+    return (
+      <span title={tip} style={{
+        display:'inline-flex',alignItems:'center',gap:2,
+        background:`${color}18`,border:`1px solid ${color}40`,
+        borderRadius:4,padding:'1px 5px',fontSize:9,
+        color,cursor:'help',fontWeight:700,flexShrink:0
+      }}>
+        {label} {c}%
+      </span>
+    );
+  };
+
+  const EvidenceDrawer = ({ ev, label='evidence' }) => {
+    const [evOpen, setEvOpen] = useState(false);
+    if (!ev?.snippet) return null;
+    return (
+      <div>
+        <span onClick={()=>setEvOpen(o=>!o)}
+          style={{cursor:'pointer',fontSize:9,color:C.textMuted,userSelect:'none'}}>
+          {evOpen?'▲ hide':'▼'} {label}
+        </span>
+        {evOpen&&(
+          <div style={{marginTop:5,padding:'5px 8px',background:C.bg,borderRadius:4,
+            fontSize:10,fontFamily:'monospace',lineHeight:1.5,maxHeight:100,overflow:'auto',
+            border:`1px solid ${C.border}`,whiteSpace:'pre-wrap',wordBreak:'break-word'}}>
+            {ev.snippet}
+            {ev.location&&<div style={{fontSize:9,color:C.textMuted,marginTop:2}}>↳ {ev.location}</div>}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const getConf = (item) =>
+    item?.evidence?.confidence ?? item?.confidence ??
+    (item?.source==='doc'?55:item?.source==='scm'?65:50);
 
   return (
     <div style={{display:"flex", height:"calc(100vh - 58px)"}}>
@@ -7944,6 +8435,17 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                             background:C.bg,padding:"6px 10px",borderRadius:6,border:`1px solid ${C.border}`}}>
                             <span style={{color:C.textMuted,fontWeight:600}}>Remediation: </span>{f.remediation}
                           </div>
+                          {/* ── Evidence row ── */}
+                          <div style={{display:'flex',gap:6,alignItems:'center',marginTop:6,flexWrap:'wrap'}}>
+                            <ConfidenceBadge ev={f.evidence} />
+                            {f.evidence?.method==='var_ref'&&(
+                              <span style={{fontSize:9,color:'#F57C00',background:'#F57C0015',borderRadius:3,padding:'1px 4px',border:'1px solid #F57C0030',fontWeight:700}}>VAR UNRESOLVED</span>
+                            )}
+                            {isScpMitigated&&(
+                              <span style={{fontSize:9,color:'#2E7D32',background:'#2E7D3215',borderRadius:3,padding:'1px 4px',border:'1px solid #2E7D3230',fontWeight:700}}>SCP MITIGATED</span>
+                            )}
+                            <EvidenceDrawer ev={f.evidence} label="attribute" />
+                          </div>
                         </div>
                         );
                       })}
@@ -8198,6 +8700,16 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                     </div>
                   </div>
 
+                  {/* Scoring methodology footnote */}
+                  <div style={{fontSize:10,color:C.textMuted,background:C.surface,border:`1px solid ${C.border}`,
+                    borderRadius:8,padding:"8px 12px",marginBottom:16,lineHeight:1.7}}>
+                    <strong style={{color:C.textSub}}>Scoring methodology:</strong>{' '}
+                    NIST CSF 40% · Defense-in-Depth 35% · Zero Trust 25%{' · '}
+                    HCL-verified controls: full weight · Doc-referenced controls: partial weight ·
+                    Partial controls (configured but incomplete): 50% weight ·
+                    Variable-referenced attributes excluded from checks (shown as unresolved).
+                  </div>
+
                   {/* Priority Remediation Actions */}
                   {p?.topRisks?.length > 0 && (
                     <div style={{ background:'#E5393510', border:'1px solid #E5393540', borderRadius:10, padding:'14px 18px', marginBottom:16 }}>
@@ -8354,16 +8866,21 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             ) : (()=>{
               const ci = summary.controlInventory;
               const byLayer = {};
-              const presentIds = new Set((ci.present||[]).map(c=>c.id));
-              [...(ci.present||[]), ...(ci.absent||[])].forEach(c=>{
+              const presentIds  = new Set((ci.present||[]).map(c=>c.id));
+              const partialIds  = new Set((ci.partial||[]).map(c=>c.id));
+              [...(ci.present||[]), ...(ci.partial||[]), ...(ci.absent||[])].forEach(c=>{
                 const lk = c.layer || 'monitoring';
-                if(!byLayer[lk]) byLayer[lk]={present:[],absent:[]};
-                (presentIds.has(c.id) ? byLayer[lk].present : byLayer[lk].absent).push(c);
+                if(!byLayer[lk]) byLayer[lk]={present:[],partial:[],absent:[]};
+                if(presentIds.has(c.id))      byLayer[lk].present.push(c);
+                else if(partialIds.has(c.id)) byLayer[lk].partial.push(c);
+                else                          byLayer[lk].absent.push(c);
               });
               const presentCount = ci.present?.length||0;
+              const partialCount = ci.partial?.length||0;
               const absentCount  = ci.absent?.length||0;
-              const totalCount   = presentCount + absentCount;
-              const coveragePct  = totalCount ? Math.round(presentCount/totalCount*100) : 0;
+              const totalCount   = presentCount + partialCount + absentCount;
+              // Weighted: present=1.0, partial=0.5
+              const coveragePct  = totalCount ? Math.round(((presentCount + partialCount * 0.5)/totalCount)*100) : 0;
               return (
                 <div>
                   {/* Coverage bar */}
@@ -8373,7 +8890,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       <div style={{display:"flex", justifyContent:"space-between", marginBottom:6}}>
                         <span style={{fontSize:12, fontWeight:600, color:C.text}}>Overall Control Coverage</span>
                         <span style={{fontSize:12, fontWeight:700, color:coveragePct>=70?"#43A047":coveragePct>=40?"#F57C00":"#E53935"}}>
-                          {presentCount} / {totalCount} ({coveragePct}%)
+                          {presentCount} present · {partialCount} partial · {absentCount} absent ({coveragePct}%)
                         </span>
                       </div>
                       <div style={{height:8, background:C.border, borderRadius:4, overflow:"hidden"}}>
@@ -8427,16 +8944,12 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                     />
                   </div>
 
-                  {/* By layer */}
+                  {/* By layer — three-state */}
                   {Object.entries(DID_LAYERS).sort(([,a],[,b])=>a.order-b.order).map(([didLayerKey, didLayer])=>{
-                    const layerData = byLayer[didLayerKey] || {present:[],absent:[]};
-                    const filteredPresent = controlSearch
-                      ? layerData.present.filter(c => c.name.toLowerCase().includes(controlSearch.toLowerCase()))
-                      : layerData.present;
-                    const filteredAbsent = controlSearch
-                      ? layerData.absent.filter(c => c.name.toLowerCase().includes(controlSearch.toLowerCase()))
-                      : layerData.absent;
-                    if(!filteredPresent.length && !filteredAbsent.length) return null;
+                    const layerData = byLayer[didLayerKey] || {present:[],partial:[],absent:[]};
+                    const flt = s => controlSearch ? s.filter(c=>c.name.toLowerCase().includes(controlSearch.toLowerCase())) : s;
+                    const fp = flt(layerData.present), fpa = flt(layerData.partial), fa = flt(layerData.absent);
+                    if(!fp.length && !fpa.length && !fa.length) return null;
                     return (
                       <div key={didLayerKey} style={{background:C.surface, border:`1px solid ${C.border}`,
                         borderRadius:12, padding:"16px 20px", marginBottom:12}}>
@@ -8444,39 +8957,43 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                           <didLayer.Icon size={16} style={{color:didLayer.color}} />
                           <span style={{fontSize:13, fontWeight:700, color:C.text}}>{didLayer.name}</span>
                           <span style={{fontSize:11, color:C.textMuted, marginLeft:"auto"}}>
-                            {filteredPresent.length} present · {filteredAbsent.length} missing
+                            {fp.length} present{fpa.length?` · ${fpa.length} partial`:''} · {fa.length} missing
                           </span>
                         </div>
                         <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
-                          {filteredPresent.map((c,i)=>(
-                            <div key={i} style={{background:"#43A04710", border:"1px solid #43A04740",
-                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", flexDirection:"column", gap:2}}>
-                              <div style={{display:"flex", alignItems:"center", gap:4}}>
-                                <span>✓</span><span style={{fontWeight:600}}>{c.name}</span>
-                                {c.source==='doc'
-                                  ? (
-                                    <span
-                                      onClick={() => setExpandedControl(expandedControl === (c.id||c.name) ? null : (c.id||c.name))}
-                                      style={{ cursor:'pointer', color:C.accent, fontSize:9, marginLeft:4, userSelect:'none' }}
-                                      title="Click to expand evidence"
-                                    >
-                                      📄 {expandedControl === (c.id||c.name) ? '▲' : '▼'}
-                                    </span>
-                                  )
-                                  : <span style={{fontSize:10,background:"#43A04720",borderRadius:4,padding:"1px 4px",opacity:0.7}}>&lt;/&gt;</span>}
+                          {/* ✓ PRESENT */}
+                          {fp.map((c,i)=>(
+                            <div key={`p${i}`} style={{background:"#43A04710", border:"1px solid #43A04740",
+                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", flexDirection:"column", gap:3}}>
+                              <div style={{display:"flex", alignItems:"center", gap:4, flexWrap:"wrap"}}>
+                                <span style={{fontWeight:700}}>✓</span>
+                                <span style={{fontWeight:600}}>{c.name}</span>
+                                {c.source==='doc' ? <span style={{fontSize:9,opacity:0.8}}>📄</span>
+                                  : c.source==='hcl'||!c.source ? <span style={{fontSize:9,background:"#43A04720",borderRadius:3,padding:"1px 4px",opacity:0.7}}>&lt;/&gt;</span> : null}
+                                <ConfidenceBadge ev={c.evidence} />
                               </div>
-                              {expandedControl === (c.id||c.name) && c.evidence && (
-                                <div style={{ marginTop:5, padding:'6px 10px', background:C.bg, borderRadius:5, border:`1px solid ${C.border}`, fontSize:10, color:C.textSub, lineHeight:1.6, ...MONO }}>
-                                  {c.evidence.slice(0, 400)}
-                                  <div style={{ fontSize:9, color:C.textMuted, marginTop:3 }}>Source: {c.docFile || c.source}</div>
-                                </div>
-                              )}
+                              <EvidenceDrawer ev={c.evidence} label="evidence" />
                             </div>
                           ))}
-                          {filteredAbsent.map((c,i)=>(
-                            <div key={i} style={{background:"#E5393510", border:"1px solid #E5393540",
+                          {/* ~ PARTIAL */}
+                          {fpa.map((c,i)=>(
+                            <div key={`pa${i}`} style={{background:"#F57C0010", border:"1px solid #F57C0040",
+                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#F57C00", display:"flex", flexDirection:"column", gap:3}}>
+                              <div style={{display:"flex", alignItems:"center", gap:4, flexWrap:"wrap"}}>
+                                <span style={{fontWeight:700}}>~</span>
+                                <span style={{fontWeight:600}}>{c.name}</span>
+                                <span style={{fontSize:9,background:"#F57C0020",borderRadius:3,padding:"1px 4px",fontWeight:700}}>PARTIAL</span>
+                                <ConfidenceBadge ev={c.evidence} />
+                              </div>
+                              {c.partialNote && <div style={{fontSize:9,color:"#F57C00",opacity:0.85}}>{c.partialNote}</div>}
+                              <EvidenceDrawer ev={c.evidence} label="evidence" />
+                            </div>
+                          ))}
+                          {/* ✗ ABSENT */}
+                          {fa.map((c,i)=>(
+                            <div key={`a${i}`} style={{background:"#E5393510", border:"1px solid #E5393540",
                               borderRadius:6, padding:"4px 10px", fontSize:11, color:"#E53935", display:"flex", alignItems:"center", gap:4}}>
-                              <span>✗</span><span style={{fontWeight:600}}>{c.name}</span>
+                              <span style={{fontWeight:700}}>✗</span><span style={{fontWeight:600}}>{c.name}</span>
                             </div>
                           ))}
                         </div>
@@ -8760,6 +9277,18 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                               {misconfigs.length>2 && (
                                 <div style={{fontSize:10,color:C.textMuted}}>+{misconfigs.length-2} more — see Misconfig Checks tab</div>
                               )}
+                            </div>
+                          )}
+                          {/* HCL-derived input dependencies (factual from parseHCLBody) */}
+                          {r.inputRefs?.length > 0 && (
+                            <div style={{marginTop:6,fontSize:10,color:C.textMuted,lineHeight:1.7}}>
+                              <span style={{fontWeight:600,color:C.textSub}}>→ Inputs: </span>
+                              {[...new Map(r.inputRefs.map(ref=>[ref.resourceId,ref])).values()].slice(0,6).map((ref,j)=>(
+                                <span key={j} style={{...MONO,background:C.bg,border:`1px solid ${C.border}`,borderRadius:3,padding:"0 4px",marginRight:4,fontSize:9}}>
+                                  {ref.resourceId} [{ref.attr}]
+                                </span>
+                              ))}
+                              {r.inputRefs.length > 6 && <span style={{fontSize:9,color:C.textMuted}}>+{r.inputRefs.length-6} more</span>}
                             </div>
                           )}
                           {hits.length===0 && misconfigs.length===0 && (
@@ -9155,6 +9684,7 @@ export default function App() {
     const archDoc = buildArchContextDoc();
     const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
     const docsWithCtx = [...syntheticDocs, ...userDocs];
+    intelligenceRef.current = new ThreatModelIntelligence();
     intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[]);
     setIntelligenceVersion(v => v+1);
     // Regenerate XML with enriched intelligence if we have parsed data
@@ -9397,6 +9927,7 @@ export default function App() {
     if (!tfFiles.length) {
       setParseResult(null); setXml("");
       const seedDocs = [ctxDoc, archDoc].filter(Boolean);
+      intelligenceRef.current = new ThreatModelIntelligence();
       intelligenceRef.current.build(seedDocs, [], []);
       setIntelligenceVersion(v=>v+1);
       return;
@@ -9427,6 +9958,7 @@ export default function App() {
     // Rebuild intelligence: model context + arch context + uploaded docs + parsed resources
     const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
     const docsWithCtx = [...syntheticDocs, ...userDocsRef.current];
+    intelligenceRef.current = new ThreatModelIntelligence();
     intelligenceRef.current.build(docsWithCtx, result.resources, result.modules);
     setIntelligenceVersion(v => v+1);
     if (result.resources.length > 0 || result.modules.length > 0) {
