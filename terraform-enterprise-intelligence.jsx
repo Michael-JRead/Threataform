@@ -7,6 +7,7 @@ import { VectorStore, hybridSearch as ragHybridSearch, buildRAGPrompt, ContextPa
 import { HybridRetriever } from './src/lib/rag/HybridRetriever.js';
 import { hydeTemplate } from './src/lib/rag/HyDE.js';
 import { ColBERTVectorStore } from './src/lib/rag/VectorStore.js';
+import { mcpRegistry } from './src/lib/mcp/MCPToolRegistry.js';
 import {
   BookOpen, Upload, Brain, Microscope, Map as MapIcon, Building2, Search, ShieldCheck,
   ListChecks, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers,
@@ -6920,6 +6921,10 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   const [chatGenerating, setChatGenerating] = useState(false);
   const [isTraining, setIsTraining]   = useState(false);  // LoRA fine-tuning state
   const [ftProgress, setFtProgress]   = useState(0);       // LoRA training progress %
+  const [loraReady, setLoraReady]     = useState(false);   // LoRA adapter trained + ready to export
+  // MCP tool server state
+  const [mcpUrl, setMcpUrl]         = useState('ws://localhost:3747');
+  const [mcpStatus, setMcpStatus]   = useState(''); // '' | 'connected' | 'failed' | 'connecting'
   const chatBottomRef = useRef(null);
 
   // ── Cross-tab navigation state ──
@@ -7578,49 +7583,124 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
             return out.join('\n\n');
           };
 
+          // ── Dynamic context-aware system prompt ──────────────────────────────
+          const buildSystemPrompt = (sections) => {
+            const resources = parseResult?.resources || [];
+            const resCtx = resources.length
+              ? `\nInfrastructure: ${resources.length} resources (${[...new Set(resources.map(r => r.type?.split('_')[1]).filter(Boolean))].slice(0, 8).join(', ')}).`
+              : '';
+            const scoreCtx = summary?.postureScore !== undefined
+              ? `\nPosture: ${summary.postureScore}/100 — Grade ${summary.grade}. ${summary.topMisconfigs?.length || 0} open findings.`
+              : '';
+            const toolDefs = mcpRegistry.getToolsForPrompt();
+            const toolCtx = toolDefs.length
+              ? `\nTools available — call with <tool_call>{"name":"...","args":{...}}</tool_call>:\n` +
+                toolDefs.map(t => `  • ${t.name}: ${t.description.slice(0, 120)}`).join('\n')
+              : '';
+            const example = '\nExample Q: "Is my S3 safe?" → "3 issues: (1) S3-001 public access block missing — anyone can list contents. (2) S3-002 versioning disabled. Fix: add aws_s3_bucket_public_access_block."';
+            return `You are Threataform, expert threat modeler and cloud security architect.${resCtx}${scoreCtx}
+You have full access to the user's architecture: uploaded documents, Terraform resources, security posture, control inventory, misconfigurations, ATT&CK coverage, and scope.
+Respond conversationally and concisely. Cite specific resource IDs and finding codes (e.g. S3-001, EC2-001, T1078). Keep responses under 400 words unless deep analysis is requested.
+Never hallucinate resource names or CVE IDs. If uncertain, say so.${toolCtx}${example}
+
+Context:
+${sections}`;
+          };
+
+          // ── Conversation memory compression ──────────────────────────────────
+          // When history exceeds 80 messages, compress oldest 60 into a summary.
+          const compressHistory = async (history) => {
+            if (history.length <= 80) return history;
+            const toCompress = history.slice(0, 60).filter(m => !m._compressed);
+            if (!toCompress.length) return history;
+            const summaryText = toCompress
+              .map(m => `${m.role}: ${m.content.slice(0, 200)}`)
+              .join('\n');
+            return [
+              {
+                role: 'assistant',
+                content: `[Earlier conversation summary]\n${summaryText.slice(0, 1500)}`,
+                _compressed: true,
+              },
+              ...history.slice(60),
+            ];
+          };
+
           const sendChat = async (userText) => {
             if (!userText?.trim() || chatGenerating) return;
             setChatInput("");
             setChatGenerating(true);
 
-            // Cap chat history at 200 total messages (keep last 100 for context)
-            setChatMessages(prev => prev.length > 200 ? prev.slice(-100) : prev);
+            // Compress history if needed (Phase 4-B)
+            const compressedHistory = await compressHistory(chatMessages);
+            if (compressedHistory !== chatMessages) setChatMessages(compressedHistory);
 
             // Add user message immediately
             setChatMessages(prev => [...prev, { role:"user", content: userText }]);
             setChatMessages(prev => [...prev, { role:"assistant", content:"", streaming: true, sources:[] }]);
 
             try {
+              const { sections, contextChunks } = await buildFullContext(userText);
+
+              // ── Tier 1: LLM (Ollama or wllama WASM) ───────────────────────────
               if (onGenerateLLM && llmStatus === "ready") {
-                // ── Ollama LLM path (optional, if available) ──
-                const { sections, contextChunks } = await buildFullContext(userText);
-                const systemPrompt = `You are Threataform Assistant, an expert threat modeler and cloud security architect.
-You have FULL access to the user's architecture: uploaded documents, Terraform resources, security posture, control inventory, misconfigurations, ATT&CK coverage, scope, and architecture analysis.
-Answer using ONLY the context provided. Cite document sources as [DOC-N]. Be specific, technical, and actionable.
-If the context doesn't contain the answer, say so clearly — do NOT hallucinate.\n\n${sections}`;
+                const systemPrompt = buildSystemPrompt(sections);
+
+                // Build message history — use compressed if available
+                const historyMsgs = chatMessages
+                  .filter(m => !m.streaming)
+                  .slice(-12)
+                  .map(m => ({ role: m.role, content: m.content.slice(0, 800) }));
 
                 const messages = [
                   { role: "system", content: systemPrompt },
-                  ...chatMessages.filter(m => !m.streaming).slice(-10).map(m => ({ role: m.role, content: m.content })),
+                  ...historyMsgs,
                   { role: "user", content: userText },
                 ];
-                // Update sources on the streaming bubble
+
+                // Attach retrieval stats + sources to streaming bubble
+                const retrieval = contextChunks.length ? {
+                  count:    contextChunks.length,
+                  bm25:     contextChunks.filter(c => c.searchType === 'bm25').length,
+                  dense:    contextChunks.filter(c => c.searchType === 'dense').length,
+                  colbert:  contextChunks.filter(c => c.searchType === 'hybrid' || c.searchType === 'colbert').length,
+                  avgScore: Math.round((contextChunks.reduce((s, c) => s + (c.score ?? 0.5), 0) / contextChunks.length) * 100),
+                } : null;
+
                 setChatMessages(prev => {
                   const last = prev[prev.length-1];
                   if (last?.streaming) return [...prev.slice(0,-1), { ...last,
-                    sources: contextChunks.slice(0,5).map(c=>({ file:c.source||c.docId||'doc', cat:c.category||'', type:c.searchType||'bm25' }))
+                    sources:   contextChunks.slice(0, 5).map(c => ({ file:c.source||c.docId||'doc', cat:c.category||'', type:c.searchType||'bm25' })),
+                    retrieval,
                   }];
                   return prev;
                 });
+
+                // Stream response
+                let fullResponse = '';
                 await onGenerateLLM(messages, (token) => {
+                  fullResponse += token;
                   setChatMessages(prev => {
                     const last = prev[prev.length - 1];
                     if (last?.streaming) return [...prev.slice(0,-1), { ...last, content: last.content + token }];
                     return prev;
                   });
                 });
+
+                // Phase 3-D: Execute any tool calls embedded in the response
+                if (fullResponse.includes('<tool_call>')) {
+                  const withResults = await mcpRegistry.executeToolCalls(fullResponse);
+                  if (withResults !== fullResponse) {
+                    setChatMessages(prev => {
+                      const last = prev[prev.length - 1];
+                      if (!last?.streaming) return [...prev.slice(0,-1), { ...last, content: withResults }];
+                      return prev;
+                    });
+                  }
+                }
+
               } else {
-                // ── Offline intelligence path (always available, no internet needed) ──
+                // ── Tier 2 / 3: Offline smart response (always available) ──────
                 const response = generateSmartResponse(userText);
                 setChatMessages(prev => {
                   const last = prev[prev.length-1];
@@ -7646,6 +7726,8 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             if (!texts.length) return;
             setIsTraining(true);
             setFtProgress(0);
+            setLoraReady(false);
+            let trainOk = false;
             try {
               if (typeof wllamaManager.fineTune === 'function') {
                 await wllamaManager.fineTune(texts, {
@@ -7653,6 +7735,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                   onProgress: (step, total) => setFtProgress(Math.round(step / total * 100)),
                 });
                 setFtProgress(100);
+                trainOk = true;
               } else {
                 // Fallback: just show progress animation without actual training
                 for (let i = 1; i <= 10; i++) {
@@ -7665,6 +7748,29 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             }
             setIsTraining(false);
             setFtProgress(0);
+            if (trainOk) setLoraReady(true);
+          };
+
+          // ── LoRA adapter export handler (Phase 5-D) ───────────────────────────
+          const handleExportLora = async () => {
+            if (!loraReady || isTraining) return;
+            try {
+              let buf;
+              if (typeof wllamaManager.saveLoRA === 'function') {
+                buf = await wllamaManager.saveLoRA();
+              }
+              if (!buf) { console.warn('[LoRA] saveLoRA returned nothing'); return; }
+              const blob     = new Blob([buf], { type: 'application/octet-stream' });
+              const ts       = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+              const filename = `threataform-lora-adapter-${ts}.tnlm`;
+              const url = URL.createObjectURL(blob);
+              const a   = document.createElement('a');
+              a.href = url; a.download = filename; a.click();
+              URL.revokeObjectURL(url);
+              console.info(`[LoRA] Exported adapter: ${filename} (${(buf.byteLength / 1024).toFixed(1)} KB)`);
+            } catch (err) {
+              console.warn('[LoRA] Export failed:', err);
+            }
           };
 
           return (
@@ -7740,6 +7846,16 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                         {isTraining ? `Training ${ftProgress}%` : 'Fine-tune on Docs'}
                       </button>
                     )}
+                    {loraReady && !isTraining && (
+                      <button onClick={handleExportLora}
+                        title="Download trained LoRA adapter as a .tnlm patch file"
+                        style={{ background:"transparent",
+                          border:`1px solid #2E7D3244`, borderRadius:5, padding:"3px 10px", fontSize:10,
+                          color:"#2E7D32", cursor:"pointer",
+                          display:"flex", alignItems:"center", gap:4, ...SANS }}>
+                        Export .tnlm
+                      </button>
+                    )}
                     <button onClick={() => onLoadModel(null)} style={{ background:"transparent",
                       border:`1px solid ${C.border}`, borderRadius:5, padding:"3px 10px", fontSize:10,
                       color:C.textMuted, cursor:"pointer", ...SANS }}>Change</button>
@@ -7765,6 +7881,48 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                   </div>
                 </div>
               )}
+
+              {/* ── MCP Tool Server ── */}
+              <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 14px", marginBottom:12 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+                  <span style={{ fontSize:11, fontWeight:600, color:C.text }}>MCP Tool Server</span>
+                  <span style={{ fontSize:9, color:C.textMuted }}>
+                    Built-in: score_cvss · lookup_mitre · check_compliance
+                  </span>
+                </div>
+                <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+                  <input
+                    value={mcpUrl}
+                    onChange={e => setMcpUrl(e.target.value)}
+                    placeholder="ws://localhost:3747"
+                    style={{ flex:1, fontSize:10, padding:"3px 7px", background:C.bg, border:`1px solid ${C.border}`, borderRadius:4, color:C.text, outline:"none" }}
+                  />
+                  <button
+                    onClick={async () => {
+                      setMcpStatus('connecting');
+                      const ok = await mcpRegistry.tryConnectExternal(mcpUrl);
+                      setMcpStatus(ok ? 'connected' : 'failed');
+                    }}
+                    style={{ fontSize:10, padding:"3px 10px", borderRadius:4, cursor:"pointer",
+                      background: mcpStatus === 'connected' ? '#2E7D3215' : C.surface,
+                      border:`1px solid ${mcpStatus === 'connected' ? '#2E7D3244' : C.border}`,
+                      color: mcpStatus === 'connected' ? '#2E7D32' : C.text }}
+                  >
+                    {mcpStatus === 'connecting' ? '…' : 'Connect'}
+                  </button>
+                  {mcpStatus && (
+                    <span style={{ fontSize:9, fontWeight:700,
+                      color: mcpStatus === 'connected' ? '#2E7D32' : mcpStatus === 'failed' ? '#B71C1C' : C.textMuted }}>
+                      {mcpStatus === 'connected' ? `✓ ${mcpRegistry.toolCount} tools` : mcpStatus === 'failed' ? '✗ failed' : '…'}
+                    </span>
+                  )}
+                </div>
+                {mcpStatus === 'connected' && (
+                  <div style={{ fontSize:9, color:C.textMuted, marginTop:4 }}>
+                    LLM can call tools via &lt;tool_call&gt; in responses. Ask: "score CVSS AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                  </div>
+                )}
+              </div>
 
               {/* Quick prompts — always show when intelligence is ready and no chat */}
               {chatMessages.length === 0 && intelligence?._built && (
@@ -7828,6 +7986,16 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                               <span style={{ opacity:.5, fontSize:9 }}>{s.type === "dense" ? "⚡" : s.type === "hybrid" ? "◈" : "∷"}</span>
                             </span>
                           ))}
+                        </div>
+                      )}
+                      {/* Retrieval quality stats (Phase 4-E) */}
+                      {msg.role === 'assistant' && msg.retrieval && !msg.streaming && (
+                        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginTop:4, fontSize:9, color:C.textMuted, paddingTop:4 }}>
+                          <span>{msg.retrieval.count} chunks retrieved</span>
+                          {msg.retrieval.bm25 > 0 && <span>BM25: {msg.retrieval.bm25}</span>}
+                          {msg.retrieval.dense > 0 && <span>dense: {msg.retrieval.dense}</span>}
+                          {msg.retrieval.colbert > 0 && <span>colbert: {msg.retrieval.colbert}</span>}
+                          <span>avg: {msg.retrieval.avgScore}%</span>
                         </div>
                       )}
                       {msg.role === 'assistant' && !msg.streaming && (

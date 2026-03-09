@@ -29,6 +29,19 @@ const STOP_WORDS = new Set([
   'up', 'out', 'use', 'used', 'using', 'used', 'per', 'via',
 ]);
 
+// Security domain terms that must NEVER be filtered, even if they look like
+// stop words or appear in generic stop-word lists.  "access", "control",
+// "policy" etc. are precisely the terms a security query cares about.
+const SECURITY_NEVER_STOP = new Set([
+  'access', 'control', 'policy', 'role', 'trust', 'admin', 'root',
+  'public', 'private', 'open', 'allow', 'deny', 'block', 'enable',
+  'disable', 'encrypt', 'decrypt', 'key', 'secret', 'token', 'password',
+  'credential', 'permission', 'privilege', 'scope', 'ingress', 'egress',
+  'port', 'protocol', 'rule', 'group', 'principal', 'action', 'resource',
+  'effect', 'statement', 'boundary', 'attach', 'detach', 'audit', 'log',
+  'mfa', 'iam', 'kms', 'vpc', 'sg', 'acl', 'waf', 'scp', 'sts',
+]);
+
 export class BM25Index {
   constructor() {
     /** @type {Map<string, {id:string, tf:Map<string,number>, len:number}>} */
@@ -131,7 +144,7 @@ export class BM25Index {
       .toLowerCase()
       .replace(/[^a-z0-9_.-]/g, ' ')
       .split(/\s+/)
-      .filter(t => t.length >= 2 && !STOP_WORDS.has(t));
+      .filter(t => t.length >= 2 && (SECURITY_NEVER_STOP.has(t) || !STOP_WORDS.has(t)));
   }
 
   /** Serialize to a plain object for persistence. */

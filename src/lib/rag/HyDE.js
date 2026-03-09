@@ -16,56 +16,83 @@
  */
 
 /**
- * HyDE query expansion.
+ * Multi-hypothesis HyDE query expansion.
+ *
+ * Generates N hypothetical answers from different expert perspectives, embeds
+ * each, and produces a weighted average embedding that better covers the
+ * semantic space around the query.
+ *
+ * Weights: query=0.5, each hypothesis=0.5/N  (query anchors the result)
  *
  * @param {string}          query
  * @param {ThreataformLM}   model
  * @param {BPETokenizer}    tokenizer
  * @param {object}          [opts]
- * @param {number}          [opts.maxNew=150]    Max tokens for hypothetical doc
- * @param {number}          [opts.temp=0.3]      Low temp → more factual hypothesis
- * @param {string}          [opts.systemPrompt]  Override system prompt
- * @returns {Promise<{ hydeVec: Float32Array, hydeText: string, queryVec: Float32Array }>}
+ * @param {number}          [opts.maxNew=80]     Max tokens per hypothesis
+ * @param {number}          [opts.temp=0.4]      Temperature for hypothesis generation
+ * @param {number}          [opts.numHyps=3]     Number of hypotheses to generate
+ * @returns {Promise<{ hydeVec: Float32Array, hydeTexts: string[], queryVec: Float32Array }>}
  */
 export async function hydeExpand(query, model, tokenizer, {
-  maxNew = 150,
-  temp   = 0.3,
-  systemPrompt = 'You are a cybersecurity expert. Write a concise, factual answer to the following question about threat modeling, cloud security, or infrastructure risks.',
+  maxNew  = 80,
+  temp    = 0.4,
+  numHyps = 3,
 } = {}) {
-  // 1. Build hypothesis generation prompt
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user',   content: `Question: ${query}\n\nProvide a direct, factual answer:` },
+  // Domain-specific system prompts for each hypothesis angle
+  const HYPOTHESIS_PROMPTS = [
+    'You are a threat modeler. Give a direct expert answer about the security risk or control.',
+    'You are a cloud security architect. Describe the AWS infrastructure configuration relevant to the question.',
+    'You are a compliance auditor. Identify which security controls or compliance requirements apply.',
   ];
-  const promptIds = tokenizer.encodeChat(messages);
 
-  // 2. Generate hypothetical document
-  let hydeText = '';
-  for await (const tokId of model.generate(promptIds, { maxNew, temp, topP: 0.85 })) {
-    hydeText += tokenizer.decode([tokId]);
-  }
-  hydeText = hydeText.trim();
-
-  // 3. Embed hypothetical document
-  const hydeIds = tokenizer.encode(hydeText);
-  const hydeVec = model.embed(hydeIds);
-
-  // 4. Embed original query
+  // 1. Embed original query
   const queryIds = tokenizer.encode(query);
   const queryVec = model.embed(queryIds);
 
-  // 5. Average the two vectors (equal weight)
-  const dim      = model.cfg.dim;
-  const avgVec   = new Float32Array(dim);
-  let   norm     = 0;
-  for (let i = 0; i < dim; i++) {
-    avgVec[i] = (hydeVec[i] + queryVec[i]) * 0.5;
-    norm += avgVec[i] * avgVec[i];
+  // 2. Generate and embed N hypotheses in parallel (sequential due to JS single-thread,
+  //    but structured for worker-based parallelism)
+  const hydeTexts = [];
+  const hydeVecs  = [];
+
+  for (let h = 0; h < Math.min(numHyps, HYPOTHESIS_PROMPTS.length); h++) {
+    try {
+      const messages = [
+        { role: 'system', content: HYPOTHESIS_PROMPTS[h] },
+        { role: 'user',   content: `Question: ${query}\n\nBrief answer:` },
+      ];
+      const promptIds = tokenizer.encodeChat(messages);
+
+      let hydeText = '';
+      for await (const tokId of model.generate(promptIds, { maxNew, temp, topP: 0.9 })) {
+        hydeText += tokenizer.decode([tokId]);
+      }
+      hydeText = hydeText.trim();
+      if (hydeText) {
+        hydeTexts.push(hydeText);
+        const hydeIds = tokenizer.encode(hydeText);
+        hydeVecs.push(model.embed(hydeIds));
+      }
+    } catch { /* skip failed hypothesis */ }
   }
+
+  // 3. Weighted average: query gets weight 0.5, each hypothesis gets (0.5/N)
+  const N    = hydeVecs.length;
+  const dim  = queryVec.length;
+  const hyWeight = N > 0 ? 0.5 / N : 0;
+  const avgVec   = new Float32Array(dim);
+
+  for (let i = 0; i < dim; i++) {
+    avgVec[i] = queryVec[i] * 0.5;
+    for (const hv of hydeVecs) avgVec[i] += hv[i] * hyWeight;
+  }
+
+  // 4. L2 normalize
+  let norm = 0;
+  for (let i = 0; i < dim; i++) norm += avgVec[i] * avgVec[i];
   norm = Math.sqrt(norm);
   if (norm > 1e-10) for (let i = 0; i < dim; i++) avgVec[i] /= norm;
 
-  return { hydeVec: avgVec, hydeText, queryVec };
+  return { hydeVec: avgVec, hydeTexts, queryVec };
 }
 
 /**

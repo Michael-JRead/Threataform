@@ -106,7 +106,14 @@
       "Bash(Select-Object -ExpandProperty Characters)",
       "Bash(python -c \":*)",
       "Bash(npx vite build --logLevel error)",
-      "Bash(node --input-type=module --eval \"import\\(''./terraform-enterprise-intelligence.jsx''\\)\")"
+      "Bash(node --input-type=module --eval \"import\\(''./terraform-enterprise-intelligence.jsx''\\)\")",
+      "Bash(if not exist \"C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\scripts\" mkdir \"C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\scripts\")",
+      "Bash(cmd //c \"mkdir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\scripts 2>nul && echo created || echo exists\")",
+      "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\scripts\")",
+      "Bash(cmd //c \"mkdir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\mcp\\\\tools 2>nul && echo created || echo exists\")",
+      "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\llm\")",
+      "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\mcp\\\\tools\")",
+      "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\mcp\")"
     ]
   }
 }

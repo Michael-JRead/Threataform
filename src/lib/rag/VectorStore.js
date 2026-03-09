@@ -8,11 +8,91 @@
  *
  * HNSW (Hierarchical Navigable Small World) provides O(log N) ANN search.
  *
+ * Enhancements:
+ *   - Embedding LRU cache (500 entries, keyed by djb2 hash of text)
+ *   - HNSW serialization/persistence to IndexedDB
+ *
  * Usage:
  *   const store = new SingleVectorStore(dim);
  *   store.add('chunk-1', embedding, metadata);
  *   const results = store.search(queryVec, 5);
+ *   await store.persistHNSW('my-index-key');
+ *   // on next load:
+ *   const restored = await store.loadHNSW('my-index-key', itemsArray);
  */
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Embedding LRU cache
+//  Module-level so it is shared across all VectorStore instances in the session.
+//  Key: djb2 hash of the text string. Value: Float32Array embedding.
+// ─────────────────────────────────────────────────────────────────────────────
+const _EMB_CACHE_MAX = 500;
+const _embCache = new Map();
+
+/** djb2 hash — fast, good distribution for short strings */
+function _djb2(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * Wrap an async embed function with LRU caching.
+ * @param {string}   text
+ * @param {Function} embedFn  async (text) => Float32Array
+ * @returns {Promise<Float32Array>}
+ */
+export async function cachedEmbed(text, embedFn) {
+  const key = _djb2(text);
+  if (_embCache.has(key)) return _embCache.get(key);
+  const vec = await embedFn(text);
+  if (_embCache.size >= _EMB_CACHE_MAX) {
+    // Evict oldest entry (Map preserves insertion order)
+    _embCache.delete(_embCache.keys().next().value);
+  }
+  _embCache.set(key, vec);
+  return vec;
+}
+
+/** Invalidate entire embedding cache (call after re-ingesting documents). */
+export function clearEmbedCache() { _embCache.clear(); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Lightweight IndexedDB helpers for HNSW persistence
+// ─────────────────────────────────────────────────────────────────────────────
+async function _idbOpen() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open('threataform-vectors', 2);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = () => rej(req.error);
+  });
+}
+async function _idbGet(key) {
+  try {
+    const db = await _idbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readonly');
+      const r  = tx.objectStore('kv').get(key);
+      r.onsuccess = () => { db.close(); res(r.result); };
+      r.onerror   = () => { db.close(); rej(r.error); };
+    });
+  } catch { return undefined; }
+}
+async function _idbPut(key, value) {
+  try {
+    const db = await _idbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      const r  = tx.objectStore('kv').put(value, key);
+      r.onsuccess = () => { db.close(); res(); };
+      r.onerror   = () => { db.close(); rej(r.error); };
+    });
+  } catch { /* silently ignore */ }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Math helpers
@@ -239,6 +319,64 @@ export class SingleVectorStore {
   }
 
   get size() { return this._items.length; }
+
+  // ── HNSW Persistence ─────────────────────────────────────────────────────
+
+  /**
+   * Serialize the HNSW graph to IndexedDB.
+   * Key convention: `tf-hnsw-v1-${chunkCount}` — include count so stale
+   * caches are automatically ignored when the index changes.
+   *
+   * @param {string} idbKey  e.g. 'tf-hnsw-v1-42'
+   */
+  async persistHNSW(idbKey) {
+    try {
+      const nodes = this._hnsw._data.map(n => ({
+        id:        n.id,
+        vec:       Array.from(n.vec),   // Float32Array → plain array for JSON
+        level:     n.level,
+        neighbors: n.neighbors.map(s => Array.from(s)),
+      }));
+      await _idbPut(idbKey, {
+        nodes,
+        entryPt: this._hnsw._entryPt,
+        maxLvl:  this._hnsw._maxLvl,
+        dim:     this.dim,
+        count:   this._items.length,
+      });
+    } catch { /* persistence failures are non-fatal */ }
+  }
+
+  /**
+   * Restore the HNSW graph from IndexedDB.
+   * Items (id/vec/meta) must be re-passed since they are not stored in HNSW.
+   *
+   * @param {string} idbKey
+   * @param {Array<{id,vec,meta}>} items  Must match the persisted order
+   * @returns {Promise<boolean>}  true if restored, false if not found or stale
+   */
+  async loadHNSW(idbKey, items) {
+    try {
+      const data = await _idbGet(idbKey);
+      if (!data || data.count !== items.length || data.dim !== this.dim) return false;
+
+      // Restore items
+      this._items = items;
+      this._idMap.clear();
+      items.forEach((item, i) => this._idMap.set(item.id, i));
+
+      // Restore HNSW graph
+      this._hnsw._data = data.nodes.map(n => ({
+        id:        n.id,
+        vec:       new Float32Array(n.vec),
+        level:     n.level,
+        neighbors: n.neighbors.map(arr => new Set(arr)),
+      }));
+      this._hnsw._entryPt = data.entryPt;
+      this._hnsw._maxLvl  = data.maxLvl;
+      return true;
+    } catch { return false; }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

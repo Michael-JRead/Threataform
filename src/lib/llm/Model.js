@@ -460,6 +460,58 @@ export class ThreataformLM {
     kvc.clear();
     return { logits, hiddens };
   }
+
+  /**
+   * Batch prefill with per-layer activation capture for LoRA backward pass.
+   *
+   * Captures `layerInputs[pos][l]` = the residual stream at the INPUT of layer l
+   * at token position pos (i.e. before the attention pre-norm of layer l).
+   * This is the activation needed to compute LoRA adapter gradients correctly.
+   *
+   * Memory: tokenIds.length × n_layers × dim × 4 bytes
+   *   e.g. 128 tokens × 24 layers × 1024 dim = 12 MB — safe for browsers.
+   *
+   * @param {Int32Array|number[]} tokenIds
+   * @returns {{
+   *   logits:      Float32Array[],   logits[pos]         = output logits
+   *   hiddens:     Float32Array[],   hiddens[pos]        = final hidden state
+   *   layerInputs: Float32Array[][], layerInputs[pos][l] = residual entering layer l
+   * }}
+   */
+  prefillForTrain(tokenIds) {
+    const kvc = this.allocateKVCache(tokenIds.length + 1);
+    const { dim, n_layers, vocab_size, norm_eps } = this.cfg;
+    const outW = this.cfg.tie_embeddings ? this._w('tok_embeddings') : this._w('output');
+    const embW = this._w('tok_embeddings');
+
+    const logits      = [];
+    const hiddens     = [];
+    // Allocate activation buffers up front (avoids per-position GC churn)
+    const layerInputs = Array.from({ length: tokenIds.length }, () =>
+      Array.from({ length: n_layers }, () => new Float32Array(dim)),
+    );
+
+    for (let i = 0; i < tokenIds.length; i++) {
+      // 1. Token embedding
+      fcopy(this._x, 0, embW, tokenIds[i] * dim, dim);
+
+      // 2. Run each layer, capturing the residual BEFORE each layer's norm
+      for (let l = 0; l < n_layers; l++) {
+        layerInputs[i][l].set(this._x); // snapshot residual entering layer l
+        this._layer(l, i, kvc);
+      }
+
+      // 3. Final RMSNorm + LM head
+      rmsnorm(this._xb, this._x, this._w('norm'), dim, norm_eps);
+      matmul(this._logits, outW, this._xb, vocab_size, dim);
+
+      logits.push(this._logits.slice());
+      hiddens.push(this._x.slice());
+    }
+
+    kvc.clear();
+    return { logits, hiddens, layerInputs };
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
