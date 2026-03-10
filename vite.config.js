@@ -18,8 +18,11 @@ export default defineConfig({
     format: "es",
   },
   optimizeDeps: {
-    // Exclude WASM-heavy packages from Vite's pre-bundler so they load as-is
-    exclude: ["@wllama/wllama"],
+    // Exclude WASM-heavy packages from Vite's pre-bundler so they load as-is.
+    // @huggingface/transformers is optional (cross-encoder reranker); the app
+    // falls back to RRF ranking if it is absent. Excluding it here prevents
+    // Vite from erroring when the package is not installed.
+    exclude: ["@wllama/wllama", "@huggingface/transformers"],
   },
   // Serve .wasm and .tnlm files as static assets (not base64-inlined)
   assetsInclude: ["**/*.wasm", "**/*.tnlm"],

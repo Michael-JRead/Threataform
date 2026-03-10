@@ -428,7 +428,11 @@ async function _initCrossEncoder() {
   _ceStatus = 'loading';
   try {
     // Dynamic import keeps the main bundle small; only loads when first needed
-    const { pipeline, env } = await import(/* @vite-ignore */ '@huggingface/transformers');
+    // Use new Function to fully escape Vite's import-analysis plugin.
+    // @vite-ignore is insufficient — Vite still resolves the specifier at
+    // build time even if the package is absent. new Function makes the
+    // import invisible to static analysis so it only runs at runtime.
+    const { pipeline, env } = await new Function('m', 'return import(m)')('@huggingface/transformers');
     // Allow remote models but use cache; workers are already blocked by COEP so use main thread
     env.allowRemoteModels = true;
     env.allowLocalModels  = false;
