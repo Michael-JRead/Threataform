@@ -39,14 +39,73 @@ const DOC_TYPE_META = {
   log:      { label:"LOG",     color:"#607D8B" },
 };
 
-function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
+// Recursively collect all File objects from a DataTransfer, including nested folders.
+// Uses webkitGetAsEntry for full folder traversal; falls back to .files for older browsers.
+async function collectDroppedFiles(dataTransfer) {
+  const files = [];
+
+  const processEntry = (entry, prefix) => new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(file => {
+        if (prefix) {
+          try {
+            Object.defineProperty(file, 'webkitRelativePath', {
+              configurable: true, get: () => `${prefix}/${file.name}`,
+            });
+          } catch { /* read-only in some browsers — path stays as file.name */ }
+        }
+        files.push(file);
+        resolve();
+      }, () => resolve());
+    } else if (entry.isDirectory) {
+      const folderPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const reader = entry.createReader();
+      const readAll = () => new Promise(r => {
+        reader.readEntries(async entries => {
+          if (!entries.length) { r(); return; }
+          await Promise.all(entries.map(e => processEntry(e, folderPrefix)));
+          readAll().then(r); // readEntries caps at 100 — keep reading until empty
+        }, () => r());
+      });
+      readAll().then(resolve);
+    } else {
+      resolve();
+    }
+  });
+
+  const items = Array.from(dataTransfer.items || []);
+  if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+    await Promise.all(items.map(item => {
+      const entry = item.webkitGetAsEntry?.();
+      if (entry) return processEntry(entry, '');
+      const f = item.getAsFile?.();
+      if (f) files.push(f);
+      return Promise.resolve();
+    }));
+  } else {
+    Array.from(dataTransfer.files || []).forEach(f => files.push(f));
+  }
+  return files;
+}
+
+function UserDocsPanel({docs, onAdd, onDelete, onClear, onPickDirectory}) {
   const [openDoc, setOpenDoc]       = useState(null);
   const [docDragging, setDocDragging] = useState(false);
   const [folderOpen, setFolderOpen] = useState({});
 
-  const handleDrop = e => {
+  const handleDrop = async e => {
     e.preventDefault(); setDocDragging(false);
-    if (e.dataTransfer.files?.length) onAdd(e.dataTransfer.files);
+    const collected = await collectDroppedFiles(e.dataTransfer);
+    if (collected.length) onAdd(collected);
+  };
+
+  const handleDirectoryPicker = async () => {
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+      if (onPickDirectory) onPickDirectory(dirHandle);
+    } catch (err) {
+      if (err?.name !== 'AbortError') console.warn('[UserDocsPanel] showDirectoryPicker failed:', err);
+    }
   };
 
   // Group docs by top-level folder (from webkitRelativePath)
@@ -177,7 +236,18 @@ function UserDocsPanel({docs, onAdd, onDelete, onClear}) {
               Drop any files or folders here — all file types accepted
             </div>
             <div style={{display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap"}}>
-              {/* Browse folder */}
+              {/* FSAPI directory picker — Chrome/Edge only, supports 1GB+ */}
+              {'showDirectoryPicker' in window && (
+                <button onClick={handleDirectoryPicker} style={{
+                  background:`${C.blue}18`, border:`1px solid ${C.blue}55`,
+                  borderRadius:6, padding:"8px 18px",
+                  color:C.blue, fontSize:12, cursor:"pointer", ...SANS,
+                  display:"inline-flex", alignItems:"center", gap:6,
+                }}>
+                  🗂 Open Folder (1GB+)
+                </button>
+              )}
+              {/* Browse folder (webkitdirectory fallback) */}
               <label style={{
                 background:`${C.accent}18`, border:`1px solid ${C.accent}55`,
                 borderRadius:6, padding:"8px 18px",

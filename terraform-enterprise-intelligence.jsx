@@ -8,6 +8,7 @@ import { useVectorStore } from './src/hooks/useVectorStore.js';
 // Runs 100% offline. No internet. No API. No installation required.
 // User loads a GGUF model file from their local disk.
 import { wllamaManager } from './src/lib/WllamaManager.js';
+import { threataformEngine } from './src/lib/ThreataformEngine.js';
 import { VectorStore, hybridSearch as ragHybridSearch, rerank as crossEncoderRerank, prewarmCrossEncoder } from './src/lib/ThrataformRAG.js';
 import { hydeTemplate } from './src/lib/rag/HyDE.js';
 import { mcpRegistry } from './src/lib/mcp/MCPToolRegistry.js';
@@ -166,121 +167,71 @@ async function extractTextFromFile(file) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DRAG-AND-DROP — recursive folder traversal via webkitGetAsEntry
+// Works for both individual files and entire folder trees dropped onto the app.
+// Falls back to dataTransfer.files for browsers without the Entry API.
+// ─────────────────────────────────────────────────────────────────────────────
+async function collectDroppedFiles(dataTransfer) {
+  const files = [];
+  const processEntry = (entry, prefix) => new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(file => {
+        if (prefix) {
+          try {
+            Object.defineProperty(file, 'webkitRelativePath', {
+              configurable: true, get: () => `${prefix}/${file.name}`,
+            });
+          } catch { /* read-only in some browsers */ }
+        }
+        files.push(file); resolve();
+      }, () => resolve());
+    } else if (entry.isDirectory) {
+      const fp = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const reader = entry.createReader();
+      const readAll = () => new Promise(r => {
+        reader.readEntries(async entries => {
+          if (!entries.length) { r(); return; }
+          await Promise.all(entries.map(e => processEntry(e, fp)));
+          readAll().then(r); // readEntries caps at 100 per call — keep reading
+        }, () => r());
+      });
+      readAll().then(resolve);
+    } else { resolve(); }
+  });
+  const items = Array.from(dataTransfer.items || []);
+  if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+    await Promise.all(items.map(item => {
+      const entry = item.webkitGetAsEntry?.();
+      if (entry) return processEntry(entry, '');
+      const f = item.getAsFile?.(); if (f) files.push(f);
+      return Promise.resolve();
+    }));
+  } else {
+    Array.from(dataTransfer.files || []).forEach(f => files.push(f));
+  }
+  return files;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // INTELLIGENCE PANEL
 // Enterprise Threat Model Intelligence — zero hallucination, verbatim retrieval
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VECTOR DB — IndexedDB persistence for embeddings (no re-embed on reload)
+// STORAGE — all IDB / OPFS operations consolidated in DocStore
 // ─────────────────────────────────────────────────────────────────────────────
-let _vdbConn = null;
-function _getVectorDB() {
-  if (!_vdbConn) {
-    _vdbConn = new Promise((resolve) => {
-      // v3: adds 'sessions' object store for H2 session history
-      const req = indexedDB.open('threataform-vectors', 3);
-      req.onupgradeneeded = (e) => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains('vectors')) db.createObjectStore('vectors');
-        if (!db.objectStoreNames.contains('sessions')) {
-          const s = db.createObjectStore('sessions', { keyPath: 'id' });
-          s.createIndex('createdAt', 'createdAt');
-        }
-      };
-      req.onsuccess = (e) => resolve(e.target.result);
-      req.onerror = () => { _vdbConn = null; resolve(null); };
-    });
-  }
-  return _vdbConn;
-}
-
-// H2: Write a session record to IDB (fire-and-forget)
-async function sessionDbPut(record) {
-  const db = await _getVectorDB();
-  if (!db) return;
-  return new Promise((res) => {
-    try {
-      const tx = db.transaction('sessions', 'readwrite');
-      tx.objectStore('sessions').put(record);
-      tx.oncomplete = () => res();
-      tx.onerror = () => res();
-    } catch { res(); }
-  });
-}
-
-// H2: Get recent sessions (up to N, newest first)
-async function sessionDbGetRecent(limit = 10) {
-  const db = await _getVectorDB();
-  if (!db) return [];
-  return new Promise((res) => {
-    try {
-      const tx = db.transaction('sessions');
-      const req = tx.objectStore('sessions').index('createdAt').getAll();
-      req.onsuccess = () => {
-        const all = req.result || [];
-        res(all.sort((a, b) => b.createdAt - a.createdAt).slice(0, limit));
-      };
-      req.onerror = () => res([]);
-    } catch { res([]); }
-  });
-}
-async function vdbGet(key) {
-  const db = await _getVectorDB();
-  if (!db) return null;
-  return new Promise((res) => {
-    try {
-      const r = db.transaction('vectors').objectStore('vectors').get(key);
-      r.onsuccess = () => res(r.result ?? null);
-      r.onerror = () => res(null);
-    } catch { res(null); }
-  });
-}
-async function vdbPut(key, value) {
-  const db = await _getVectorDB();
-  if (!db) return;
-  return new Promise((res) => {
-    try {
-      const tx = db.transaction('vectors', 'readwrite');
-      tx.objectStore('vectors').put(value, key);
-      tx.oncomplete = () => res();
-      tx.onerror = () => res();
-    } catch { res(); }
-  });
-}
-async function vdbGetMany(keys) {
-  const db = await _getVectorDB();
-  if (!db) return {};
-  return new Promise((res) => {
-    const results = {};
-    const tx = db.transaction('vectors');
-    const store = tx.objectStore('vectors');
-    let pending = keys.length;
-    if (!pending) { res(results); return; }
-    keys.forEach(k => {
-      const r = store.get(k);
-      r.onsuccess = () => { results[k] = r.result ?? null; if (--pending === 0) res(results); };
-      r.onerror   = () => { results[k] = null;             if (--pending === 0) res(results); };
-    });
-  });
-}
-// Stable chunk hash: first 50 chars + length (no crypto needed)
-function chunkHash(text) { return (text.substring(0, 50) + '|' + text.length).replace(/[^\w|]/g, '_'); }
-
-// H1: Delete cached vectors for specific IDB keys (computed from chunks of the removed doc)
-async function vdbDeleteKeys(keys) {
-  if (!keys?.length) return;
-  const db = await _getVectorDB();
-  if (!db) return;
-  return new Promise((res) => {
-    try {
-      const tx = db.transaction('vectors', 'readwrite');
-      const store = tx.objectStore('vectors');
-      keys.forEach(k => store.delete(k));
-      tx.oncomplete = () => res();
-      tx.onerror = () => res();
-    } catch { res(); }
-  });
-}
+import {
+  tfFilesPutAll, tfFilesGetAll,
+  modelMetaPut, modelMetaGet,
+  opfsWriteText as _opfsWrite,
+  vecGet as vdbGet,
+  vecPut as vdbPut,
+  vecGetMany as vdbGetMany,
+  vecPutMany as vdbPutMany,
+  vecDeleteKeys as vdbDeleteKeys,
+  chunkHash,
+  sessionDbPut, sessionDbGetRecent,
+} from './src/lib/storage/DocStore.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN APP
@@ -333,31 +284,66 @@ export default function App() {
     setDiagramImage(null); setArchAnalysis(null); setArchOverrides({});
     setAppMode("documents"); setMainTab("build");
     setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
-    try {
-      setUserDocsState(JSON.parse(localStorage.getItem(`tf-model-${model.id}-docs`) || "[]"));
-    } catch { setUserDocsState([]); }
+    setUserDocsState([]); // useUserDocs will load from IDB via its own effect
   }, [_createModel, setUserDocsState]); // eslint-disable-line
 
   const openModel = useCallback((model) => {
-    _openModel(model);
+    _openModel(model); // loads modelDetails from IDB asynchronously
     setAppMode("documents"); setMainTab("build");
     setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
-    let savedTF = [];
-    try {
-      savedTF = JSON.parse(localStorage.getItem(`tf-model-${model.id}-files`) || "[]");
-      if (savedTF.length) setFiles(savedTF);
-    } catch {}
-    try {
-      setUserDocsState(JSON.parse(localStorage.getItem(`tf-model-${model.id}-docs`) || "[]"));
-    } catch { setUserDocsState([]); }
-    try {
-      setDiagramImage(localStorage.getItem(`tf-model-${model.id}-diagram-image`) || null);
-    } catch { setDiagramImage(null); }
-    try {
-      const saved = JSON.parse(localStorage.getItem(`tf-model-${model.id}-arch-analysis`) || "{}");
-      setArchAnalysis(saved.base || null); setArchOverrides(saved.overrides || {});
-    } catch { setArchAnalysis(null); setArchOverrides({}); }
-    if (savedTF.length) setTimeout(() => reparseRef.current?.(savedTF), 0);
+    setDiagramImage(null); setArchAnalysis(null); setArchOverrides({});
+    // useUserDocs loads docs from IDB via its own effect on currentModel change
+
+    // Load TF files from IDB (async)
+    tfFilesGetAll(model.id).then(savedTF => {
+      if (savedTF.length) {
+        setFiles(savedTF);
+        setTimeout(() => reparseRef.current?.(savedTF), 0);
+      } else {
+        // Migration: check old localStorage key
+        try {
+          const old = localStorage.getItem(`tf-model-${model.id}-files`);
+          if (old) {
+            const parsed = JSON.parse(old);
+            if (parsed.length) {
+              setFiles(parsed);
+              tfFilesPutAll(model.id, parsed); // migrate to IDB
+              localStorage.removeItem(`tf-model-${model.id}-files`);
+              setTimeout(() => reparseRef.current?.(parsed), 0);
+            }
+          }
+        } catch {}
+      }
+    });
+
+    // Load diagram image from IDB
+    modelMetaGet(model.id, 'diagram-image').then(img => {
+      setDiagramImage(img || null);
+      if (!img) {
+        // Migration from localStorage
+        try {
+          const old = localStorage.getItem(`tf-model-${model.id}-diagram-image`);
+          if (old) { setDiagramImage(old); modelMetaPut(model.id, 'diagram-image', old); localStorage.removeItem(`tf-model-${model.id}-diagram-image`); }
+        } catch {}
+      }
+    });
+
+    // Load arch-analysis from IDB
+    modelMetaGet(model.id, 'arch-analysis').then(saved => {
+      setArchAnalysis(saved?.base || null); setArchOverrides(saved?.overrides || {});
+      if (!saved) {
+        // Migration from localStorage
+        try {
+          const old = localStorage.getItem(`tf-model-${model.id}-arch-analysis`);
+          if (old) {
+            const parsed = JSON.parse(old);
+            setArchAnalysis(parsed.base || null); setArchOverrides(parsed.overrides || {});
+            modelMetaPut(model.id, 'arch-analysis', parsed);
+            localStorage.removeItem(`tf-model-${model.id}-arch-analysis`);
+          }
+        } catch {}
+      }
+    });
   }, [_openModel, setUserDocsState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Enterprise Architecture Layer Analysis (7-layer model) ───────────────────
@@ -494,22 +480,26 @@ export default function App() {
   }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Rebuild intelligence whenever userDocs or modelDetails (Application Details form) changes.
-  // modelDetails is in deps so filling in env / compliance scope / description immediately
-  // re-indexes the synthetic model-context doc — no file upload required.
+  // Debounced 500ms so rapid keystrokes in form fields don't trigger repeated full re-indexes.
+  const intelRebuildTimerRef = useRef(null);
   useEffect(() => {
-    const pr = parseResultRef.current;
-    const ctxDoc = buildModelContextDoc();
-    const archDoc = buildArchContextDoc();
-    const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
-    const docsWithCtx = [...syntheticDocs, ...userDocs];
-    intelligenceRef.current = new ThreatModelIntelligence();
-    intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[], archLayerAnalysisRef.current);
-    setIntelligenceVersion(v => v+1);
-    // Regenerate XML with enriched intelligence if we have parsed data
-    if (pr && (pr.resources.length > 0 || pr.modules.length > 0)) {
-      const x = generateDFDXml(pr.resources, pr.modules, pr.connections, intelligenceRef.current, archLayerAnalysisRef.current);
-      setXml(x);
-    }
+    clearTimeout(intelRebuildTimerRef.current);
+    intelRebuildTimerRef.current = setTimeout(() => {
+      const pr = parseResultRef.current;
+      const ctxDoc = buildModelContextDoc();
+      const archDoc = buildArchContextDoc();
+      const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
+      const docsWithCtx = [...syntheticDocs, ...userDocs];
+      intelligenceRef.current = new ThreatModelIntelligence();
+      intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[], archLayerAnalysisRef.current);
+      setIntelligenceVersion(v => v+1);
+      // Regenerate XML with enriched intelligence if we have parsed data
+      if (pr && (pr.resources.length > 0 || pr.modules.length > 0)) {
+        const x = generateDFDXml(pr.resources, pr.modules, pr.connections, intelligenceRef.current, archLayerAnalysisRef.current);
+        setXml(x);
+      }
+    }, 500);
+    return () => clearTimeout(intelRebuildTimerRef.current);
   }, [userDocs, modelDetails, archOverrides]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-populate Architecture Description when intelligence rebuilds and field is empty
@@ -524,7 +514,7 @@ export default function App() {
       setModelDetails(updated);
       const cm = currentModelRef.current;
       if (cm) {
-        try { localStorage.setItem(`tf-model-${cm.id}-details`, JSON.stringify(updated)); } catch {}
+        modelMetaPut(cm.id, 'details', updated); // async, fire-and-forget
       }
     }
   }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -622,12 +612,13 @@ export default function App() {
       const batch = needEmbed.slice(i, i + BATCH);
       try {
         const vectors = await wllamaManager.embed(batch.map(b => b.chunk.text));
+        const batchPairs = [];
         batch.forEach((b, j) => {
           const vec = vectors[j];
           if (!vec?.length) return;
           result[b.chunkIdx] = { ...b.chunk, vector: vec };
           vectorStoreRef.current.add(`chunk_${b.chunkIdx}`, vec, b.chunk);
-          vdbPut(b.key, vec);
+          batchPairs.push({ key: b.key, value: vec });
           // ColBERT multi-vector embeddings (late-interaction) — populate if model supports it
           try {
             const multiVecs = wllamaManager.embedMulti?.(b.chunk.text);
@@ -638,6 +629,7 @@ export default function App() {
             }
           } catch { /* ColBERT skipped — single-vector still active */ }
         });
+        if (batchPairs.length) await vdbPutMany(batchPairs); // single transaction per batch
       } catch { /* skip failed batch */ }
       setEmbedProgress({ done: Math.min(i + BATCH, needEmbed.length), total: needEmbed.length });
     }
@@ -706,10 +698,7 @@ export default function App() {
         );
         setArchAnalysis(result);
         if (currentModel) {
-          try {
-            localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: result, overrides: archOverrides }));
-          } catch {}
+          modelMetaPut(currentModel.id, 'arch-analysis', { base: result, overrides: archOverrides });
         }
       } finally { setArchAnalyzing(false); }
     }, 0);
@@ -720,7 +709,7 @@ export default function App() {
     // Accept PDFs, images, and text files; skip compiled binaries, archives, web assets
     const SKIP_EXT = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
     const candidates = Array.from(fileList)
-      .filter(f => !SKIP_EXT.test(f.name) && f.size < 50 * 1024 * 1024); // skip >50MB
+      .filter(f => !SKIP_EXT.test(f.name) && f.size < 512 * 1024 * 1024); // skip >512MB
     if (!candidates.length) return Promise.resolve([]);
     return Promise.all(candidates.map(async f => {
       const path = f.webkitRelativePath || f.name;
@@ -728,7 +717,7 @@ export default function App() {
       const ext  = name.includes(".") ? name.split(".").pop().toLowerCase() : "txt";
       if (onProgress) onProgress(name, "processing");
       try {
-        const content = await extractTextFromFile(f);
+        const { text: content } = await threataformEngine.ingestFileViaWorker(f);
         if (onProgress) onProgress(name, "done");
         return { path, name, ext, content, binary: false, size: f.size, docCategory };
       } catch {
@@ -836,7 +825,7 @@ export default function App() {
   const readFiles = useCallback((fileList, append = false, docCategory = "general") => {
     const SKIP_BINARY = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
     const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name) || /\.cfn\.json$/i.test(f.name);
-    const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 50*1024*1024);
+    const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 512*1024*1024);
     if (!all.length) return;
     setError("");
 
@@ -857,7 +846,7 @@ export default function App() {
     Promise.all([
       Promise.all(tfCandidates.map(readAsText)),
       Promise.all(ctxCandidates.map(f =>
-        extractTextFromFile(f).then(content => {
+        threataformEngine.ingestFileViaWorker(f).then(({ text: content }) => {
           onFileDone(f.name);
           return { path: f.webkitRelativePath || f.name, name: f.name, content, size: f.size, docCategory };
         }).catch(() => { onFileDone(f.name); return null; })
@@ -880,7 +869,7 @@ export default function App() {
       // Side effects separately, after state update, using stable refs
       const cm = currentModelRef.current;
       if (cm) {
-        try { localStorage.setItem(`tf-model-${cm.id}-files`, JSON.stringify(merged)); } catch {}
+        tfFilesPutAll(cm.id, merged); // persist to IDB (async, fire-and-forget)
         updateModelMetaRef.current({ tfFileCount: merged.length });
       }
       reparse(merged); // reads fresh userDocsRef.current
@@ -908,7 +897,7 @@ export default function App() {
     // Update persistence
     const cm = currentModelRef.current;
     if (cm) {
-      try { localStorage.setItem(`tf-model-${cm.id}-files`, JSON.stringify(next)); } catch {}
+      tfFilesPutAll(cm.id, next); // persist to IDB (async, fire-and-forget)
       updateModelMetaRef.current({ tfFileCount: next.length });
     }
   }, [reparse]);
@@ -922,7 +911,112 @@ export default function App() {
     setError("");
   }, []);
 
-  const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files, true); }, [readFiles]);
+  // Phase 3B — File System Access API: read an entire directory handle
+  // Called from UserDocsPanel's "Open Folder (1GB+)" button (Chrome/Edge only).
+  // TF/HCL files → setFiles + reparse; context files → userDocs (via ingestWorker).
+  const readDirectory = useCallback(async (dirHandle) => {
+    const SKIP_BINARY = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
+    const SKIP_HIDDEN = /^\./;
+    const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name) || /\.cfn\.json$/i.test(f.name);
+
+    // Recursively enumerate all file handles
+    const fileHandles = [];
+    const traverse = async (handle, prefix) => {
+      for await (const [name, entry] of handle.entries()) {
+        if (SKIP_HIDDEN.test(name)) continue;
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (entry.kind === 'file') {
+          fileHandles.push({ entry, path });
+        } else if (entry.kind === 'directory') {
+          await traverse(entry, path);
+        }
+      }
+    };
+
+    try {
+      await traverse(dirHandle, '');
+    } catch (err) {
+      console.warn('[readDirectory] Enumeration error:', err);
+      return;
+    }
+
+    // Get File objects (filter by size + extension)
+    const resolved = (await Promise.all(
+      fileHandles
+        .filter(({ path }) => !SKIP_BINARY.test(path))
+        .map(async ({ entry, path }) => {
+          try {
+            const file = await entry.getFile();
+            if (file.size >= 512 * 1024 * 1024) return null;
+            return { file, path };
+          } catch { return null; }
+        })
+    )).filter(Boolean);
+
+    if (!resolved.length) return;
+    setError("");
+
+    const tfEntries  = resolved.filter(({ file }) => isTF(file));
+    const ctxEntries = resolved.filter(({ file }) => !isTF(file));
+    const total = resolved.length;
+    let done = 0;
+    setIngestState({ total, done: 0, current: resolved[0]?.file?.name || "" });
+    const onFileDone = (name) => { done++; setIngestState({ total, done, current: name }); };
+
+    const readAsText = ({ file, path }) => new Promise(res => {
+      const r = new FileReader();
+      r.onload  = ev => { onFileDone(file.name); res({ path, name: file.name, content: ev.target.result || "", size: file.size }); };
+      r.onerror = ()  => { onFileDone(file.name); res(null); };
+      r.readAsText(file);
+    });
+
+    const [tfLoaded, ctxLoaded] = await Promise.all([
+      Promise.all(tfEntries.map(readAsText)),
+      Promise.all(ctxEntries.map(({ file, path }) =>
+        threataformEngine.ingestFileViaWorker(file).then(({ text: content }) => {
+          onFileDone(file.name);
+          return { path, name: file.name, content, size: file.size, docCategory: 'general' };
+        }).catch(() => { onFileDone(file.name); return null; })
+      )),
+    ]);
+
+    setIngestState(null);
+
+    const validTF  = tfLoaded.filter(Boolean);
+    const validCtx = ctxLoaded.filter(Boolean);
+
+    // Merge TF files
+    const existing   = filesRef.current;
+    const existPaths = new Set(existing.map(f => f.path));
+    const newTF      = validTF.filter(f => !existPaths.has(f.path));
+    const merged     = [...existing, ...newTF].sort((a, b) => a.path.localeCompare(b.path));
+
+    setScopeFiles(null);
+    setFiles(merged);
+    const cm = currentModelRef.current;
+    if (cm) {
+      tfFilesPutAll(cm.id, merged);
+      updateModelMetaRef.current({ tfFileCount: merged.length });
+    }
+    reparse(merged);
+
+    // Add context files to userDocs
+    if (validCtx.length) {
+      saveUserDocs(prev => {
+        const existCtxPaths = new Set(prev.map(d => d.path || d.name));
+        const newDocs = validCtx
+          .filter(d => !existCtxPaths.has(d.path))
+          .map(d => ({ ...d, ext: (d.name.split('.').pop() || 'txt').toLowerCase() }));
+        return newDocs.length ? [...prev, ...newDocs] : prev;
+      });
+    }
+  }, [reparse, saveUserDocs]);
+
+  const handleDrop = useCallback(async e => {
+    e.preventDefault(); setDragging(false);
+    const collected = await collectDroppedFiles(e.dataTransfer);
+    if (collected.length) readFiles(collected, true);
+  }, [readFiles]);
   // Full <mxfile> wrapper with correct document-level indentation matching the working reference XML:
   //   <mxfile>            ← 0 spaces
   //     <diagram>         ← 2 spaces
@@ -1016,6 +1110,7 @@ export default function App() {
           ingestState={ingestState}
           intelligence={intelligenceRef.current}
           intelligenceVersion={intelligenceVersion}
+          onPickDirectory={readDirectory}
         />
       </>
     );
@@ -1273,7 +1368,8 @@ export default function App() {
             {kbDomain === "userdocs"
               ? <UserDocsPanel docs={userDocs} onAdd={addUserDocs}
                   onDelete={(i) => saveUserDocs(userDocs.filter((_,idx)=>idx!==i))}
-                  onClear={() => saveUserDocs([])} />
+                  onClear={() => saveUserDocs([])}
+                  onPickDirectory={readDirectory} />
               : <KBPanel domain={kbDomain} />
             }
           </div>
@@ -1348,8 +1444,7 @@ export default function App() {
           setArchOverrides(updated);
           setIntelligenceVersion(v => v + 1);
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: updated })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: updated });
           }
         };
 
@@ -1368,8 +1463,7 @@ export default function App() {
           setArchOverrides(newOverrides);
           setIntelligenceVersion(v => v + 1);
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: newOverrides })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: newOverrides });
           }
         };
 
@@ -1380,8 +1474,7 @@ export default function App() {
               const result = intelligenceRef.current.analyzeArchitecture(parseResult?.resources||[], userDocs, modelDetails);
               setArchAnalysis(result);
               if (currentModel) {
-                try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-                  JSON.stringify({ base: result, overrides: archOverrides })); } catch {}
+                modelMetaPut(currentModel.id, 'arch-analysis', { base: result, overrides: archOverrides });
               }
             } finally { setArchAnalyzing(false); }
           }, 0);
@@ -1390,8 +1483,7 @@ export default function App() {
         const resetOverrides = () => {
           setArchOverrides({});
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: {} })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: {} });
           }
         };
 
@@ -1824,6 +1916,23 @@ export default function App() {
               All file types accepted · .tf .hcl .sentinel .tfvars → parsed · everything else → context docs
             </div>
             <div style={{display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap"}}>
+              {'showDirectoryPicker' in window && (
+                <button onClick={async () => {
+                  try {
+                    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+                    readDirectory(dirHandle);
+                  } catch (err) {
+                    if (err?.name !== 'AbortError') console.warn('[DropZone] showDirectoryPicker failed:', err);
+                  }
+                }} style={{
+                  background:`${C.blue}18`, border:`1px solid ${C.blue}55`,
+                  borderRadius:8, padding:"9px 20px",
+                  color:C.blue, fontSize:13, cursor:"pointer", ...SANS,
+                  display:"flex", alignItems:"center", gap:7, fontWeight:600,
+                }}>
+                  🗂 Open Folder (1GB+)
+                </button>
+              )}
               <label style={{
                 background:C.surface2, border:`1px solid ${C.border2}`,
                 borderRadius:8, padding:"9px 20px",
@@ -2076,8 +2185,7 @@ export default function App() {
           setArchOverrides(updated);
           setIntelligenceVersion(v => v + 1);
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: updated })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: updated });
           }
         };
 
@@ -2096,8 +2204,7 @@ export default function App() {
           setArchOverrides(newOverrides);
           setIntelligenceVersion(v => v + 1);
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: newOverrides })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: newOverrides });
           }
         };
 
@@ -2108,8 +2215,7 @@ export default function App() {
               const result = intelligenceRef.current.analyzeArchitecture(parseResult?.resources||[], userDocs, modelDetails);
               setArchAnalysis(result);
               if (currentModel) {
-                try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-                  JSON.stringify({ base: result, overrides: archOverrides })); } catch {}
+                modelMetaPut(currentModel.id, 'arch-analysis', { base: result, overrides: archOverrides });
               }
             } finally { setArchAnalyzing(false); }
           }, 0);
@@ -2118,8 +2224,7 @@ export default function App() {
         const resetOverrides = () => {
           setArchOverrides({});
           if (currentModel) {
-            try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
-              JSON.stringify({ base: archAnalysis, overrides: {} })); } catch {}
+            modelMetaPut(currentModel.id, 'arch-analysis', { base: archAnalysis, overrides: {} });
           }
         };
 
@@ -2539,7 +2644,7 @@ export default function App() {
                 onUpload={(dataUrl, _name) => {
                   setDiagramImage(dataUrl);
                   if (currentModel) {
-                    try { localStorage.setItem(`tf-model-${currentModel.id}-diagram-image`, dataUrl); } catch {}
+                    modelMetaPut(currentModel.id, 'diagram-image', dataUrl);
                   }
                 }}
               />

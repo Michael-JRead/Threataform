@@ -465,6 +465,46 @@ class ThreataformEngine {
     this._colbert.clear();
   }
 
+  /**
+   * Extract text from a File object using the ingestWorker (off main thread).
+   * Returns { text: string, chunks: Array, metadata: object }.
+   * Falls back to FileReader.readAsText() if the worker fails or isn't started.
+   *
+   * @param {File} file
+   * @returns {Promise<{text: string, chunks: Array, metadata: object}>}
+   */
+  ingestFileViaWorker(file) {
+    return new Promise((resolve) => {
+      try {
+        this._ensureIngestWorker();
+        const id = _newId();
+        this._pendingCalls.set(id, {
+          resolve: (result) => resolve(result || { text: '', chunks: [], metadata: {} }),
+          reject:  () => this._fallbackRead(file).then(resolve),
+        });
+        this._ingestWorker.postMessage({ type: 'ingestFile', id, file });
+      } catch {
+        this._fallbackRead(file).then(resolve);
+      }
+    });
+  }
+
+  /** @private Plain FileReader fallback when ingestWorker unavailable. */
+  _fallbackRead(file) {
+    return new Promise(resolve => {
+      const ext = (file.name.split('.').pop() || '').toLowerCase();
+      if (['pdf', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'tiff', 'docx', 'xlsx', 'pptx'].includes(ext)) {
+        // Binary formats need the worker — return empty text
+        resolve({ text: `[${file.name} — extraction requires worker]`, chunks: [], metadata: {} });
+        return;
+      }
+      const r = new FileReader();
+      r.onload  = e => resolve({ text: e.target.result || '', chunks: [], metadata: {} });
+      r.onerror = ()  => resolve({ text: '', chunks: [], metadata: {} });
+      r.readAsText(file);
+    });
+  }
+
   /** Status string for UI display. */
   get statusText() {
     if (!this.isLoaded)      return 'Loading ThreataformLM-200M...';

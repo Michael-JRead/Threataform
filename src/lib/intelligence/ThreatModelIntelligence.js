@@ -1388,6 +1388,35 @@ class ThreatModelIntelligence {
                    c.text.toLowerCase().includes('layer'));
   }
 
+  // ── Incremental: add a single doc without full rebuild ───────────────────────
+  addDoc(doc) {
+    if (!doc || doc.binary || !doc.content || doc.content.length < 10) return;
+    const source = doc.name || doc.path;
+    // Skip if doc already indexed (same source already has chunks)
+    if (this.chunks.some(c => c.source === source)) return;
+    const cat = this._categorizeDoc(doc);
+    const docId = `doc_inc_${Date.now()}`;
+    this._splitText(doc.content).forEach((chunk, ci) => {
+      this._addChunk(source, chunk, cat, docId, ci);
+    });
+    this._buildIndex();
+    this._built = true;
+  }
+
+  // ── Incremental: remove a single doc by source name or path ─────────────────
+  removeDoc(pathOrName) {
+    // Match by exact source OR by bare filename (strip directory prefix)
+    const bare = pathOrName.replace(/^.*[\\/]/, '');
+    const keep = this.chunks.map((c, i) => c.source !== pathOrName && c.source !== bare ? i : -1).filter(i => i >= 0);
+    if (keep.length === this.chunks.length) return; // nothing to remove
+    this.chunks   = keep.map(i => this.chunks[i]);
+    this._tf      = keep.map(i => this._tf[i]);
+    this._docLens = keep.map(i => this._docLens[i]);
+    // Reassign sequential IDs
+    this.chunks.forEach((c, i) => { c.id = i; });
+    this._buildIndex();
+  }
+
   // ── Legacy: keep _addChunk's old index object intact for any callers ─────────
   // (not needed in v2 but guards against stale refs)
   get index() { return this._idf; }

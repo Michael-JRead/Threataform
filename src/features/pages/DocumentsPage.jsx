@@ -6,6 +6,42 @@ import {
 } from '../../icons.jsx';
 import { C, SANS } from '../../constants/styles.js';
 
+// Recursively collect all File objects from a DataTransfer, including nested folders.
+async function collectDroppedFiles(dataTransfer) {
+  const files = [];
+  const processEntry = (entry, prefix) => new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(file => {
+        if (prefix) {
+          try { Object.defineProperty(file, 'webkitRelativePath', { configurable: true, get: () => `${prefix}/${file.name}` }); } catch {}
+        }
+        files.push(file); resolve();
+      }, () => resolve());
+    } else if (entry.isDirectory) {
+      const fp = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const reader = entry.createReader();
+      const readAll = () => new Promise(r => {
+        reader.readEntries(async entries => {
+          if (!entries.length) { r(); return; }
+          await Promise.all(entries.map(e => processEntry(e, fp)));
+          readAll().then(r);
+        }, () => r());
+      });
+      readAll().then(resolve);
+    } else { resolve(); }
+  });
+  const items = Array.from(dataTransfer.items || []);
+  if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+    await Promise.all(items.map(item => {
+      const entry = item.webkitGetAsEntry?.();
+      if (entry) return processEntry(entry, '');
+      const f = item.getAsFile?.(); if (f) files.push(f);
+      return Promise.resolve();
+    }));
+  } else { Array.from(dataTransfer.files || []).forEach(f => files.push(f)); }
+  return files;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DOCUMENTS PAGE — Step 2: categorized supporting document upload
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,7 +66,7 @@ const THREAT_FRAMEWORKS = [
   "OWASP Top 10","OWASP Top 10 Cloud","MITRE ATT&CK","DREAD","TRIKE",
 ];
 
-function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs, onRemoveDoc, onContinue, onBack, ingestState, intelligence, intelligenceVersion }) {
+function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs, onRemoveDoc, onContinue, onBack, ingestState, intelligence, intelligenceVersion, onPickDirectory }) {
   const [collapsed, setCollapsed] = useState({ "security-controls":true, "cspm":true, "compliance-guide":true, "trust-cloud":true });
   const [processing, setProcessing] = useState({});   // { filename: 'processing'|'done'|'error' }
   const [keyFeaturesText, setKeyFeaturesText] = useState(modelDetails.keyFeatures || "");
@@ -75,10 +111,10 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
 
   const totalDocs = userDocs.length;
 
-  const handleDrop = (e, catId) => {
+  const handleDrop = async (e, catId) => {
     e.preventDefault(); e.stopPropagation();
-    const files = e.dataTransfer.files;
-    if (files?.length) handleFiles(files, catId);
+    const collected = await collectDroppedFiles(e.dataTransfer);
+    if (collected.length) handleFiles(collected, catId);
   };
 
   const handleFiles = (fileList, catId) => {
@@ -92,6 +128,15 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
     onAddDocs(fileList, catId, (name, status) => {
       setProcessing(prev => ({ ...prev, [name]: status }));
     });
+  };
+
+  const handleDirectoryPicker = async () => {
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+      if (onPickDirectory) onPickDirectory(dirHandle);
+    } catch (err) {
+      if (err?.name !== 'AbortError') console.warn('[DocumentsPage] showDirectoryPicker failed:', err);
+    }
   };
 
   const toggleFramework = (fw, isIndustry) => {
@@ -229,7 +274,7 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
                 <Upload size={16}/>
                 <span style={{...SANS, fontSize:12}}>Drop files here or <span style={{color:C.accent, fontWeight:600}}>click to browse</span></span>
               </div>
-              <div style={{fontSize:11, color:C.textMuted, marginTop:4}}>PDF · DOCX · XLSX · CSV · JSON · YAML · TXT · Images — max 50MB</div>
+              <div style={{fontSize:11, color:C.textMuted, marginTop:4}}>PDF · DOCX · XLSX · CSV · JSON · YAML · TXT · Images — up to 512MB each</div>
             </div>
             {renderFileList(catDocs, cat.id)}
           </div>
@@ -307,6 +352,17 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
             </div>
           ))}
         </div>
+
+        {/* FSAPI folder picker — Chrome/Edge only */}
+        {'showDirectoryPicker' in window && (
+          <button onClick={handleDirectoryPicker} style={{
+            display:"flex", alignItems:"center", gap:6, background:`${C.blue}18`,
+            border:`1px solid ${C.blue}55`, borderRadius:8, padding:"8px 14px", color:C.blue,
+            fontSize:12, cursor:"pointer", ...SANS, flexShrink:0,
+          }}>
+            🗂 Open Folder (1GB+)
+          </button>
+        )}
 
         {/* Continue */}
         <button onClick={onContinue} style={{
