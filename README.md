@@ -53,9 +53,20 @@ python scripts/create_dummy_model.py
 # Replace with real trained weights after running the training pipeline
 ```
 
-### Enterprise / Restricted npm Registry
+### Enterprise / Restricted npm Registry (e.g. corporate JFrog Artifactory)
 
-If your environment blocks the public npm registry:
+If `npm install` fails or Vite is not found after install (common with corporate Artifactory proxies that intercept `devDependencies`), use this sequence:
+
+```bash
+rm -rf node_modules package-lock.json
+npm install
+npm install vite --save-dev
+npm run dev
+```
+
+The `rm -rf` ensures a clean state; reinstalling `vite` separately works around Artifactory virtual repos that may not resolve dev dependencies in a single pass. The `npm audit` 404 errors logged by Artifactory (`Virtual repository npm does not have any npm audit providers`) are harmless warnings — the install itself succeeds.
+
+If your environment blocks the public npm registry entirely:
 
 ```bash
 npm install --omit=optional   # skip native binary optionals
