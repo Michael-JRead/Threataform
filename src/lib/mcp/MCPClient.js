@@ -21,7 +21,7 @@
 
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 const DEFAULT_TIMEOUT_MS   = 10_000;
-const CONNECT_TIMEOUT_MS   = 3_000;
+const CONNECT_TIMEOUT_MS   = 10_000;
 
 export class MCPClient {
   /**
@@ -36,6 +36,7 @@ export class MCPClient {
     this._id      = 0;
     this._pending = new Map(); // id → { res, rej, timer }
     this._useHttp = url.startsWith('http');
+    this.lastError = null;
   }
 
   /**
@@ -96,7 +97,9 @@ export class MCPClient {
 
       const timeout = setTimeout(() => {
         ws.close();
-        rej(new Error(`MCP connection timeout (${CONNECT_TIMEOUT_MS}ms)`));
+        const timeoutMsg = `Connection timed out after 10s. Check that your MCP server is running at ${this.url}`;
+        this.lastError = timeoutMsg;
+        rej(new Error(timeoutMsg));
       }, CONNECT_TIMEOUT_MS);
 
       ws.onopen = async () => {
@@ -122,7 +125,10 @@ export class MCPClient {
       ws.onerror = (e) => {
         clearTimeout(timeout);
         this.connected = false;
-        rej(new Error(`MCP WebSocket error: ${e.message ?? 'connection refused'}`));
+        const detail = e.message || e.type || 'connection refused';
+        const errMsg = `MCP WebSocket error: ${detail}. Verify the server is running at ${this.url}`;
+        this.lastError = errMsg;
+        rej(new Error(errMsg));
       };
 
       ws.onclose = () => {

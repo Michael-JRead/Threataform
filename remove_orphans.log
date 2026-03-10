@@ -1,0 +1,23 @@
+Original: 7292 lines
+  Removing: {/* ── THREAT FINDINGS TAB ── */}
+    Lines removed: 110
+    First 80 chars of removed block: '        {/* ── THREAT FINDINGS TAB ── */}\n        {iTab==="threats" && (\n       '
+  Removing: {/* ── SCOPE ANALYSIS TAB ── */}
+    Lines removed: 170
+    First 80 chars of removed block: '        {/* ── SCOPE ANALYSIS TAB ── */}\n        {iTab==="scope" && (\n          '
+  Removing: {/* ── MISCONFIG CHECKS TAB ── */}
+    Lines removed: 180
+    First 80 chars of removed block: '        {/* ── MISCONFIG CHECKS TAB ── */}\n        {iTab==="misconfigs" && (\n   '
+  Removing: {/* ── ATT&CK MAPPING TAB ── */}
+    Lines removed: 173
+    First 80 chars of removed block: '        {/* ── ATT&CK MAPPING TAB ── */}\n        {iTab==="attacks" && (\n        '
+  Removing: {/* ── SECURITY POSTURE TAB ── */}
+    Lines removed: 224
+    First 80 chars of removed block: '        {/* ── SECURITY POSTURE TAB ── */}\n        {iTab==="posture" && (\n      '
+  Removing: {/* ── CONTROL INVENTORY TAB ── */}
+    Lines removed: 165
+    First 80 chars of removed block: '        {/* ── CONTROL INVENTORY TAB ── */}\n        {iTab==="controls" && (\n    '
+
+Removed 1022 total lines across 6 blocks
+New length: 6270 lines
+Done. File written successfully.

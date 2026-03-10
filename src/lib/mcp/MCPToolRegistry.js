@@ -24,6 +24,11 @@ import { MCPClient }        from './MCPClient.js';
 import { scoreCVSS }        from './tools/CVSSScorer.js';
 import { lookupMitre }      from './tools/ThreatDBTool.js';
 import { checkCompliance }  from './tools/ComplianceChecker.js';
+import { ArchitectureAnalyzer } from '../intelligence/ArchitectureAnalyzer.js';
+import { findPotentialProductModules } from '../iac/TerraformParser.js';
+
+let _archAnalyzer = null;
+function _getArchAnalyzer() { return _archAnalyzer || (_archAnalyzer = new ArchitectureAnalyzer()); }
 
 class MCPToolRegistry {
   constructor() {
@@ -103,6 +108,144 @@ class MCPToolRegistry {
         return lines.join('\n');
       },
     });
+
+    this._register({
+      name:        'analyze_architecture',
+      source:      'builtin',
+      description: 'Analyze Terraform files for 7-layer enterprise architecture completeness, factory component status, and governance gaps',
+      inputSchema: {
+        type:       'object',
+        properties: {
+          files: { type: 'array', description: 'Array of file objects with { path, name, content } fields' },
+        },
+        required: ['files'],
+      },
+      fn: (params) => {
+        try {
+          const result = _getArchAnalyzer().analyzeArchitecture(params.files || []);
+          const lines = [
+            `Architecture Grade: ${result.architectureGrade}`,
+            `Files Analyzed: ${result.summary?.totalFiles || 0}`,
+            `Layers Present: ${result.summary?.presentLayers}/${result.summary?.totalLayers}`,
+            `Average Completeness: ${result.summary?.avgCompleteness}%`,
+            '',
+            'LAYER STATUS:',
+          ];
+          Object.entries(result.layers || {}).forEach(([num, l]) => {
+            const icon = l.completeness >= 90 ? '✅' : l.completeness > 0 ? '⚠️' : '❌';
+            lines.push(`  Layer ${num} (${l.name}): ${icon} ${l.completeness}% — ${l.fileCount} file(s)`);
+            if (l.missingModules?.length) lines.push(`    Missing: ${l.missingModules.join(', ')}`);
+          });
+          if (result.security?.criticalIssues?.length) {
+            lines.push('', 'CRITICAL ISSUES:');
+            result.security.criticalIssues.forEach(i => lines.push(`  ⚠️  ${i}`));
+          }
+          if (result.recommendations?.length) {
+            lines.push('', 'TOP RECOMMENDATIONS:');
+            result.recommendations.slice(0, 3).forEach((r, i) => {
+              lines.push(`  ${i+1}. [${r.priority}] ${r.title}`);
+            });
+          }
+          return lines.join('\n');
+        } catch (e) {
+          return `Error analyzing architecture: ${e.message}`;
+        }
+      },
+    });
+
+    this._register({
+      name:        'assess_layer',
+      source:      'builtin',
+      description: 'Check completeness of a specific architecture layer (1-7)',
+      inputSchema: {
+        type:       'object',
+        properties: {
+          layer: { type: 'number', description: 'Architecture layer number (1-7)' },
+          files: { type: 'array',  description: 'Array of file objects with { path, name, content } fields' },
+        },
+        required: ['layer', 'files'],
+      },
+      fn: (params) => {
+        try {
+          const result = _getArchAnalyzer().assessLayerCompleteness(params.layer, params.files || []);
+          if (result.error) return `Error: ${result.error}`;
+          const lines = [
+            `Layer ${result.layer}: ${result.name}`,
+            `Status: ${result.status?.toUpperCase()} (${result.completeness}% complete)`,
+            `Files Found: ${result.fileCount}`,
+          ];
+          if (result.presentModules?.length) lines.push(`Present modules: ${result.presentModules.join(', ')}`);
+          if (result.missingModules?.length) lines.push(`Missing modules: ${result.missingModules.join(', ')}`);
+          return lines.join('\n');
+        } catch (e) {
+          return `Error assessing layer: ${e.message}`;
+        }
+      },
+    });
+
+    this._register({
+      name:        'find_product_modules',
+      source:      'builtin',
+      description: 'Auto-detect product module candidates from Terraform files (identifies directories with main.tf + service patterns)',
+      inputSchema: {
+        type:       'object',
+        properties: {
+          files: { type: 'array', description: 'Array of file objects with { path, name, content } fields' },
+        },
+        required: ['files'],
+      },
+      fn: (params) => {
+        try {
+          const candidates = findPotentialProductModules(params.files || []);
+          if (!candidates.length) return 'No product module candidates detected.';
+          const lines = [`Found ${candidates.length} product module candidate(s):\n`];
+          candidates.forEach((c, i) => {
+            lines.push(`${i+1}. ${c.name} (${c.path})`);
+            lines.push(`   Service Type: ${c.serviceType}`);
+            lines.push(`   Files: ${c.fileCount} | Confidence: ${Math.round(c.confidence * 100)}%`);
+            if (c.awsServices?.length) lines.push(`   AWS Services: ${c.awsServices.join(', ')}`);
+            lines.push('');
+          });
+          return lines.join('\n');
+        } catch (e) {
+          return `Error finding product modules: ${e.message}`;
+        }
+      },
+    });
+
+    this._register({
+      name:        'validate_compliance_arch',
+      source:      'builtin',
+      description: 'Run SOX/PCI/GDPR/HIPAA compliance validation against architecture',
+      inputSchema: {
+        type:       'object',
+        properties: {
+          files: { type: 'array', description: 'Array of file objects with { path, name, content } fields' },
+        },
+        required: ['files'],
+      },
+      fn: (params) => {
+        try {
+          const result = _getArchAnalyzer().validateCompliance(params.files || []);
+          const lines = [
+            `Overall Compliance Score: ${result.overall || 0}%`,
+            `  SOX:   ${result.sox || 0}%`,
+            `  PCI:   ${result.pci || 0}%`,
+            `  GDPR:  ${result.gdpr || 0}%`,
+            `  HIPAA: ${result.hipaa || 0}%`,
+          ];
+          if (result.violations?.length) {
+            lines.push('', 'VIOLATIONS:');
+            result.violations.forEach((v, i) => lines.push(`  ${i+1}. ${v}`));
+          } else {
+            lines.push('', 'No compliance violations detected.');
+          }
+          return lines.join('\n');
+        } catch (e) {
+          return `Error validating compliance: ${e.message}`;
+        }
+      },
+    });
   }
 
   _register({ name, source, description, inputSchema, fn }) {
@@ -151,6 +294,8 @@ class MCPToolRegistry {
       return true;
     } catch (e) {
       this._status = 'error';
+      // Preserve error message from client if available, otherwise use thrown error
+      this.lastConnectError = e?.message || String(e) || 'Connection failed';
       return false;
     }
   }

@@ -132,3 +132,11 @@ export const Bot             = _g('Bot', 'Robot', 'Cpu');
 export const MapIcon         = _g('Map');
 export const ImageIcon       = _g('Image', 'ImageIcon');
 export const LinkIcon        = _g('Link', 'LinkIcon', 'ExternalLink');
+
+// ── KB Domain Icons (maps domain key → lucide icon component) ────────────────
+// Kept here because it references icon components that are already exported above.
+export const KB_DOMAIN_ICONS = {
+  xsphere: Cloud, spinnaker: Settings, iam: KeyRound, jenkins: Server,
+  dfd: MapIcon, wiz: ShieldAlert, attack: Zap, cwe: TriangleAlert,
+  stride: Target, tfePave: Layers, userdocs: FileText,
+};

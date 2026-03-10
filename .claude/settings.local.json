@@ -114,7 +114,22 @@
       "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\llm\")",
       "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\mcp\\\\tools\")",
       "Bash(cmd //c \"dir C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\src\\\\lib\\\\mcp\")",
-      "Bash(node -e \"try { const p = require\\(''./node_modules/lucide-react/package.json''\\); console.log\\(''version:'', p.version\\); } catch\\(e\\) { console.log\\(''not installed:'', e.message\\); }\")"
+      "Bash(node -e \"try { const p = require\\(''./node_modules/lucide-react/package.json''\\); console.log\\(''version:'', p.version\\); } catch\\(e\\) { console.log\\(''not installed:'', e.message\\); }\")",
+      "Bash(wc -l src/**/*.js src/**/*.jsx src/**/*.ts src/*.js src/*.jsx terraform-enterprise-intelligence.jsx terraform-to-drawio-v5.jsx dfd-generator.jsx kb-module.jsx vite.config.js)",
+      "Bash(done)",
+      "Bash(awk '{if \\(/^[0-9]+:\\(\\\\/\\\\/ ═|\\\\/\\\\/ ─|function|class|export|const\\)/\\) print}')",
+      "Bash(python3 -c \":*)",
+      "Bash(npx vite build --mode development)",
+      "Bash(node -e \"const fs=require\\(''fs''\\); const s=fs.readFileSync\\(''./src/data/architecture-layers.js'',''utf8''\\); console.log\\(''layers size:'',s.length\\); const s2=fs.readFileSync\\(''./src/lib/intelligence/ArchitectureAnalyzer.js'',''utf8''\\); console.log\\(''analyzer size:'',s2.length\\);\")",
+      "Bash(awk 'NR>=558 && NR<=729' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(awk 'NR>=323 && NR<=533' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(awk 'NR>=1304 && NR<=1804' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(awk 'NR>=1809 && NR<=1959' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(awk 'NR>=1965 && NR<=2058' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(awk 'NR>=731 && NR<=1278' \"C:/Users/mjrma/Downloads/threataform/terraform-enterprise-intelligence.jsx\")",
+      "Bash(python3:*)",
+      "Bash(grep -l \"renderMarkdown\\\\|chunkCard\" /c/Users/mjrma/Downloads/threataform/src/features/intelligence/tabs/*.jsx)",
+      "Bash(grep -v \"//.*<[A-Z]\")"
     ]
   }
 }

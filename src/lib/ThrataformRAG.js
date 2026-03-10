@@ -260,7 +260,11 @@ export class ContextPacker {
   }
 
   estimateTokens(text) {
-    return Math.ceil(text.length / this.charsPerToken);
+    // G2: Adaptive estimation — more accurate than fixed chars/token
+    // HCL/code tokens are shorter; words*1.3 + punctuation clusters*0.5
+    const words = text.split(/\s+/).length;
+    const codeTokens = (text.match(/[{}()\[\]=><;,|&]/g) || []).length;
+    return Math.ceil(words * 1.3 + codeTokens * 0.5);
   }
 
   // Greedily fill context window with best chunks
@@ -332,19 +336,33 @@ export class ContextPacker {
 // Pass queryVec (pre-computed embedding) for vector search
 // ═══════════════════════════════════════════════════════════════════════════
 
-export function hybridSearch({ bm25Chunks, vectorStore, queryVec, topK = 8 }) {
-  // Dense results from vector store
-  const denseResults = queryVec?.length && vectorStore?.size > 0
+export function hybridSearch({ bm25Chunks, vectorStore, queryVec, topK = 8, categoryFilter = null }) {
+  // G3: Pre-filter by category when intent is known (e.g. isCompliance → compliance-guide docs)
+  const filterChunks = (chunks) => {
+    if (!categoryFilter || !chunks?.length) return chunks;
+    const filtered = chunks.filter(c => c.category && categoryFilter.includes(c.category));
+    // Fall back to all chunks if the filter yields nothing (avoids empty results)
+    return filtered.length > 0 ? filtered : chunks;
+  };
+
+  const filteredBm25 = filterChunks(bm25Chunks);
+
+  // Dense results from vector store — also filter if possible
+  let denseResults = queryVec?.length && vectorStore?.size > 0
     ? vectorStore.search(queryVec, topK * 2, 0.05)
     : [];
+  if (categoryFilter && denseResults.length) {
+    const filteredDense = denseResults.filter(c => c.category && categoryFilter.includes(c.category));
+    if (filteredDense.length > 0) denseResults = filteredDense;
+  }
 
-  if (!bm25Chunks?.length && !denseResults.length) return [];
+  if (!filteredBm25?.length && !denseResults.length) return [];
 
   // If only one source available, return it directly
-  if (!bm25Chunks?.length) return denseResults.slice(0, topK);
-  if (!denseResults.length) return bm25Chunks.slice(0, topK);
+  if (!filteredBm25?.length) return denseResults.slice(0, topK);
+  if (!denseResults.length) return filteredBm25.slice(0, topK);
 
-  return reciprocalRankFusion(bm25Chunks, denseResults, [], 60).slice(0, topK);
+  return reciprocalRankFusion(filteredBm25, denseResults, [], 60).slice(0, topK);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -360,6 +378,7 @@ export function buildRAGPrompt({
   environment = '',
   frameworks = [],
   systemExtra = '',
+  archContext = '',
 }) {
   const modelCtx = [
     modelName  && `Product: ${modelName}`,
@@ -367,12 +386,17 @@ export function buildRAGPrompt({
     frameworks?.length && `Compliance: ${frameworks.join(', ')}`,
   ].filter(Boolean).join('\n');
 
+  const archSection = archContext && typeof archContext === 'string' && archContext.trim()
+    ? `\n\nARCHITECTURE CONTEXT:\n${archContext.substring(0, 1500)}\n`
+    : '';
+
   const systemPrompt = [
     'You are Threataform Assistant, an expert in infrastructure security, threat modeling, and compliance.',
     'Answer ONLY from the provided context. Do not hallucinate. If context is insufficient, say so.',
     'Format responses with clear headers. Cite control IDs (e.g. AC-1, CC6.1) when present.',
     'Be precise, technical, and structured.',
     modelCtx && `\nArchitecture context:\n${modelCtx}`,
+    archSection,
     systemExtra,
   ].filter(Boolean).join('\n');
 
@@ -387,6 +411,79 @@ export function buildRAGPrompt({
     },
   ];
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7b. CROSS-ENCODER RERANKER (G1)
+// Lazy-loaded singleton using @huggingface/transformers
+// Re-scores RRF results with a bi-encoder cross-attention model for higher
+// precision. Falls back silently to the original RRF ranking if the model
+// cannot be loaded (offline / COEP restriction / first-run timeout).
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _ceStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'error'
+let _cePipeline = null; // HuggingFace text-ranking pipeline
+
+async function _initCrossEncoder() {
+  if (_ceStatus === 'ready' || _ceStatus === 'loading') return;
+  _ceStatus = 'loading';
+  try {
+    // Dynamic import keeps the main bundle small; only loads when first needed
+    const { pipeline, env } = await import('@huggingface/transformers');
+    // Allow remote models but use cache; workers are already blocked by COEP so use main thread
+    env.allowRemoteModels = true;
+    env.allowLocalModels  = false;
+    env.backends.onnx.wasm.numThreads = 1; // single-thread for COEP compat
+    _cePipeline = await pipeline(
+      'text-ranking',
+      'Xenova/ms-marco-MiniLM-L-6-v2',
+      { device: 'cpu', dtype: 'q8' },
+    );
+    _ceStatus = 'ready';
+  } catch {
+    _ceStatus = 'error'; // graceful degradation — RRF ranking used instead
+  }
+}
+
+/**
+ * Rerank `chunks` for `query` using the cross-encoder.
+ * Returns at most `topK` chunks sorted by descending relevance.
+ * If the pipeline is not ready, returns the input unchanged.
+ */
+export async function rerank(query, chunks, topK = 8) {
+  if (!chunks?.length || !query) return chunks?.slice(0, topK) ?? [];
+
+  // Kick off init in background if not started yet; return RRF order this call
+  if (_ceStatus === 'idle') { _initCrossEncoder(); return chunks.slice(0, topK); }
+  if (_ceStatus !== 'ready' || !_cePipeline) return chunks.slice(0, topK);
+
+  try {
+    const passages = chunks.map(c => (c.text || '').substring(0, 512));
+    const scores = await _cePipeline(query, passages, { top_k: null });
+    // scores: [{ index, score }, ...] sorted by score desc
+    if (!scores?.length) return chunks.slice(0, topK);
+    return scores
+      .slice(0, topK)
+      .map(s => ({ ...chunks[s.index], rerankScore: s.score, searchType: 'reranked' }));
+  } catch {
+    return chunks.slice(0, topK);
+  }
+}
+
+/** Pre-warm the cross-encoder pipeline in the background (call after wllama loads) */
+export function prewarmCrossEncoder() {
+  if (_ceStatus === 'idle') _initCrossEncoder();
+}
+
+export const ARCH_QUICK_PROMPTS = [
+  'Which architecture governance layers are incomplete or missing?',
+  'What MITRE ATT&CK techniques does my missing Layer 2 factory expose?',
+  'Do my Sentinel policies cover all required governance domains?',
+  'Which product modules are missing proper IAM boundaries?',
+  'Summarize my cross-layer compliance posture for SOX and PCI.',
+  'What is the blast radius if my base-account-factory is compromised?',
+  'How does my IAM governance layer compare to enterprise best practices?',
+  'Which factory components are missing CRD definitions or IRSA roles?',
+];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 8. DOCUMENT CHUNKER — integrates with existing userDocs structure
